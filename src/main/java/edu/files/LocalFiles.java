@@ -7,11 +7,11 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.file.DirectoryIteratorException;
 import java.nio.file.FileAlreadyExistsException;
-import java.nio.file.FileSystemException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
@@ -26,6 +26,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.function.BooleanSupplier;
@@ -55,7 +56,23 @@ final class LocalFiles {
                     ? DosFileAttributes.class : BasicFileAttributes.class;
     private static final Set<String> IMAGE_EXTENSIONS = Set.of("png", "jpg", "jpeg", "gif", "bmp");
 
-    record Entry(Path path, boolean directory, boolean link, long size, FileTime modified) {
+    record Entry(Path path, boolean directory, boolean link, long size, FileTime modified,
+                 FileTime created, Object fileKey, boolean other) {
+        boolean hasIdentity() {
+            return fileKey != null && !link && !other;
+        }
+
+        boolean sameObject(Entry current) {
+            return hasIdentity() && current.hasIdentity() && directory == current.directory
+                    && fileKey.equals(current.fileKey) && created.equals(current.created);
+        }
+
+        boolean sameMetadata(Entry current) {
+            return directory == current.directory && link == current.link && other == current.other
+                    && size == current.size && modified.equals(current.modified) && created.equals(current.created)
+                    && Objects.equals(fileKey, current.fileKey);
+        }
+
         String name() {
             return path.getFileName() == null ? path.toString() : path.getFileName().toString();
         }
@@ -284,6 +301,18 @@ final class LocalFiles {
         return entry(path, Files.readAttributes(path, BasicFileAttributes.class, NO_LINKS));
     }
 
+    static Entry verify(Entry expected, boolean confirmedCurrentPath) throws IOException {
+        Path requested = expected.path();
+        Path parent = requested.toAbsolutePath().getParent();
+        Path actual = parent == null ? requested : parent.toRealPath().resolve(requested.getFileName());
+        Entry current = describe(actual);
+        if (expected.sameObject(current)
+                || (confirmedCurrentPath && !expected.hasIdentity() && expected.sameMetadata(current))) {
+            return current;
+        }
+        throw new IOException("项目已变化或无法确认身份，请刷新后重新选择：" + requested);
+    }
+
     static Path childNamed(Path directory, String name) {
         Path child = Path.of(name);
         if (name.isBlank() || child.getRoot() != null || child.getNameCount() != 1
@@ -297,20 +326,34 @@ final class LocalFiles {
         desktopFor(Desktop.Action.OPEN).open(path.toFile());
     }
 
-    static void trash(Path path) throws IOException {
-        File file = path.toFile();
-        if (!desktopFor(Desktop.Action.MOVE_TO_TRASH).moveToTrash(file)) {
-            throw new IOException("无法移到回收站：" + path);
+    @FunctionalInterface
+    interface RecycleBin { boolean moveToTrash(Path path) throws IOException; }
+
+    static boolean desktopTrash(Path path) throws IOException {
+        return desktopFor(Desktop.Action.MOVE_TO_TRASH).moveToTrash(path.toFile());
+    }
+
+    static void trash(Path path, RecycleBin recycleBin) throws IOException {
+        boolean recycled;
+        try {
+            recycled = recycleBin.moveToTrash(path);
+        } catch (IllegalArgumentException | SecurityException | UnsupportedOperationException exception) {
+            // Desktop can reject a path that went away after verification.
+            throw uncertain("无法确认回收结果", exception, path);
+        } catch (IOException exception) {
+            throw uncertain("无法确认回收结果", exception, path);
+        }
+        if (!recycled) {
+            throw uncertain("无法确认回收结果", new IOException("系统未报告回收成功"), path);
         }
     }
 
     static void rename(Path source, Path target) throws IOException {
         if (!source.equals(target)) {
-            requireAvailable(target);
-            Files.move(source, target);
+            moveWithoutReplacing(source, target);
         } else if (!source.toString().equals(target.toString()) && !source.toFile().renameTo(target.toFile())) {
             // Windows NIO treats case-only names as equal and returns without renaming.
-            throw new FileSystemException(source.toString(), target.toString(), "无法更改名称的大小写");
+            throw uncertain("无法确认改名结果", new IOException("无法更改名称的大小写"), source, target);
         }
     }
 
@@ -328,12 +371,15 @@ final class LocalFiles {
             attributes = Files.readAttributes(stagedItem, BasicFileAttributes.class, NO_LINKS);
             copied = sameFolder
                     ? placeDuplicate(stagedItem, destination, attributes.isDirectory())
-                    : Files.move(stagedItem, destination);
+                    : moveWithoutReplacing(stagedItem, destination);
         } catch (IOException | RuntimeException exception) {
             try {
                 deleteStaging(staging);
             } catch (IOException cleanupFailure) {
                 exception.addSuppressed(cleanupFailure);
+                if (exception instanceof IOException) {
+                    throw uncertain("无法确认复制结果，暂存清理也失败", exception, source, destination, staging);
+                }
             }
             throw exception;
         }
@@ -354,8 +400,7 @@ final class LocalFiles {
             String suffix = number == 1 ? " - 副本" : " - 副本 (" + number + ")";
             Path candidate = original.resolveSibling(stem + suffix + extension);
             try {
-                requireAvailable(candidate);
-                return Files.move(stagedItem, candidate);
+                return moveWithoutReplacing(stagedItem, candidate);
             } catch (FileAlreadyExistsException exception) {
                 // Another copy may have acquired this name while the data was staged.
             }
@@ -367,15 +412,48 @@ final class LocalFiles {
         return !directory && dot > 0 && dot < name.length() - 1 ? dot : name.length();
     }
 
-    static boolean move(Path source, Path directory) throws IOException {
+    // Null indicates that the source already belongs to the destination directory.
+    static Path move(Path source, Path directory) throws IOException {
         Path destination = transferTarget(source, directory);
         if (Files.isSameFile(source.toAbsolutePath().getParent(), destination.getParent())) {
             describe(source);
-            return false;
+            return null;
         }
-        requireAvailable(destination);
-        Files.move(source, destination);
-        return true;
+        return moveWithoutReplacing(source, destination);
+    }
+
+    private static Path moveWithoutReplacing(Path source, Path target) throws IOException {
+        requireAvailable(target);
+        try {
+            return Files.move(source, target);
+        } catch (FileAlreadyExistsException conflict) {
+            throw conflict;
+        } catch (IOException | SecurityException failure) {
+            throw uncertain("无法确认移动或发布结果", failure, source, target);
+        }
+    }
+
+    static final class UncertainWrite extends IOException {
+        UncertainWrite(String message, Exception cause) { super(message, cause); }
+    }
+
+    private static UncertainWrite uncertain(String message, Exception failure, Path... paths) {
+        List<String> observations = new ArrayList<>();
+        for (Path path : paths) {
+            String state;
+            try {
+                describe(path);
+                state = "存在";
+            } catch (NoSuchFileException absent) {
+                state = "不存在";
+            } catch (IOException | SecurityException inaccessible) {
+                state = "无法读取";
+            }
+            observations.add(path + "（" + state + "）");
+        }
+        String reason = Objects.requireNonNullElse(failure.getMessage(), failure.getClass().getSimpleName());
+        return new UncertainWrite(message + "。\n原因：" + reason
+                + "\n检查时的路径状态：" + String.join("、", observations), failure);
     }
 
     private static void requireAvailable(Path path) throws FileAlreadyExistsException {
@@ -441,7 +519,8 @@ final class LocalFiles {
 
     private static Entry entry(Path path, BasicFileAttributes attributes) {
         return new Entry(path, attributes.isDirectory(), attributes.isSymbolicLink(),
-                attributes.size(), attributes.lastModifiedTime());
+                attributes.size(), attributes.lastModifiedTime(), attributes.creationTime(),
+                attributes.fileKey(), attributes.isOther());
     }
 
     private static void checkCancelled(BooleanSupplier cancelled) {

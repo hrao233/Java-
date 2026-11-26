@@ -2,6 +2,9 @@ package edu.files;
 
 import edu.files.BrowserView.Field;
 import edu.files.BrowserView.Mode;
+import edu.files.FileChanges.Change;
+import edu.files.FileChanges.Outcome;
+import edu.files.FileChanges.State;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.concurrent.Task;
@@ -86,15 +89,7 @@ public final class FileManagerApp extends Application {
         }
     }
     private record SystemCatalog(WindowsPlaces.Places places, List<NewItems.Type> newTypes) { }
-    private record Transfer(List<Path> paths, boolean move) { }
-    private record Change(FileAction apply, FileAction undo, List<Path> folders, BooleanSupplier changed) {
-        Change(FileAction apply, FileAction undo, List<Path> folders) {
-            this(apply, undo, folders, () -> true);
-        }
-    }
-    private record Outcome(List<Change> completed, IOException error) {
-        List<Change> writes() { return completed.stream().filter(change -> change.changed().getAsBoolean()).toList(); }
-    }
+    private record Transfer(List<LocalFiles.Entry> sources, boolean move) { }
 
     @FunctionalInterface
     private interface FileAction { void run() throws IOException; }
@@ -1565,7 +1560,7 @@ public final class FileManagerApp extends Application {
     private void createItem(String label, Work<NewItems.Created> work) {
         writing = true;
         runTask(task(work), "正在新建" + label + "…", false, created -> {
-            undoCreation(created);
+            undo = List.of(FileChanges.undoCreation(created.path()));
             recordFolderEdits(Stream.of(created.path().getParent()));
             rebuildSidebar();
             request(location, "", "已新建" + label, () -> Platform.runLater(() -> {
@@ -1578,57 +1573,44 @@ public final class FileManagerApp extends Application {
         });
     }
 
-    private void undoCreation(NewItems.Created created) {
-        undo = List.of(new Change(null, created::undo, List.of(created.path().getParent())));
-    }
-
     private void renameNewItem(NewItems.Created created, String name) {
-        if (activeTask != null || name.isBlank()) { return; }
-        Path original = created.path();
-        try {
-            Path target = LocalFiles.childNamed(original.getParent(), name);
-            if (original.toString().equals(target.toString())) { return; }
-            writing = true;
-            runTask(task(ignored -> NewItems.rename(created, target)), "正在命名…", false, renamed -> {
-                undoCreation(renamed);
-                recordFolderEdits(Stream.of(target.getParent()));
-                rebuildSidebar();
-                request(location, "", "已命名", () -> Platform.runLater(() -> browser.reveal(target)));
-            });
-        } catch (InvalidPathException exception) {
-            showError(exception);
-        }
+        renameEntry(created.entry(), name);
     }
 
     private void renameSelected() {
         BrowserItem selected = selectedItem();
         if (selected == null || selected.entry() == null || browser.selection().size() != 1 || activeTask != null) { return; }
         String extension = selected.name().substring(LocalFiles.extensionStart(selected.name(), selected.directory()));
-        browser.editName(selected.path(), extension, false, name -> {
-            try {
-                Path target = LocalFiles.childNamed(selected.path().getParent(), name);
-                Change rename = new Change(() -> LocalFiles.rename(selected.path(), target),
-                        () -> LocalFiles.rename(target, selected.path()), List.of(target.getParent()));
-                applyChanges("正在重命名…", "已重命名", List.of(rename), ignored -> { },
-                        () -> Platform.runLater(() -> browser.reveal(target)));
-            } catch (InvalidPathException exception) {
-                showError(exception);
+        browser.editName(selected.path(), extension, false, name -> renameEntry(selected.entry(), name));
+    }
+
+    private void renameEntry(LocalFiles.Entry entry, String name) {
+        if (activeTask != null || name.isBlank()) { return; }
+        try {
+            Path target = LocalFiles.childNamed(entry.path().getParent(), name);
+            if (entry.path().toString().equals(target.toString()) || !confirmCurrentPaths(List.of(entry), "重命名", false)) {
+                return;
             }
-        });
+            Change change = FileChanges.rename(entry, target, !entry.hasIdentity());
+            applyChanges("正在重命名…", "已重命名", List.of(change), ignored -> { },
+                    () -> Platform.runLater(() -> browser.reveal(target)));
+        } catch (InvalidPathException exception) {
+            showError(exception);
+        }
     }
 
     private void rememberSelection(boolean move) {
         List<BrowserItem> selected = browser.selection();
         if (!canModify(selected) || activeTask != null) { return; }
-        transfer = new Transfer(selected.stream().map(BrowserItem::path).toList(), move);
+        transfer = new Transfer(selected.stream().map(BrowserItem::entry).toList(), move);
         describeTransfer();
         updateControls();
     }
 
     private void describeTransfer() {
         if (transfer == null) { clipboardStatus.setText(""); return; }
-        String label = transfer.paths().size() == 1 ? transfer.paths().getFirst().getFileName().toString()
-                : transfer.paths().size() + " 个项目";
+        String label = transfer.sources().size() == 1 ? transfer.sources().getFirst().name()
+                : transfer.sources().size() + " 个项目";
         clipboardStatus.setText((transfer.move() ? "已剪切 · " : "待粘贴 · ") + label);
     }
 
@@ -1639,68 +1621,50 @@ public final class FileManagerApp extends Application {
     private void pasteInto(Path directory) {
         Transfer pending = transfer;
         if (activeTask != null || pending == null) { return; }
-        List<Change> changes = pending.paths().stream()
-                .map(source -> new PasteItem(source, directory, pending.move()).change()).toList();
+        if (!confirmCurrentPaths(pending.sources(), pending.move() ? "移动" : "复制", false)) { return; }
+        List<Change> changes = pending.sources().stream()
+                .map(source -> FileChanges.transfer(source, directory, pending.move(), !source.hasIdentity())).toList();
         applyChanges(pending.move() ? "正在移动…" : "正在复制…", pending.move() ? "已移动" : "已复制", changes, outcome -> {
             if (!pending.move()) { return; }
-            List<Path> remaining = pending.paths().subList(outcome.completed().size(), pending.paths().size());
+            List<LocalFiles.Entry> remaining = outcome.remainingCut(pending.sources());
             transfer = remaining.isEmpty() ? null : new Transfer(remaining, true);
             describeTransfer();
         });
     }
 
-    private static final class PasteItem {
-        private final Path source;
-        private final Path directory;
-        private final boolean move;
-        private LocalFiles.Entry copied;
-        private boolean changed;
-
-        PasteItem(Path source, Path directory, boolean move) {
-            this.source = source;
-            this.directory = directory;
-            this.move = move;
-        }
-
-        Change change() {
-            List<Path> folders = move ? List.of(source.getParent(), directory) : List.of(directory);
-            return new Change(this::paste, this::undo, folders, () -> changed);
-        }
-
-        private void paste() throws IOException {
-            if (move) {
-                changed = LocalFiles.move(source, directory);
-            } else {
-                copied = LocalFiles.copy(source, directory);
-                changed = true;
-            }
-        }
-
-        private void undo() throws IOException {
-            if (move) {
-                LocalFiles.rename(directory.resolve(source.getFileName()), source);
-                return;
-            }
-            Path target = copied.path();
-            if (!copied.equals(LocalFiles.describe(target))) {
-                throw new IOException("复制项已更改，无法撤消：" + target);
-            }
-            LocalFiles.trash(target);
-        }
-    }
-
     private void trashSelected() {
         List<BrowserItem> selected = browser.selection();
         if (!canModify(selected) || activeTask != null) { return; }
-        String name = selected.size() == 1 ? "「" + selected.getFirst().name() + "」" : selected.size() + " 个项目";
-        Alert confirm = new Alert(Alert.AlertType.CONFIRMATION, "将" + name + "移到回收站？", ButtonType.CANCEL, ButtonType.OK);
-        confirm.initOwner(stage);
-        confirm.setTitle("移到回收站");
-        confirm.setHeaderText(null);
-        if (confirm.showAndWait().orElse(ButtonType.CANCEL) != ButtonType.OK) { return; }
-        List<Change> changes = selected.stream().map(item -> new Change(() -> LocalFiles.trash(item.path()), null,
-                List.of(item.path().getParent()))).toList();
+        List<LocalFiles.Entry> entries = selected.stream().map(BrowserItem::entry).toList();
+        if (!confirmCurrentPaths(entries, "移到回收站", true)) { return; }
+        List<Change> changes = entries.stream()
+                .map(entry -> FileChanges.recycle(entry, !entry.hasIdentity(), LocalFiles::desktopTrash)).toList();
         applyChanges("正在移到回收站…", "已移到回收站", changes, ignored -> { });
+    }
+
+    private boolean confirmCurrentPaths(List<LocalFiles.Entry> entries, String action, boolean recycle) {
+        List<LocalFiles.Entry> unverified = entries.stream().filter(entry -> !entry.hasIdentity()).toList();
+        if (unverified.isEmpty() && !recycle) { return true; }
+        String name = entries.size() == 1 ? "「" + entries.getFirst().name() + "」" : entries.size() + " 个项目";
+        String message = unverified.isEmpty()
+                ? "将" + name + "移到回收站？"
+                : "无法核对 " + unverified.size() + " 个项目的文件身份。请确认要" + action + "下列路径当前的项目。";
+        ButtonType proceed = new ButtonType(unverified.isEmpty() ? "移到回收站" : "按当前路径继续",
+                ButtonBar.ButtonData.OK_DONE);
+        Alert confirm = new Alert(Alert.AlertType.CONFIRMATION, message, ButtonType.CANCEL, proceed);
+        confirm.initOwner(stage);
+        confirm.setTitle(action);
+        confirm.setHeaderText(null);
+        if (!unverified.isEmpty()) {
+            TextArea paths = new TextArea(String.join("\n", unverified.stream().map(entry -> entry.path().toString()).toList()));
+            paths.setEditable(false);
+            paths.setPrefRowCount(Math.min(unverified.size(), 6));
+            confirm.getDialogPane().setExpandableContent(paths);
+            confirm.getDialogPane().setExpanded(true);
+            ((Button) confirm.getDialogPane().lookupButton(proceed)).setDefaultButton(false);
+            ((Button) confirm.getDialogPane().lookupButton(ButtonType.CANCEL)).setDefaultButton(true);
+        }
+        return confirm.showAndWait().orElse(ButtonType.CANCEL) == proceed;
     }
 
     private void applyChanges(String running, String complete, List<Change> changes, Consumer<Outcome> callback) {
@@ -1711,10 +1675,9 @@ public final class FileManagerApp extends Application {
                               Runnable reloaded) {
         if (activeTask != null) { return; }
         writing = true;
-        runTask(task(cancelled -> processChanges(changes)), running, false, outcome -> {
-            List<Change> writes = outcome.writes();
-            if (!writes.isEmpty()) {
-                undo = writes.reversed().stream().filter(change -> change.undo() != null).toList();
+        runTask(task(cancelled -> FileChanges.execute(changes)), running, false, outcome -> {
+            if (outcome.count(State.APPLIED) + outcome.count(State.UNKNOWN) > 0) {
+                undo = outcome.reversals();
             }
             callback.accept(outcome);
             afterWrite(complete, outcome, reloaded);
@@ -1723,43 +1686,27 @@ public final class FileManagerApp extends Application {
 
     private void undo() {
         if (activeTask != null || undo.isEmpty()) { return; }
-        List<Change> reverse = undo.stream().map(change -> new Change(change.undo(), null, change.folders())).toList();
         writing = true;
-        runTask(task(cancelled -> processChanges(reverse)), "正在撤消…", false, outcome -> {
-            undo = undo.subList(outcome.completed().size(), undo.size());
+        List<Change> reverse = undo;
+        runTask(task(cancelled -> FileChanges.execute(reverse)), "正在撤消…", false, outcome -> {
+            undo = outcome.pending();
             afterWrite("已撤消", outcome, () -> {});
         });
     }
 
-    private static Outcome processChanges(List<Change> changes) {
-        List<Change> completed = new ArrayList<>();
-        for (Change change : changes) {
-            try {
-                change.apply().run();
-                completed.add(change);
-            } catch (IOException exception) {
-                return new Outcome(List.copyOf(completed), exception);
-            }
-        }
-        return new Outcome(List.copyOf(completed), null);
-    }
-
-    private void afterWrite(String message, Outcome outcome, Runnable reloaded) {
-        List<Change> writes = outcome.writes();
-        recordFolderEdits(writes.stream().flatMap(change -> change.folders().stream()));
-        if (outcome.error() == null) {
-            if (writes.isEmpty()) {
-                updateListingStatus("项目已在目标文件夹");
-            } else {
-                // Expanded branches may include newly created, renamed or moved folders.
-                rebuildSidebar();
-                request(location, activeQuery, message, reloaded);
-            }
+    private void afterWrite(String completed, Outcome outcome, Runnable reloaded) {
+        recordFolderEdits(outcome.items().stream().filter(item -> item.state() == State.APPLIED)
+                .flatMap(item -> item.change().folders().stream()));
+        IOException error = outcome.error();
+        String message = outcome.summary(completed);
+        boolean mayHaveWritten = outcome.count(State.APPLIED) + outcome.count(State.UNKNOWN) > 0;
+        if (mayHaveWritten) { rebuildSidebar(); }
+        if (mayHaveWritten || outcome.count(State.FAILED) > 0) {
+            request(location, activeQuery, message, error == null ? reloaded : () -> {});
         } else {
-            if (!writes.isEmpty()) { rebuildSidebar(); }
-            refresh(writes.isEmpty() ? "操作失败" : "已完成 " + writes.size() + " 项");
-            showError(outcome.error());
+            updateListingStatus(message);
         }
+        if (error != null) { showError(error); }
     }
 
     private <T> void runTask(Task<T> task, String running, boolean cancellable, Consumer<T> success) {

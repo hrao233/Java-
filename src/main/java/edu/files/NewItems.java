@@ -3,7 +3,6 @@ package edu.files;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.FileAlreadyExistsException;
-import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -13,8 +12,6 @@ import java.util.Base64;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Locale;
-import java.util.Objects;
-import java.util.concurrent.TimeUnit;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 
@@ -37,21 +34,8 @@ final class NewItems {
         }
     }
 
-    record Created(Path path, String extension, BasicFileAttributes stamp) {
-        Created withPath(Path newPath) { return new Created(newPath, extension, stamp); }
-
-        void undo() throws IOException {
-            var current = Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
-            boolean replaced = current.isSymbolicLink() || current.isDirectory() != stamp.isDirectory()
-                    || !current.creationTime().equals(stamp.creationTime())
-                    || !Objects.equals(current.fileKey(), stamp.fileKey());
-            boolean edited = !stamp.isDirectory() && (current.size() != stamp.size()
-                    || !current.lastModifiedTime().equals(stamp.lastModifiedTime()));
-            if (replaced || edited) {
-                throw new IOException("项目已更改，无法撤消新建：" + path);
-            }
-            Files.delete(path);
-        }
+    record Created(LocalFiles.Entry entry, String extension) {
+        Path path() { return entry.path(); }
     }
 
     @FunctionalInterface
@@ -122,30 +106,8 @@ final class NewItems {
         return remember(result, shortcut.extension());
     }
 
-    static Created rename(Created created, Path target) throws IOException {
-        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(900);
-        while (true) {
-            try {
-                LocalFiles.rename(created.path(), target);
-                return created.withPath(target);
-            } catch (FileSystemException failure) {
-                // Windows can temporarily hold a new item open while resolving its shell icon.
-                if (!WindowsPlaces.WINDOWS || failure.getClass() != FileSystemException.class
-                        || System.nanoTime() - deadline >= 0) {
-                    throw failure;
-                }
-                try {
-                    Thread.sleep(60);
-                } catch (InterruptedException interrupted) {
-                    Thread.currentThread().interrupt();
-                    throw failure;
-                }
-            }
-        }
-    }
-
     private static Created remember(Path path, String extension) throws IOException {
-        return new Created(path, extension, Files.readAttributes(path, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS));
+        return new Created(LocalFiles.describe(path), extension);
     }
 
     private static Path publish(Path directory, String stem, String extension, CreateAt create) throws IOException {
