@@ -102,11 +102,17 @@ final class LocalFiles {
     }
 
     static Listing readDirectory(Path directory, Visibility visibility, BooleanSupplier cancelled) throws IOException {
+        return readDirectory(directory, visibility, cancelled, path -> false);
+    }
+
+    static Listing readDirectory(Path directory, Visibility visibility, BooleanSupplier cancelled,
+                                 Predicate<Path> excluded) throws IOException {
         List<Entry> entries = new ArrayList<>();
         int unreadable = 0;
         try (var children = Files.newDirectoryStream(directory)) {
             for (Path child : children) {
                 checkCancelled(cancelled);
+                if (excluded.test(child)) { continue; }
                 try {
                     BasicFileAttributes attributes = Files.readAttributes(child, ATTRIBUTES, NO_LINKS);
                     if (visibility.includes(child, attributes)) {
@@ -186,14 +192,24 @@ final class LocalFiles {
 
     static Listing search(Path directory, String query, Visibility visibility, BooleanSupplier cancelled)
             throws IOException {
+        return search(directory, query, visibility, cancelled, path -> false);
+    }
+
+    static Listing search(Path directory, String query, Visibility visibility, BooleanSupplier cancelled,
+                          Predicate<Path> excluded) throws IOException {
         String keyword = query.toLowerCase(Locale.ROOT);
-        return scan(directory, entry -> entry.name().toLowerCase(Locale.ROOT).contains(keyword), visibility, cancelled);
+        return scan(directory, entry -> entry.name().toLowerCase(Locale.ROOT).contains(keyword), visibility, cancelled, excluded);
     }
 
     static Listing images(Path directory, String keyword, Visibility visibility, BooleanSupplier cancelled)
             throws IOException {
+        return images(directory, keyword, visibility, cancelled, path -> false);
+    }
+
+    static Listing images(Path directory, String keyword, Visibility visibility, BooleanSupplier cancelled,
+                          Predicate<Path> excluded) throws IOException {
         return scan(directory, entry -> !entry.directory() && isImage(entry.path())
-                && entry.name().toLowerCase(Locale.ROOT).contains(keyword), visibility, cancelled);
+                && entry.name().toLowerCase(Locale.ROOT).contains(keyword), visibility, cancelled, excluded);
     }
 
     static boolean isImage(Path path) {
@@ -223,7 +239,7 @@ final class LocalFiles {
     }
 
     private static Listing scan(Path directory, Predicate<Entry> filter, Visibility visibility,
-                                BooleanSupplier cancelled) throws IOException {
+                                BooleanSupplier cancelled, Predicate<Path> excluded) throws IOException {
         Path root = directory.toRealPath();
         List<Entry> matches = new ArrayList<>();
 
@@ -233,6 +249,9 @@ final class LocalFiles {
 
             private FileVisitResult match(Path path, BasicFileAttributes attributes) throws IOException {
                 checkCancelled(cancelled);
+                if (excluded.test(path)) {
+                    return attributes.isDirectory() ? FileVisitResult.SKIP_SUBTREE : FileVisitResult.CONTINUE;
+                }
                 BasicFileAttributes details = ATTRIBUTES == BasicFileAttributes.class
                         ? attributes : Files.readAttributes(path, ATTRIBUTES, NO_LINKS);
                 if (!visibility.includes(path, details)) {

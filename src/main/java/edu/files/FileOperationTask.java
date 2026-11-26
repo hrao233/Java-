@@ -35,6 +35,7 @@ final class FileOperationTask {
     private final List<FileChanges.Change> changes;
     private final Consumer<Snapshot> observer;
     private final List<Issue> issues = new ArrayList<>();
+    private ActiveStaging staging = new ActiveStaging();
     private volatile Snapshot snapshot;
     private volatile boolean cancellationRequested;
     // The disk worker owns the fields below once run() starts.
@@ -83,6 +84,10 @@ final class FileOperationTask {
     }
 
     Snapshot snapshot() { return snapshot; }
+
+    void observeStagingWith(ActiveStaging visibleToReaders) { staging = visibleToReaders; }
+
+    ActiveStaging staging() { return staging; }
     Duration elapsed() {
         Snapshot current = snapshot;
         return current.started() != null && current.result() == null

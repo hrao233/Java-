@@ -39,6 +39,7 @@ import java.nio.file.FileSystemException;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.NoSuchFileException;
+import java.nio.file.NotDirectoryException;
 import java.nio.file.Path;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
@@ -95,6 +96,11 @@ public final class FileManagerApp extends Application {
     }
     private record SystemCatalog(WindowsPlaces.Places places, List<NewItems.Type> newTypes) { }
     private record Transfer(List<Selection> sources, boolean move) { }
+    private record BrowseIntent(Location location, String query, HomeTab tab, String message,
+                                boolean openAddressFile, Runnable committed) { }
+    private record BrowseData(Listing listing, DirectoryIdentity identity, Path file) { }
+    private record BrowseRequest(BrowseIntent intent, Task<BrowseData> task) { }
+    private record PreviewData(Image image, String text) { }
 
     @FunctionalInterface
     private interface FileAction { void run() throws IOException; }
@@ -102,11 +108,18 @@ public final class FileManagerApp extends Application {
     @FunctionalInterface
     private interface Work<T> { T read(BooleanSupplier cancelled) throws Exception; }
 
-    private final ExecutorService disk = Executors.newSingleThreadExecutor(work -> {
-        return new Thread(work, "file-manager-disk");
-    });
+    @FunctionalInterface
+    interface ReadObserver {
+        void ready(Path path, boolean preview);
+        default void started(Path path, String query, long queueNanos) { }
+    }
+
+    private final ExecutorService writes = Executors.newSingleThreadExecutor(work -> new Thread(work, "file-manager-write"));
+    private final ReadExecutor reads = new ReadExecutor();
+    private final ActiveStaging staging = new ActiveStaging();
     private final Preferences preferences;
     private final BiFunction<Kind, List<Change>, FileOperationTask> operationFactory;
+    private final ReadObserver readObserver;
     private final Map<Page, View> views = new EnumMap<>(Page.class);
     private final Deque<Location> past = new ArrayDeque<>();
     private final Deque<Location> future = new ArrayDeque<>();
@@ -123,6 +136,7 @@ public final class FileManagerApp extends Application {
     private final TextField searchField = new TextField();
     private final Label status = new Label();
     private final Label clipboardStatus = new Label();
+    private final Label writeNotice = new Label("文件写入命令暂不可用");
     private final Button unknownResults = new Button("核查结果");
     private final List<FileChanges.UnknownOperation> unknownOperations = new ArrayList<>();
     private final ProgressIndicator progress = new ProgressIndicator();
@@ -150,14 +164,22 @@ public final class FileManagerApp extends Application {
     private FileOperationProgress operationProgress;
     private FileOperationTask activeFileOperation;
     private LocalFiles.Visibility visibility;
-    private Task<?> activeTask;
+    private Task<?> fileTask;
+    private Task<SystemCatalog> catalogTask;
+    private BrowseRequest browseRequest;
+    private DirectoryIdentity directoryIdentity;
+    private boolean directoryUnavailable;
+    private boolean closing;
+    private long listingVersion;
+    private String deferredRefresh;
     private Task<?> previewTask;
+    private final Map<TreeItem<SideNode>, Task<?>> treeReads = new HashMap<>();
+    private long sidebarVersion;
     private Task<List<Path>> modifiedFoldersTask;
     private List<Path> modifiedFolders = List.of();
     private boolean modifiedFoldersRefreshQueued;
     private String activeQuery = "";
     private boolean writing;
-    private boolean searching;
     private boolean extensions = true;
     private boolean navigationPane = true;
     private boolean compact;
@@ -172,8 +194,14 @@ public final class FileManagerApp extends Application {
     }
 
     FileManagerApp(Preferences preferences, BiFunction<Kind, List<Change>, FileOperationTask> operationFactory) {
+        this(preferences, operationFactory, (path, preview) -> {});
+    }
+
+    FileManagerApp(Preferences preferences, BiFunction<Kind, List<Change>, FileOperationTask> operationFactory,
+                   ReadObserver readObserver) {
         this.preferences = preferences;
         this.operationFactory = operationFactory;
+        this.readObserver = readObserver;
     }
 
     @Override
@@ -252,19 +280,22 @@ public final class FileManagerApp extends Application {
 
     @Override
     public void stop() {
+        closing = true;
         rememberNavigationWidth();
         preferences.putDouble("navigationWidth", navigationWidth);
         if (browser != null) { browser.cancelNewName(); }
-        if (activeTask != null && !writing) { activeTask.cancel(); }
-        if (previewTask != null) { previewTask.cancel(); }
-        if (modifiedFoldersTask != null) { modifiedFoldersTask.cancel(); }
+        cancelBrowse();
+        if (fileTask != null && !writing) { fileTask.cancel(); }
+        if (previewTask != null) { reads.cancel(previewTask); }
+        if (modifiedFoldersTask != null) { reads.cancel(modifiedFoldersTask); }
+        reads.close();
         if (activeFileOperation != null) {
             activeFileOperation.requestCancellation();
-            disk.shutdown();
+            writes.shutdown();
         } else if (writing) {
-            disk.shutdown();
+            writes.shutdown();
         } else {
-            disk.shutdownNow();
+            writes.shutdownNow();
         }
         if (operationProgress != null) { operationProgress.close(); }
         if (icons != null) { icons.close(); }
@@ -289,7 +320,7 @@ public final class FileManagerApp extends Application {
         Button search = button("搜索", "search", this::search);
         search.getStyleClass().add("primary-button");
         Button stop = button("取消搜索", "cancel-search", () -> {
-            if (searching && activeTask != null) { activeTask.cancel(); }
+            if (isSearching()) { cancelBrowse(); settleBrowse(""); }
         });
         stop.managedProperty().bind(stop.visibleProperty());
         Button clear = button("退出搜索", "clear-search", () -> request(location, "", "", () -> {}));
@@ -380,14 +411,22 @@ public final class FileManagerApp extends Application {
         unknownResults.setVisible(false);
         unknownResults.managedProperty().bind(unknownResults.visibleProperty());
         unknownResults.setOnAction(event -> inspectUnknownResults());
-        HBox bar = new HBox(8, progress, status, clipboardStatus, operationProgress.launcher(), unknownResults);
+        writeNotice.setId("write-notice");
+        writeNotice.managedProperty().bind(writeNotice.visibleProperty());
+        writeNotice.setVisible(false);
+        HBox bar = new HBox(8, progress, status, clipboardStatus, operationProgress.launcher(), writeNotice, unknownResults);
         bar.setAlignment(Pos.CENTER_LEFT);
         bar.getStyleClass().add("status-bar");
         return bar;
     }
 
     private void loadPlaces(boolean initial) {
-        runTask(task(cancelled -> new SystemCatalog(WindowsPlaces.load(), NewItems.load())), "正在读取系统位置…", false, catalog -> {
+        if (closing || catalogTask != null) { return; }
+        if (initial) { status.setText("正在读取系统位置…"); }
+        var read = task(cancelled -> new SystemCatalog(WindowsPlaces.load(), NewItems.load()));
+        catalogTask = read;
+        readDetail(read, catalog -> {
+            catalogTask = null;
             var result = catalog.places();
             places = result;
             newTypes = catalog.newTypes();
@@ -401,7 +440,12 @@ public final class FileManagerApp extends Application {
             }
             rebuildSidebar();
             refreshModifiedFolders();
-            refresh("");
+            if (initial || location.path() == null || browseRequest != null) { refresh(""); }
+            else { updateLocation(); updateControls(); }
+        }, failure -> {
+            catalogTask = null;
+            status.setText("无法读取系统位置");
+            showError(failure);
         });
     }
 
@@ -418,7 +462,7 @@ public final class FileManagerApp extends Application {
     }
 
     private void navigateFromAddress(String input) {
-        if (activeTask != null || places == null) { return; }
+        if (places == null || closing) { return; }
         String text = input.strip();
         try {
             if (text.isEmpty()) { throw new InvalidPathException(text, "请输入文件或文件夹路径"); }
@@ -432,11 +476,7 @@ public final class FileManagerApp extends Application {
             Path target = Path.of(text);
             Path relativeTo = location.path() == null ? WindowsPlaces.USER_HOME : location.path();
             Path path = relativeTo.resolve(target).normalize();
-            runTask(task(ignored -> Files.readAttributes(path, BasicFileAttributes.class).isDirectory()),
-                    "正在打开地址…", false, directory -> {
-                        if (directory) { navigate(Location.folder(path)); }
-                        else { openFile(path, path.getFileName().toString()); }
-                    });
+            navigate(Location.folder(path), true);
         } catch (InvalidPathException exception) {
             showError(exception);
         }
@@ -492,12 +532,17 @@ public final class FileManagerApp extends Application {
                 .findFirst().orElse(target.label());
         return new AddressBar.Crumb(label, null, () -> navigate(target), complete -> {
             LocalFiles.Visibility filter = visibility;
-            var read = task(cancelled -> LocalFiles.readDirectory(path, filter, cancelled));
-            read.setOnSucceeded(event -> complete.accept(new AddressBar.Children(read.getValue().entries().stream()
-                    .filter(LocalFiles.Entry::directory).map(BrowserItem::file).map(this::folderChoice).toList(),
-                    "没有可显示的子文件夹")));
-            read.setOnFailed(event -> complete.accept(new AddressBar.Children(List.of(), "无法读取子文件夹")));
-            disk.execute(read);
+            long version = listingVersion;
+            var read = task(cancelled -> readVisibleDirectory(path, filter, cancelled));
+            readDetail(read, result -> {
+                if (version == listingVersion) {
+                    complete.accept(new AddressBar.Children(result.entries().stream()
+                            .filter(LocalFiles.Entry::directory).map(BrowserItem::file).map(this::folderChoice).toList(),
+                            "没有可显示的子文件夹"));
+                }
+            }, failure -> {
+                if (version == listingVersion) { complete.accept(new AddressBar.Children(List.of(), "无法读取子文件夹")); }
+            });
         });
     }
 
@@ -513,15 +558,19 @@ public final class FileManagerApp extends Application {
     }
 
     private void navigate(Location target) {
+        navigate(target, false);
+    }
+
+    private void navigate(Location target, boolean openAddressFile) {
         if (target == null) { return; }
         Location previous = location;
-        request(target, "", "", () -> {
+        startBrowse(new BrowseIntent(target, "", homeTab, "", openAddressFile, () -> {
             if (!previous.equals(target)) {
                 past.push(previous);
                 future.clear();
             }
             visitFolder(target);
-        });
+        }));
     }
 
     private void history(Deque<Location> from, Deque<Location> to) {
@@ -541,48 +590,150 @@ public final class FileManagerApp extends Application {
     }
 
     private void refresh(String message) {
-        request(location, activeQuery, message, () -> {});
+        if (browseRequest == null) {
+            request(location, activeQuery, message, () -> {});
+        } else {
+            var pending = browseRequest.intent();
+            startBrowse(new BrowseIntent(pending.location(), pending.query(), pending.tab(), message,
+                    pending.openAddressFile(), pending.committed()));
+        }
     }
 
     private void request(Location target, String query, String message, Runnable loaded) {
-        if (places == null || activeTask != null) { return; }
-        boolean cancellable = !query.isEmpty() || target.page() == Page.GALLERY;
-        Work<Listing> work = listingWork(target, query);
-        String loading = query.isEmpty() ? "正在读取「" + target.label() + "」…" : "正在搜索「" + query + "」…";
-        runTask(task(work), loading, cancellable, result -> {
-            if (!location.equals(target) || !activeQuery.equals(query)) { browser.resetFilters(); }
-            location = target;
-            activeQuery = query;
-            listing = result;
-            loaded.run();
-            updateLocation();
-            render(false);
-            updateListingStatus(message);
+        startBrowse(new BrowseIntent(target, query, homeTab, message, false, loaded));
+    }
+
+    private void startBrowse(BrowseIntent intent) {
+        if (places == null || closing) { return; }
+        cancelBrowse();
+        Location target = intent.location();
+        Work<Listing> work = listingWork(target, intent.query(), intent.tab());
+        long queued = System.nanoTime();
+        var worker = task(cancelled -> {
+            readObserver.started(target.path(), intent.query(), System.nanoTime() - queued);
+            return readBrowse(intent, work, cancelled);
         });
+        var request = new BrowseRequest(intent, worker);
+        browseRequest = request;
+        status.setText(intent.query().isEmpty() ? "正在读取「" + target.label() + "」…"
+                : "正在搜索「" + intent.query() + "」…");
+        worker.setOnSucceeded(event -> {
+            if (owns(request)) { commitBrowse(request, worker.getValue()); }
+        });
+        worker.setOnFailed(event -> {
+            if (owns(request)) { browseFailed(request, worker.getException()); }
+        });
+        updateControls();
+        if (!reads.listing(worker)) { browseFailed(request, new IOException("读取队列暂满，请稍后刷新")); }
+    }
+
+    private BrowseData readBrowse(BrowseIntent intent, Work<Listing> work, BooleanSupplier cancelled) throws Exception {
+        Path path = intent.location().path();
+        if (path == null) { return new BrowseData(work.read(cancelled), null, null); }
+        requireVisible(path);
+        var attributes = Files.readAttributes(path, BasicFileAttributes.class);
+        if (!attributes.isDirectory() && intent.openAddressFile()) { return new BrowseData(null, null, path); }
+        var before = DirectoryIdentity.read(path, attributes);
+        var data = work.read(cancelled);
+        readObserver.ready(path, false);
+        if (cancelled.getAsBoolean()) { return null; }
+        var after = DirectoryIdentity.read(path);
+        if ((before.known() || after.known()) && !before.equals(after)) {
+            throw new IOException("读取期间目录身份已变化，请刷新：" + path);
+        }
+        return new BrowseData(data, after, null);
+    }
+
+    private boolean owns(BrowseRequest request) { return !closing && browseRequest == request; }
+
+    private void cancelBrowse() {
+        var old = browseRequest;
+        browseRequest = null;
+        if (old != null) { reads.cancel(old.task()); }
+    }
+
+    private boolean isSearching() {
+        return browseRequest != null && (!browseRequest.intent().query().isEmpty()
+                || browseRequest.intent().location().page() == Page.GALLERY);
+    }
+
+    private void commitBrowse(BrowseRequest request, BrowseData data) {
+        browseRequest = null;
+        if (data.file() != null) {
+            settleBrowse("");
+            openFile(data.file(), data.file().getFileName().toString());
+            return;
+        }
+        var intent = request.intent();
+        deferredRefresh = null;
+        boolean sameLocation = location.equals(intent.location());
+        boolean replaced = sameLocation && directoryIdentity != null && directoryIdentity.known()
+                && !directoryIdentity.equals(data.identity());
+        if (!sameLocation || !activeQuery.equals(intent.query()) || homeTab != intent.tab() || replaced) {
+            browser.resetFilters();
+        }
+        location = intent.location();
+        activeQuery = intent.query();
+        homeTab = intent.tab();
+        directoryIdentity = data.identity();
+        directoryUnavailable = false;
+        listing = data.listing();
+        listingVersion++;
+        updateLocation();
+        render(false);
+        intent.committed().run();
+        updateControls();
+        updateListingStatus(replaced ? "目录身份已变化，已重新读取" : intent.message());
+    }
+
+    private void browseFailed(BrowseRequest request, Throwable failure) {
+        browseRequest = null;
+        if (request.intent().location().equals(location) && location.path() != null
+                && (failure instanceof NoSuchFileException || failure instanceof NotDirectoryException
+                    || failure instanceof AccessDeniedException)) {
+            directoryUnavailable = true;
+            listing = new Listing(List.of(), 0, false);
+            listingVersion++;
+            render(false);
+        }
+        settleBrowse(directoryUnavailable ? "当前位置无法访问，可返回或上移" : "读取失败，当前页面已保留");
+        showError(failure);
+    }
+
+    private void settleBrowse(String message) {
+        if (!Objects.equals(searchField.getText(), activeQuery)) { searchField.setText(activeQuery); }
+        updateControls();
+        updateListingStatus(message);
+        if (deferredRefresh != null) {
+            String refresh = deferredRefresh;
+            deferredRefresh = null;
+            request(location, activeQuery, refresh, () -> {});
+        }
     }
 
     private void updateListingStatus(String message) {
-        if (activeTask != null) { return; }
+        if (browseRequest != null) { return; }
         String total = Integer.toString(listing.items().size());
         String count = browser.filtersActive() ? "显示 " + browser.items().size() + " / " + total : total;
         count += activeQuery.isEmpty() ? " 个项目" : " 个搜索结果";
         if (listing.limited()) { count += " · 已达结果上限"; }
         if (listing.unreadable() != 0) { count += " · " + listing.unreadable() + " 项无法读取"; }
+        if (directoryUnavailable && message.isEmpty()) { message = "当前位置无法访问，可返回或上移"; }
         status.setText(message.isEmpty() ? count : message + " · " + count);
     }
 
-    private Work<Listing> listingWork(Location target, String query) {
+    private Work<Listing> listingWork(Location target, String query, HomeTab tab) {
         LocalFiles.Visibility filters = visibility;
         String keyword = query.toLowerCase(Locale.ROOT);
         return switch (target.page()) {
             case DIRECTORY -> cancelled -> fromDisk(query.isEmpty()
-                    ? LocalFiles.readDirectory(target.path(), filters, cancelled)
-                    : LocalFiles.search(target.path(), query, filters, cancelled));
+                    ? readVisibleDirectory(target.path(), filters, cancelled)
+                    : LocalFiles.search(target.path(), query, filters, cancelled, staging::contains));
             case COMPUTER -> staticListing(places.computer(), keyword);
             case NETWORK -> staticListing(networkItems(), keyword);
             case LINUX -> staticListing(places.linux(), keyword);
             case GALLERY -> galleryWork(keyword, filters);
-            case HOME -> homeWork(keyword);
+            case HOME -> homeWork(keyword, tab);
         };
     }
 
@@ -599,7 +750,8 @@ public final class FileManagerApp extends Application {
             boolean limited = false;
             for (Path source : sources) {
                 try {
-                    var result = LocalFiles.images(source, keyword, filters, cancelled);
+                    if (staging.contains(source)) { continue; }
+                    var result = LocalFiles.images(source, keyword, filters, cancelled, staging::contains);
                     result.entries().forEach(entry -> matches.putIfAbsent(entry.path(), BrowserItem.file(entry)));
                     unreadable += result.unreadable();
                     limited |= result.limited();
@@ -620,20 +772,21 @@ public final class FileManagerApp extends Application {
         };
     }
 
-    private Work<Listing> homeWork(String keyword) {
-        if (homeTab == HomeTab.SHARED) { return staticListing(networkItems(), keyword); }
+    private Work<Listing> homeWork(String keyword, HomeTab tab) {
+        if (tab == HomeTab.SHARED) { return staticListing(networkItems(), keyword); }
         Map<Path, FileTime> source = new LinkedHashMap<>();
-        if (homeTab == HomeTab.FAVORITES) {
+        if (tab == HomeTab.FAVORITES) {
             favorites.forEach(path -> source.put(path, null));
         } else {
             source.putAll(recentFiles);
             places.recent().forEach(recent -> source.putIfAbsent(recent.path(), recent.time()));
         }
-        boolean onlyFiles = homeTab == HomeTab.RECENT;
+        boolean onlyFiles = tab == HomeTab.RECENT;
         return cancelled -> {
             List<BrowserItem> results = new ArrayList<>();
             for (var entry : source.entrySet()) {
                 if (cancelled.getAsBoolean()) { break; }
+                if (staging.contains(entry.getKey())) { continue; }
                 try {
                     BrowserItem item = BrowserItem.file(LocalFiles.describe(entry.getKey())).visitedAt(entry.getValue());
                     if ((!onlyFiles || !item.directory()) && item.name().toLowerCase(Locale.ROOT).contains(keyword)) {
@@ -649,6 +802,16 @@ public final class FileManagerApp extends Application {
 
     private static Listing fromDisk(LocalFiles.Listing result) {
         return new Listing(result.entries().stream().map(BrowserItem::file).toList(), result.unreadable(), result.limited());
+    }
+
+    private LocalFiles.Listing readVisibleDirectory(Path path, LocalFiles.Visibility filters, BooleanSupplier cancelled)
+            throws IOException {
+        requireVisible(path);
+        return LocalFiles.readDirectory(path, filters, cancelled, staging::contains);
+    }
+
+    private void requireVisible(Path path) throws IOException {
+        if (staging.contains(path)) { throw new IOException("该目录属于正在进行的文件任务：" + path); }
     }
 
     private void updateLocation() {
@@ -819,16 +982,16 @@ public final class FileManagerApp extends Application {
     private List<MenuItem> moreItems() {
         boolean windows = WindowsPlaces.WINDOWS;
         List<MenuItem> commands = new ArrayList<>();
-        commands.add(iconMenu("撤消", "undo", UiGlyph.UNDO, this::undo, undo.isEmpty()));
+        commands.add(iconMenu("撤消", "undo", UiGlyph.UNDO, this::undo, fileTask != null || undo.isEmpty()));
         BrowserItem drive = driveForTools();
         if (windows && (location.page() == Page.COMPUTER || drive != null)) {
             commands.add(new SeparatorMenuItem());
             commands.add(iconMenu("清理", "clean-drive", UiGlyph.CLEAN,
-                    () -> driveTool(drive, "清理", () -> WindowsPlaces.cleanDrive(drive.path()), false), drive == null));
+                    () -> driveTool(drive, "清理", () -> WindowsPlaces.cleanDrive(drive.path()), false), drive == null || fileTask != null));
             commands.add(iconMenu("优化", "optimize-drive", UiGlyph.DRIVE,
-                    () -> driveTool(drive, "优化", WindowsPlaces::optimizeDrives, false), drive == null));
+                    () -> driveTool(drive, "优化", WindowsPlaces::optimizeDrives, false), drive == null || fileTask != null));
             commands.add(iconMenu("格式化", "format-drive", UiGlyph.FORMAT,
-                    () -> driveTool(drive, "格式化", () -> WindowsPlaces.formatDrive(drive.path()), true), drive == null));
+                    () -> driveTool(drive, "格式化", () -> WindowsPlaces.formatDrive(drive.path()), true), drive == null || fileTask != null));
         }
         if (location.page() == Page.DIRECTORY) {
             commands.add(new SeparatorMenuItem());
@@ -838,8 +1001,9 @@ public final class FileManagerApp extends Application {
             commands.add(new SeparatorMenuItem());
             commands.add(iconMenu("连接到媒体服务器", "media-server", UiGlyph.MEDIA, this::connectMedia, false));
             commands.add(iconMenu("添加一个网络位置", "add-network", UiGlyph.NETWORK, this::addNetwork, false));
-            commands.add(iconMenu("映射网络驱动器", "map-network", UiGlyph.DRIVE, this::mapNetworkDrive, false));
-            commands.add(iconMenu("断开网络驱动器的连接", "disconnect-network", UiGlyph.DISCONNECT, this::disconnectNetworkDrive, false));
+            commands.add(iconMenu("映射网络驱动器", "map-network", UiGlyph.DRIVE, this::mapNetworkDrive, fileTask != null));
+            commands.add(iconMenu("断开网络驱动器的连接", "disconnect-network", UiGlyph.DISCONNECT,
+                    this::disconnectNetworkDrive, fileTask != null));
         }
         commands.add(new SeparatorMenuItem());
         commands.add(iconMenu("全部选择", "select-all", UiGlyph.SELECT_ALL, browser::selectAll, browser.items().isEmpty()));
@@ -867,8 +1031,8 @@ public final class FileManagerApp extends Application {
     }
 
     private void driveTool(BrowserItem drive, String label, FileAction action, boolean reload) {
-        if (drive == null || activeTask != null) { return; }
-        runTask(task(ignored -> {
+        if (drive == null || fileTask != null) { return; }
+        runFileTask(task(ignored -> {
             action.run();
             return null;
         }), "正在打开 Windows「" + label + "」…", false, ignored -> {
@@ -878,7 +1042,8 @@ public final class FileManagerApp extends Application {
     }
 
     private ContextMenu contextMenu(BrowserItem item) {
-        if (activeTask != null || places == null) { return null; }
+        if (places == null || closing) { return null; }
+        boolean unavailable = fileCommandsUnavailable();
         List<MenuItem> commands = new ArrayList<>();
         if (item == null) {
             commands.add(menuItem("刷新", "context-refresh", () -> fire("refresh")));
@@ -887,7 +1052,7 @@ public final class FileManagerApp extends Application {
             if (location.path() != null) {
                 commands.add(new SeparatorMenuItem());
                 if (canCreate()) { commands.add(submenu("新建", newItems())); }
-                commands.add(menuItem("粘贴", "context-paste", this::paste, transfer == null));
+                commands.add(menuItem("粘贴", "context-paste", this::paste, unavailable || transfer == null));
             }
         } else {
             commands.add(menuItem("打开", "context-open", () -> open(item)));
@@ -896,13 +1061,15 @@ public final class FileManagerApp extends Application {
             }
             if (canModify(browser.selection())) {
                 commands.add(new SeparatorMenuItem());
-                commands.add(menuItem("剪切", "context-cut", () -> rememberSelection(true)));
-                commands.add(menuItem("复制", "context-copy", () -> rememberSelection(false)));
+                commands.add(menuItem("剪切", "context-cut", () -> rememberSelection(true), unavailable));
+                commands.add(menuItem("复制", "context-copy", () -> rememberSelection(false), unavailable));
                 if (item.directory()) {
-                    commands.add(menuItem("粘贴到此文件夹", "context-paste-folder", () -> pasteInto(item.path()), transfer == null));
+                    commands.add(menuItem("粘贴到此文件夹", "context-paste-folder", () -> pasteInto(item.path()),
+                            unavailable || transfer == null));
                 }
-                commands.add(menuItem("重命名", "context-rename", this::renameSelected, browser.selection().size() != 1));
-                commands.add(menuItem("移到回收站", "context-trash", this::trashSelected));
+                commands.add(menuItem("重命名", "context-rename", this::renameSelected,
+                        unavailable || browser.selection().size() != 1));
+                commands.add(menuItem("移到回收站", "context-trash", this::trashSelected, unavailable));
             }
             if (item.directory() && item.path() != null && item.kind() != BrowserItem.Kind.DRIVE) {
                 commands.add(pinItem(item.path()));
@@ -971,7 +1138,7 @@ public final class FileManagerApp extends Application {
                 });
                 setOnContextMenuRequested(event -> {
                     if (!isEmpty() && getItem().location() != null && getItem().location().path() != null
-                            && getItem().location().path().getParent() != null && activeTask == null) {
+                            && getItem().location().path().getParent() != null && fileTask == null) {
                         Path path = getItem().location().path();
                         new ContextMenu(pinItem(path)).show(this, event.getScreenX(), event.getScreenY());
                         event.consume();
@@ -1030,6 +1197,9 @@ public final class FileManagerApp extends Application {
     }
 
     private void rebuildSidebar() {
+        sidebarVersion++;
+        treeReads.values().forEach(reads::cancel);
+        treeReads.clear();
         Set<Path> expanded = new HashSet<>();
         for (int i = 0; i < tree.getExpandedItemCount(); i++) {
             var node = tree.getTreeItem(i);
@@ -1062,19 +1232,30 @@ public final class FileManagerApp extends Application {
 
     private TreeItem<SideNode> directoryItem(BrowserItem item, Set<Path> expanded) {
         Path path = item.path();
+        long version = sidebarVersion;
         var branch = new TreeItem<>(new SideNode(item.name(), Location.folder(path), item));
         branch.getChildren().add(new TreeItem<>(new SideNode("正在读取…", null, null)));
         branch.expandedProperty().addListener((observable, oldValue, newValue) -> {
-            if (!newValue || branch.getChildren().size() != 1
+            if (!newValue) {
+                var pending = treeReads.remove(branch);
+                if (pending != null) { reads.cancel(pending); }
+                return;
+            }
+            if (version != sidebarVersion || treeReads.containsKey(branch) || branch.getChildren().size() != 1
                     || !branch.getChildren().getFirst().getValue().label().equals("正在读取…")) { return; }
             LocalFiles.Visibility filter = visibility;
-            var task = task(cancelled -> LocalFiles.readDirectory(path, filter, cancelled));
-            task.setOnSucceeded(event -> branch.getChildren().setAll(task.getValue().entries().stream()
-                    .filter(LocalFiles.Entry::directory).map(BrowserItem::file)
-                    .map(child -> directoryItem(child, expanded)).toList()));
-            task.setOnFailed(event -> branch.getChildren().setAll(List.of(
-                    new TreeItem<>(new SideNode("无法读取此文件夹", null, null)))));
-            disk.execute(task);
+            var read = task(cancelled -> readVisibleDirectory(path, filter, cancelled));
+            treeReads.put(branch, read);
+            readDetail(read, result -> {
+                if (treeReads.remove(branch, read) && version == sidebarVersion && branch.isExpanded()) {
+                    branch.getChildren().setAll(result.entries().stream().filter(LocalFiles.Entry::directory)
+                            .map(BrowserItem::file).map(child -> directoryItem(child, expanded)).toList());
+                }
+            }, failure -> {
+                if (treeReads.remove(branch, read) && version == sidebarVersion && branch.isExpanded()) {
+                    branch.getChildren().setAll(List.of(new TreeItem<>(new SideNode("无法读取此文件夹", null, null))));
+                }
+            });
         });
         if (expanded.contains(path)) { branch.setExpanded(true); }
         return branch;
@@ -1128,20 +1309,19 @@ public final class FileManagerApp extends Application {
         Map<Path, FileTime> recorded = Map.copyOf(folderEdits);
         LocalFiles.Visibility filters = visibility;
         Task<List<Path>> scan = task(cancelled -> LocalFiles.recentlyModifiedFolders(
-                known, recorded, WindowsPlaces.indexedModifiedItems(), filters, cancelled));
+                known, recorded, WindowsPlaces.indexedModifiedItems(), filters, cancelled).stream()
+                .filter(path -> !staging.contains(path)).toList());
         modifiedFoldersTask = scan;
-        scan.setOnSucceeded(event -> {
+        readDetail(scan, result -> {
             List<BrowserItem> previous = latestFolders();
-            modifiedFolders = scan.getValue();
+            modifiedFolders = result;
             if (!previous.equals(latestFolders())) {
                 refreshQuickAccess();
                 markLocation();
                 if (homeLayout()) { refreshOverview(); }
             }
             finishModifiedFoldersRefresh();
-        });
-        scan.setOnFailed(event -> finishModifiedFoldersRefresh());
-        Thread.startVirtualThread(scan);
+        }, failure -> finishModifiedFoldersRefresh());
     }
 
     private void finishModifiedFoldersRefresh() {
@@ -1281,12 +1461,9 @@ public final class FileManagerApp extends Application {
         button.setId("home-" + tab.name().toLowerCase(Locale.ROOT));
         button.getStyleClass().add(tab == homeTab ? "active-tab" : "home-tab");
         button.setOnAction(event -> {
-            if (activeTask != null) { return; }
             if (!browser.homeFilesExpanded()) { browser.toggleHomeFiles(); }
-            if (tab == homeTab) { return; }
-            homeTab = tab;
-            browser.resetFilters();
-            refresh("");
+            if (tab == homeTab && browseRequest == null) { return; }
+            startBrowse(new BrowseIntent(location, activeQuery, tab, "", false, () -> {}));
         });
         return button;
     }
@@ -1324,7 +1501,7 @@ public final class FileManagerApp extends Application {
     }
 
     private void addNetwork() {
-        if (activeTask != null) { return; }
+        if (fileTask != null) { return; }
         chooseText("添加一个网络位置", "共享路径", "", input -> {
             Path path = WindowsPlaces.networkPath(input);
             if (networkLocations.add(path)) {
@@ -1343,7 +1520,7 @@ public final class FileManagerApp extends Application {
     }
 
     private void mapNetworkDrive() {
-        runTask(task(ignored -> { WindowsPlaces.mapNetworkDrive(); return null; }),
+        runFileTask(task(ignored -> { WindowsPlaces.mapNetworkDrive(); return null; }),
                 "等待 Windows 网络驱动器对话框…", false, ignored -> loadPlaces(false));
     }
 
@@ -1366,7 +1543,7 @@ public final class FileManagerApp extends Application {
         dialog.setOnHidden(event -> {
             Path drive = drives.get(dialog.getResult());
             if (drive != null) {
-                runTask(task(ignored -> { WindowsPlaces.disconnectNetworkDrive(drive); return null; }),
+                runFileTask(task(ignored -> { WindowsPlaces.disconnectNetworkDrive(drive); return null; }),
                         "正在断开网络驱动器…", false, ignored -> loadPlaces(false));
             }
         });
@@ -1388,7 +1565,7 @@ public final class FileManagerApp extends Application {
                             || "https".equalsIgnoreCase(uri.getScheme()))) {
                         throw new IllegalArgumentException("请输入有效的 HTTP 或 HTTPS 网址");
                     }
-                    runTask(task(ignored -> { Desktop.getDesktop().browse(uri); return null; }),
+                    runFileTask(task(ignored -> { Desktop.getDesktop().browse(uri); return null; }),
                             "正在打开媒体服务器…", false, ignored -> status.setText("已在浏览器中打开"));
                 });
             }
@@ -1396,7 +1573,7 @@ public final class FileManagerApp extends Application {
     }
 
     private void browseNetwork() {
-        runTask(task(ignored -> { WindowsPlaces.openNetworkDiscovery(); return null; }), "正在打开 Windows 网络…",
+        runFileTask(task(ignored -> { WindowsPlaces.openNetworkDiscovery(); return null; }), "正在打开 Windows 网络…",
                 false, ignored -> status.setText("已打开 Windows 网络"));
     }
 
@@ -1413,7 +1590,7 @@ public final class FileManagerApp extends Application {
 
     private void refreshInspector() {
         if (previewTask != null) {
-            previewTask.cancel();
+            reads.cancel(previewTask);
             previewTask = null;
         }
         inspector.getChildren().clear();
@@ -1436,37 +1613,48 @@ public final class FileManagerApp extends Application {
     }
 
     private void preview(BrowserItem item) {
-        if (item.kind() != BrowserItem.Kind.FILE) {
+        if (item.kind() != BrowserItem.Kind.FILE || item.entry() == null) {
             inspector.getChildren().add(new Label("此项目没有文件预览"));
-            return;
-        }
-        if (LocalFiles.isImage(item.path())) {
-            Image image = new Image(item.path().toUri().toString(), 220, 340, true, true, true);
-            ImageView view = new ImageView(image);
-            view.setPreserveRatio(true);
-            view.setFitWidth(220);
-            view.setFitHeight(340);
-            Runnable imageError = () -> inspector.getChildren().setAll(new Label("无法预览此图片"));
-            image.errorProperty().addListener((observable, previous, failed) -> {
-                if (failed && inspector.getChildren().contains(view)) { imageError.run(); }
-            });
-            inspector.getChildren().add(view);
-            if (image.isError()) { imageError.run(); }
             return;
         }
         Label hint = new Label("正在读取预览…");
         inspector.getChildren().add(hint);
-        Task<String> task = task(cancelled -> {
+        long version = listingVersion;
+        var read = task(cancelled -> {
+            requireVisible(item.path());
+            var selection = FileChanges.capture(item.entry());
+            LocalFiles.verify(item.entry(), true);
+            PreviewData data;
             try (var input = Files.newInputStream(item.path())) {
-                String text = new String(input.readNBytes(8192), StandardCharsets.UTF_8);
-                if (text.indexOf('\0') >= 0 || text.indexOf('\ufffd') >= 0) { return null; }
-                return text;
+                if (LocalFiles.isImage(item.path())) {
+                    var image = new Image(input, 220, 340, true, true);
+                    if (image.isError()) { throw new IOException("无法预览此图片", image.getException()); }
+                    data = new PreviewData(image, null);
+                } else {
+                    String text = new String(input.readNBytes(8192), StandardCharsets.UTF_8);
+                    data = new PreviewData(null, text.indexOf('\0') >= 0 || text.indexOf('\ufffd') >= 0 ? null : text);
+                }
             }
+            readObserver.ready(item.path(), true);
+            if (!cancelled.getAsBoolean()) {
+                if (selection.nativeItem() != null) { NtfsFileOperations.verify(selection.nativeItem()); }
+                else { LocalFiles.verify(item.entry(), true); }
+            }
+            return data;
         });
-        previewTask = task;
-        task.setOnSucceeded(event -> {
-            if (previewTask != task) { return; }
-            String text = task.getValue();
+        previewTask = read;
+        readDetail(read, result -> {
+            if (previewTask != read || listingVersion != version || selectedItem() != item) { return; }
+            previewTask = null;
+            if (result.image() != null) {
+                var image = new ImageView(result.image());
+                image.setPreserveRatio(true);
+                image.setFitWidth(220);
+                image.setFitHeight(340);
+                inspector.getChildren().set(inspector.getChildren().indexOf(hint), image);
+                return;
+            }
+            String text = result.text();
             if (text == null) { hint.setText("此格式没有文本预览"); }
             else if (text.isEmpty()) { hint.setText("空文件"); }
             else {
@@ -1477,9 +1665,12 @@ public final class FileManagerApp extends Application {
                 inspector.getChildren().set(inspector.getChildren().indexOf(hint), preview);
                 VBox.setVgrow(preview, Priority.ALWAYS);
             }
+        }, failure -> {
+            if (previewTask == read) {
+                previewTask = null;
+                hint.setText("无法读取此文件，项目可能已变化");
+            }
         });
-        task.setOnFailed(event -> { if (previewTask == task) { hint.setText("无法读取此文件"); } });
-        disk.execute(task);
     }
 
     private static String propertiesText(BrowserItem item) {
@@ -1520,8 +1711,9 @@ public final class FileManagerApp extends Application {
             if (drive.isPresent()) {
                 showProperties(drive.get());
             } else {
-                runTask(task(ignored -> BrowserItem.file(LocalFiles.describe(path))), "正在读取属性…", false,
-                        item -> { updateListingStatus(""); showProperties(item); });
+                long version = listingVersion;
+                readDetail(task(ignored -> BrowserItem.file(LocalFiles.describe(path))),
+                        item -> { if (version == listingVersion) { showProperties(item); } }, this::showError);
             }
         }
     }
@@ -1536,42 +1728,41 @@ public final class FileManagerApp extends Application {
             WindowsPlaces.showProperties(path);
             return null;
         });
-        properties.setOnFailed(event -> showError(properties.getException()));
-        Thread.startVirtualThread(properties);
+        readDetail(properties, ignored -> {}, this::showError);
     }
 
     private void open(BrowserItem item) {
-        if (activeTask != null || item == null) { return; }
+        if (closing || item == null) { return; }
         if (item.directory()) {
             navigate(Location.folder(item.path()));
         } else if (item.kind() == BrowserItem.Kind.SHELL) {
-            runTask(task(ignored -> { WindowsPlaces.openShortcut(item.shellTarget()); return null; }),
-                    "正在打开快捷方式…", false, ignored -> status.setText("已打开「" + item.name() + "」"));
+            readDetail(task(ignored -> { WindowsPlaces.openShortcut(item.shellTarget()); return null; }),
+                    ignored -> updateListingStatus("已打开「" + item.name() + "」"), this::showError);
         } else {
             openFile(item.path(), item.name());
         }
     }
 
     private void openFile(Path path, String name) {
-        runTask(task(ignored -> { LocalFiles.open(path); return null; }), "正在打开文件…", false, ignored -> {
+        readDetail(task(ignored -> { LocalFiles.open(path); return null; }), ignored -> {
             rememberVisit("recentFiles", recentFiles, path);
             if (path.getParent() != null) {
                 rememberVisit("recentFolders", folderHistory, path.getParent());
             }
             if (location.page() == Page.HOME && homeTab == HomeTab.RECENT) { refresh("已打开「" + name + "」"); }
             else { status.setText("已打开「" + name + "」"); }
-        });
+        }, this::showError);
     }
 
     private boolean canCreate() {
-        return activeTask == null && location.path() != null && activeQuery.isEmpty();
+        return !fileCommandsUnavailable() && location.path() != null && activeQuery.isEmpty();
     }
 
     private void create(NewItems.Type type) {
         if (!canCreate() || places == null) { return; }
         Path directory = location.path();
         switch (type.kind()) {
-            case COMMAND -> runTask(task(ignored -> {
+            case COMMAND -> runFileTask(task(ignored -> {
                 WindowsPlaces.launchNewCommand(directory, type.value());
                 return null;
             }), "正在打开「" + type.label() + "」的创建向导…", false,
@@ -1585,39 +1776,47 @@ public final class FileManagerApp extends Application {
     }
 
     private void createItem(String label, Work<NewItems.Created> work) {
-        writing = true;
-        runTask(task(work), "正在新建" + label + "…", false, created -> {
+        if (fileCommandsUnavailable()) { return; }
+        Location origin = location;
+        long view = listingVersion;
+        runFileTask(task(work), "正在新建" + label + "…", true, created -> {
             undo = List.of(FileChanges.undoCreation(created.path()));
             recordFolderEdits(Stream.of(created.path().getParent()));
             rebuildSidebar();
-            request(location, "", "已新建" + label, () -> Platform.runLater(() -> {
+            if (browseRequest != null || !location.equals(origin) || listingVersion != view) {
+                refreshAffected(BrowseImpact.ofParent(created.path()), "已新建" + label, () -> {});
+                return;
+            }
+            request(location, "", "已新建" + label, () -> {
                 if (browser.filtersActive() && browser.items().stream().noneMatch(item -> created.path().equals(item.path()))) {
                     browser.clearFilters();
                     updateListingStatus("已新建" + label);
                 }
                 browser.editName(created.path(), created.extension(), true, name -> renameNewItem(created, name));
-            }));
+            });
         });
     }
 
     private void renameNewItem(NewItems.Created created, String name) {
-        if (activeTask != null || name.isBlank()) { return; }
-        runTask(task(ignored -> FileChanges.capture(created.entry())), "正在核对新建项目…", false,
+        if (fileCommandsUnavailable() || name.isBlank()) { return; }
+        runFileTask(task(ignored -> FileChanges.capture(created.entry())), "正在核对新建项目…", false,
                 selection -> renameEntry(selection, name));
     }
 
     private void renameSelected() {
         BrowserItem selected = selectedItem();
-        if (selected == null || selected.entry() == null || browser.selection().size() != 1 || activeTask != null) { return; }
+        if (selected == null || selected.entry() == null || browser.selection().size() != 1 || fileCommandsUnavailable()) { return; }
         String extension = selected.name().substring(LocalFiles.extensionStart(selected.name(), selected.directory()));
-        runTask(task(ignored -> FileChanges.capture(selected.entry())), "正在核对所选项目…", false, selection -> {
+        runFileTask(task(ignored -> FileChanges.capture(selected.entry())), "正在核对所选项目…", false, selection -> {
             updateListingStatus("");
-            browser.editName(selected.path(), extension, false, name -> renameEntry(selection, name));
+            if (browseRequest == null && selectedItem() == selected) {
+                browser.editName(selected.path(), extension, false, name -> renameEntry(selection, name));
+            }
         });
     }
 
     private void renameEntry(Selection entry, String name) {
-        if (activeTask != null || name.isBlank()) { return; }
+        if (fileCommandsUnavailable() || name.isBlank()) { return; }
         try {
             Path target = LocalFiles.childNamed(entry.path().getParent(), name);
             if (entry.path().toString().equals(target.toString())
@@ -1627,7 +1826,7 @@ public final class FileManagerApp extends Application {
             }
             Change change = FileChanges.rename(entry, target, entry.needsPathConfirmation());
             applyChanges(Kind.RENAME, "正在重命名…", "已重命名", List.of(change), ignored -> { },
-                    () -> Platform.runLater(() -> browser.reveal(target)));
+                    () -> browser.reveal(target));
         } catch (InvalidPathException exception) {
             showError(exception);
         }
@@ -1635,7 +1834,7 @@ public final class FileManagerApp extends Application {
 
     private void rememberSelection(boolean move) {
         List<BrowserItem> selected = browser.selection();
-        if (!canModify(selected) || activeTask != null) { return; }
+        if (!canModify(selected) || fileCommandsUnavailable()) { return; }
         captureSelection(selected, sources -> {
             transfer = new Transfer(sources, move);
             describeTransfer();
@@ -1644,7 +1843,7 @@ public final class FileManagerApp extends Application {
     }
 
     private void captureSelection(List<BrowserItem> selected, Consumer<List<Selection>> ready) {
-        runTask(task(ignored -> {
+        runFileTask(task(ignored -> {
             List<Selection> result = new ArrayList<>();
             for (BrowserItem item : selected) {
                 result.add(FileChanges.capture(item.entry()));
@@ -1666,8 +1865,8 @@ public final class FileManagerApp extends Application {
 
     private void pasteInto(Path directory) {
         Transfer pending = transfer;
-        if (activeTask != null || pending == null) { return; }
-        runTask(task(ignored -> FileChanges.destination(directory)), "正在核对目标文件夹…", false, destination -> {
+        if (fileCommandsUnavailable() || pending == null) { return; }
+        runFileTask(task(ignored -> FileChanges.destination(directory)), "正在核对目标文件夹…", false, destination -> {
             Predicate<Selection> unverified = source -> source.needsPathConfirmation(destination, pending.move());
             if (!confirmCurrentPaths(pending.sources(), unverified, pending.move() ? "移动" : "复制", false)) {
                 updateListingStatus("");
@@ -1687,7 +1886,7 @@ public final class FileManagerApp extends Application {
 
     private void trashSelected() {
         List<BrowserItem> selected = browser.selection();
-        if (!canModify(selected) || activeTask != null) { return; }
+        if (!canModify(selected) || fileCommandsUnavailable()) { return; }
         captureSelection(selected, entries -> {
             if (!confirmCurrentPaths(entries, Selection::needsPathConfirmation, "移到回收站", true)) {
                 updateListingStatus("");
@@ -1739,7 +1938,7 @@ public final class FileManagerApp extends Application {
     }
 
     private void undo() {
-        if (activeTask != null || undo.isEmpty()) { return; }
+        if (fileTask != null || closing || undo.isEmpty()) { return; }
         runFileOperation(Kind.UNDO, undo, "正在撤消…", outcome -> {
             undo = outcome.pending();
             afterWrite(Kind.UNDO, "已撤消", outcome, () -> {});
@@ -1747,17 +1946,17 @@ public final class FileManagerApp extends Application {
     }
 
     private void runFileOperation(Kind kind, List<Change> changes, String running, Consumer<Outcome> complete) {
-        if (activeTask != null) { return; }
+        if (fileTask != null || closing) { return; }
         var operation = operationFactory.apply(kind, changes);
+        operation.observeStagingWith(staging);
         activeFileOperation = operation;
         operationProgress.start(operation);
-        writing = true;
         Task<Outcome> worker = task(ignored -> operation.run());
         worker.addEventHandler(WorkerStateEvent.WORKER_STATE_FAILED, event -> {
             activeFileOperation = null;
-            operationProgress.failed(worker.getException());
+            if (!closing) { operationProgress.failed(worker.getException()); }
         });
-        runTask(worker, running, false, outcome -> {
+        runFileTask(worker, running, true, outcome -> {
             operationProgress.finish(outcome);
             activeFileOperation = null;
             complete.accept(outcome);
@@ -1772,13 +1971,7 @@ public final class FileManagerApp extends Application {
         IOException error = outcome.error();
         String message = outcome.summary(completed);
         if (!outcome.issues().isEmpty()) { message += " · 查看文件任务详情"; }
-        boolean mayHaveWritten = outcome.count(State.APPLIED) + outcome.count(State.UNKNOWN) > 0;
-        if (mayHaveWritten) { rebuildSidebar(); }
-        if (mayHaveWritten || outcome.count(State.FAILED) > 0 || !outcome.issues().isEmpty()) {
-            request(location, activeQuery, message, error == null ? reloaded : () -> {});
-        } else {
-            updateListingStatus(message);
-        }
+        refreshAffected(BrowseImpact.from(kind, outcome), message, error == null ? reloaded : () -> {});
         if (outcome.count(State.UNKNOWN) > 0) {
             showError(new IOException(error.getMessage() + "\n可用状态栏的「核查结果」查看路径并重新选择。", error));
         } else if (error != null) {
@@ -1786,62 +1979,115 @@ public final class FileManagerApp extends Application {
         }
     }
 
+    private void refreshAffected(BrowseImpact impact, String message, Runnable reloaded) {
+        boolean sidebarAffected = false;
+        for (int index = 0; index < tree.getExpandedItemCount(); index++) {
+            var branch = tree.getTreeItem(index);
+            if (branch != null && branch.isExpanded() && branch.getValue().location() != null) {
+                Path path = branch.getValue().location().path();
+                if (path != null && impact.affectsDirectory(path, false)) {
+                    sidebarAffected = true;
+                    break;
+                }
+            }
+        }
+        if (sidebarAffected) { rebuildSidebar(); }
+        boolean affectsCurrent = dependsOn(impact, location, activeQuery, homeTab);
+        if (browseRequest == null) {
+            if (affectsCurrent) { request(location, activeQuery, message, reloaded); }
+            else { updateListingStatus(message); }
+        } else {
+            if (affectsCurrent) { deferredRefresh = message; }
+            BrowseIntent pending = browseRequest.intent();
+            if (dependsOn(impact, pending.location(), pending.query(), pending.tab())) {
+                startBrowse(pending);
+            }
+        }
+    }
+
+    private boolean dependsOn(BrowseImpact impact, Location target, String query, HomeTab tab) {
+        return switch (target.page()) {
+            case DIRECTORY -> impact.affectsDirectory(target.path(), !query.isEmpty());
+            case GALLERY -> galleryFolders.stream().anyMatch(path -> impact.affectsDirectory(path, true));
+            case HOME -> switch (tab) {
+                case RECENT -> recentFiles.keySet().stream().anyMatch(impact::affectsEntry)
+                        || places.recent().stream().anyMatch(recent -> impact.affectsEntry(recent.path()));
+                case FAVORITES -> favorites.stream().anyMatch(impact::affectsEntry);
+                case SHARED -> false;
+            };
+            default -> false;
+        };
+    }
+
     private void inspectUnknownResults() {
-        if (activeTask != null || unknownOperations.isEmpty()) { return; }
+        if (closing || unknownOperations.isEmpty()) { return; }
         var records = List.copyOf(unknownOperations.reversed());
-        runTask(task(ignored -> {
+        readDetail(task(ignored -> {
             Map<FileChanges.UnknownOperation, List<LocalFiles.Observation>> observations = new LinkedHashMap<>();
             for (var operation : records) { observations.put(operation, LocalFiles.observe(operation.paths())); }
             return observations;
-        }), "正在只读核查路径…", false, observations -> UnknownResultsDialog.show(stage, observations)
+        }), observations -> UnknownResultsDialog.show(stage, observations)
                 .filter(path -> path.getParent() != null).ifPresent(path -> {
                     Location target = Location.folder(path.getParent());
-                    if (!target.equals(location)) {
-                        past.addFirst(location);
-                        future.clear();
-                    }
-                    request(target, "", "请检查当前项目并重新发起操作", () -> browser.reveal(path));
-                }));
+                    Location previous = location;
+                    request(target, "", "请检查当前项目并重新发起操作", () -> {
+                        if (!target.equals(previous)) {
+                            past.addFirst(previous);
+                            future.clear();
+                        }
+                        browser.reveal(path);
+                    });
+                }), this::showError);
     }
 
-    private <T> void runTask(Task<T> task, String running, boolean cancellable, Consumer<T> success) {
-        if (activeTask != null) { return; }
-        activeTask = task;
-        searching = cancellable;
-        status.setText(running);
+    private <T> void readDetail(Task<T> task, Consumer<T> success, Consumer<Throwable> failure) {
+        if (closing) { return; }
+        task.setOnSucceeded(event -> { if (!closing) { success.accept(task.getValue()); } });
+        task.setOnFailed(event -> { if (!closing) { failure.accept(task.getException()); } });
+        if (!reads.detail(task)) { failure.accept(new IOException("读取队列暂满，请稍后重试")); }
+    }
+
+    private <T> void runFileTask(Task<T> task, String running, boolean writesDisk, Consumer<T> success) {
+        if (fileTask != null || closing) { return; }
+        fileTask = task;
+        writing = writesDisk;
+        if (browseRequest == null) { status.setText(running); }
         updateControls();
         task.setOnSucceeded(event -> {
-            finishTask();
-            success.accept(task.getValue());
-            updateControls();
+            finishFileTask();
+            if (!closing) {
+                success.accept(task.getValue());
+                updateControls();
+            }
         });
         task.setOnFailed(event -> {
-            finishTask();
-            status.setText("操作失败");
-            updateControls();
-            showError(task.getException());
+            finishFileTask();
+            if (!closing) {
+                updateListingStatus("操作失败");
+                updateControls();
+                showError(task.getException());
+            }
         });
         task.setOnCancelled(event -> {
-            finishTask();
-            status.setText("已取消读取");
-            updateControls();
+            finishFileTask();
+            if (!closing) { updateControls(); }
         });
-        disk.execute(task);
+        writes.execute(task);
     }
 
-    private void finishTask() {
-        activeTask = null;
-        searching = false;
+    private void finishFileTask() {
+        fileTask = null;
         writing = false;
     }
 
     private void updateControls() {
-        boolean busy = activeTask != null;
-        unknownResults.setDisable(busy);
-        boolean unavailable = busy || places == null;
-        boolean writableFolder = !unavailable && location.path() != null;
+        boolean unavailable = closing || places == null;
+        boolean commandsUnavailable = fileCommandsUnavailable();
+        boolean writableFolder = !commandsUnavailable && location.path() != null;
+        unknownResults.setDisable(unavailable);
+        writeNotice.setVisible(fileTask != null);
         List<BrowserItem> selected = browser.selection();
-        boolean editable = !unavailable && canModify(selected);
+        boolean editable = !commandsUnavailable && canModify(selected);
         tree.setDisable(unavailable);
         syncNavigationPane();
         overview.setDisable(unavailable);
@@ -1852,8 +2098,8 @@ public final class FileManagerApp extends Application {
         controls.get("up").setDisable(unavailable || parentLocation() == null);
         controls.get("refresh").setDisable(unavailable);
         controls.get("search").setDisable(unavailable);
-        controls.get("cancel-search").setVisible(searching);
-        controls.get("clear-search").setVisible(!searching && !activeQuery.isEmpty());
+        controls.get("cancel-search").setVisible(isSearching());
+        controls.get("clear-search").setVisible(!isSearching() && !activeQuery.isEmpty());
         controls.get("clear-search").setDisable(unavailable);
         controls.get("new").setDisable(unavailable || !canCreate());
         controls.get("copy").setDisable(!editable);
@@ -1864,7 +2110,11 @@ public final class FileManagerApp extends Application {
         for (String id : List.of("sort", "view", "more", "gallery-sources")) { controls.get(id).setDisable(unavailable); }
         controls.get("gallery-sources").setVisible(location.page() == Page.GALLERY);
         controls.get("details-pane").setDisable(places == null);
-        progress.setVisible(busy);
+        progress.setVisible(browseRequest != null || fileTask != null || catalogTask != null);
+    }
+
+    private boolean fileCommandsUnavailable() {
+        return closing || places == null || fileTask != null || browseRequest != null || directoryUnavailable;
     }
 
     private BrowserItem selectedItem() { return browser.selection().stream().findFirst().orElse(null); }

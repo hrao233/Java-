@@ -43,9 +43,15 @@ final class StagedCopy {
     private static Result portableCopy(Path source, Path target, boolean sameFolder,
                                        BasicFileAttributes sourceAttributes, FileOperationTask task) throws IOException {
         task.unknownSize();
-        Path staged = sourceAttributes.isDirectory()
-                ? Files.createTempDirectory(target.getParent(), ".file-manager-")
-                : target.getParent().resolve(".file-manager-" + UUID.randomUUID());
+        Path staged;
+        synchronized (task.staging()) {
+            if (sourceAttributes.isDirectory()) {
+                staged = Files.createTempDirectory(target.getParent(), ".file-manager-");
+                task.staging().register(staged);
+            } else {
+                staged = target.getParent().resolve(".file-manager-" + UUID.randomUUID());
+            }
+        }
         boolean published = false;
         try {
             Files.walkFileTree(source, new SimpleFileVisitor<>() {
@@ -76,9 +82,13 @@ final class StagedCopy {
             published = true;
             return new Result(result, attrs);
         } finally {
-            task.phase(CLEANUP);
-            if (!published && !Files.notExists(staged, NOFOLLOW_LINKS)) {
-                task.issue(staged, "当前文件系统无法按已验证的句柄清理暂存项目，已保留供核查", null);
+            try {
+                task.phase(CLEANUP);
+                if (!published && !Files.notExists(staged, NOFOLLOW_LINKS)) {
+                    task.issue(staged, "当前文件系统无法按已验证的句柄清理暂存项目，已保留供核查", null);
+                }
+            } finally {
+                task.staging().forget(staged);
             }
         }
     }
@@ -124,7 +134,19 @@ final class StagedCopy {
             this.parent = parent;
             this.task = task;
             String name = ".file-manager-" + UUID.randomUUID();
-            root = createDirectory(parent, name);
+            synchronized (task.staging()) {
+                root = createDirectory(parent, name);
+                try {
+                    task.staging().register(root);
+                } catch (IOException failure) {
+                    try (root) { root.deleteOnClose(); }
+                    catch (IOException cleanup) {
+                        failure.addSuppressed(cleanup);
+                        task.issue(root.path(), "无法清理身份读取失败的暂存目录", cleanup);
+                    }
+                    throw failure;
+                }
+            }
             entries = new StagedEntry(name, true);
             opened.addLast(new OpenDirectory(root, entries, null));
         }
@@ -287,6 +309,8 @@ final class StagedCopy {
                 root.deleteOnClose();
             } catch (IOException failure) {
                 task.issue(root.path(), "暂存目录可能仍有残留", failure);
+            } finally {
+                task.staging().forget(root.path());
             }
         }
 

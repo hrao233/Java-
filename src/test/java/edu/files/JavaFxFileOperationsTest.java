@@ -17,6 +17,7 @@ import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
 import javafx.stage.Stage;
 import javafx.stage.Window;
+import javafx.stage.WindowEvent;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledIfSystemProperty;
 import org.junit.jupiter.api.condition.EnabledOnOs;
@@ -39,6 +40,7 @@ import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.prefs.AbstractPreferences;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -58,6 +60,8 @@ class JavaFxFileOperationsTest {
     private final AtomicInteger injectedWrites = new AtomicInteger();
     private final CountDownLatch copyHasBytes = new CountDownLatch(1);
     private final CountDownLatch releaseCopy = new CountDownLatch(1);
+    private final AtomicReference<ReadGate> heldRead = new AtomicReference<>();
+    private final AtomicReference<Gate> heldPublish = new AtomicReference<>();
     private Path captures;
 
     @Test
@@ -75,7 +79,7 @@ class JavaFxFileOperationsTest {
         assertTrue(ready.await(10, TimeUnit.SECONDS));
         try {
             fx(() -> {
-                app = new FileManagerApp(new MemoryPreferences(null, ""), this::operation);
+                app = new FileManagerApp(new MemoryPreferences(null, ""), this::operation, this::readReady);
                 stage = new Stage();
                 stage.setOpacity(0);
                 app.start(stage);
@@ -121,8 +125,13 @@ class JavaFxFileOperationsTest {
             runPartialCut();
             runLongCopy();
             runUnknownMoveAndUndo();
+            runReadRaces();
+            runWriteAgainstNavigation(false);
+            runWriteAgainstNavigation(true);
         } finally {
             releaseCopy.countDown();
+            if (heldRead.get() != null) { heldRead.get().gate().release.countDown(); }
+            if (heldPublish.get() != null) { heldPublish.get().release.countDown(); }
             fx(() -> {
                 for (var window : List.copyOf(Window.getWindows())) {
                     if (window != stage && window.getScene().getRoot() instanceof DialogPane) { window.hide(); }
@@ -153,11 +162,16 @@ class JavaFxFileOperationsTest {
             return new FileOperationTask(kind, List.of(uncertain));
         }
         return new FileOperationTask(kind, changes, sample -> {
+            Gate publish = heldPublish.get();
+            if (kind == FileOperationTask.Kind.COPY && sample.phase() == FileOperationTask.Phase.PUBLISHING
+                    && publish != null && heldPublish.compareAndSet(publish, null)) {
+                publish.hold();
+            }
             if (kind == FileOperationTask.Kind.COPY && sample.transferredBytes() > 0
                     && pauseNativeCopy.compareAndSet(true, false)) {
                 copyHasBytes.countDown();
                 try {
-                    assertTrue(releaseCopy.await(14, TimeUnit.SECONDS));
+                    assertTrue(releaseCopy.await(45, TimeUnit.SECONDS));
                 } catch (InterruptedException failure) {
                     Thread.currentThread().interrupt();
                     throw new AssertionError(failure);
@@ -169,6 +183,9 @@ class JavaFxFileOperationsTest {
     private void runLongCopy() throws Exception {
         Path from = Files.createDirectory(root.resolve("progress-source"));
         Path to = Files.createDirectory(root.resolve("progress-target"));
+        Path browse = Files.createDirectory(root.resolve("browse-during-copy"));
+        Path readable = Files.writeString(browse.resolve("阶段验证.txt"), "写入期间可以读取这个文件");
+        Path foreign = Files.createDirectory(to.resolve(".file-manager-user-fixture"));
         Path file = Files.write(from.resolve("样本视频.bin"), new byte[48 * 1024 * 1024]);
         go(from);
         select(file);
@@ -180,6 +197,43 @@ class JavaFxFileOperationsTest {
         assertTrue(copyHasBytes.await(10, TimeUnit.SECONDS));
         await(() -> progressScene() != null && progressLabel("operation-bytes").contains("48.0 MiB"),
                 "delayed JavaFX progress window", 10);
+        assertFalse(fx(() -> button("edit-address").isDisabled()),
+                "The address bar should accept navigation while the native copy is waiting");
+        Path stageFile;
+        try (var entries = Files.list(to)) {
+            stageFile = entries.filter(path -> path.getFileName().toString().startsWith(".file-manager-"))
+                    .filter(path -> !path.equals(foreign)).findFirst().orElseThrow();
+        }
+        click("refresh");
+        await(() -> field(app, "browseRequest") == null && listed(foreign), "foreign staging prefix remains visible", 10);
+        assertFalse(fx(() -> listed(stageFile)));
+        go(browse);
+        click("back");
+        await(() -> browseAt(to), "back during copy", 10);
+        click("forward");
+        await(() -> browseAt(browse), "forward during copy", 10);
+        fx(() -> {
+            ((TextField) scene.lookup("#search-field")).setText("阶段验证");
+            button("search").fire();
+            return null;
+        });
+        await(() -> browseAt(browse) && "阶段验证".equals(field(app, "activeQuery")) && listed(readable),
+                "search during copy", 10);
+        select(readable);
+        await(() -> previewText().contains("写入期间可以读取"), "preview during copy", 10);
+        fx(() -> {
+            for (String command : List.of("paste", "cut", "copy", "rename", "trash")) {
+                assertTrue(button(command).isDisabled(), command);
+            }
+            var close = new WindowEvent(stage, WindowEvent.WINDOW_CLOSE_REQUEST);
+            Event.fireEvent(stage, close);
+            assertTrue(stage.isShowing());
+            progressScene().getWindow().hide();
+            button("file-operations").fire();
+            return null;
+        });
+        assertFalse(fx(() -> ((FileOperationTask) field(app, "activeFileOperation")).cancellationRequested()));
+        captureBrowsing();
         capture("copying.png");
         assertFalse(Files.exists(to.resolve(file.getFileName())));
         long request = System.nanoTime();
@@ -196,11 +250,153 @@ class JavaFxFileOperationsTest {
                 (confirmed - request) / 1e6, (System.nanoTime() - request) / 1e6);
         capture("cancelled.png");
         assertEquals(48L * 1024 * 1024, Files.size(file));
-        try (var paths = Files.list(to)) { assertEquals(0, paths.count()); }
+        try (var paths = Files.list(to)) { assertEquals(List.of(foreign), paths.toList()); }
+        assertTrue(fx(() -> browseAt(browse)));
         fx(() -> {
             ((Button) progressScene().lookup("#operation-action")).fire();
             return null;
         });
+    }
+
+    private void runReadRaces() throws Exception {
+        Path origin = Files.createDirectory(root.resolve("race-origin"));
+        Path slow = Files.createDirectory(root.resolve("race-slow"));
+        Path next = Files.createDirectory(root.resolve("race-next"));
+        Path first = Files.writeString(next.resolve("a.txt"), "obsolete preview");
+        Path second = Files.writeString(next.resolve("b.txt"), "current preview");
+        go(origin);
+        var listing = new Gate();
+        heldRead.set(new ReadGate(slow, false, listing));
+        try {
+            enter(slow);
+            assertTrue(listing.entered.await(8, TimeUnit.SECONDS));
+            go(next);
+            assertEquals(origin, fx(() -> call(((java.util.Deque<?>) field(app, "past")).peek(), "path")));
+            listing.release.countDown();
+            assertTrue(listing.returned.await(8, TimeUnit.SECONDS));
+            assertTrue(fx(() -> browseAt(next)));
+        } finally {
+            listing.release.countDown();
+        }
+
+        var preview = new Gate();
+        heldRead.set(new ReadGate(first, true, preview));
+        try {
+            select(first);
+            assertTrue(preview.entered.await(8, TimeUnit.SECONDS));
+            select(second);
+            await(() -> previewText().contains("current preview"), "new preview wins", 8);
+            preview.release.countDown();
+            assertTrue(preview.returned.await(8, TimeUnit.SECONDS));
+            assertTrue(fx(() -> previewText().contains("current preview")));
+        } finally {
+            preview.release.countDown();
+        }
+
+        int history = fx(() -> ((java.util.Deque<?>) field(app, "past")).size());
+        enter(root.resolve("absent-directory"));
+        acknowledgeFileError();
+        assertTrue(fx(() -> browseAt(next) && listed(second)));
+        assertEquals(history, fx(() -> ((java.util.Deque<?>) field(app, "past")).size()));
+
+        Path replaced = Files.createDirectory(root.resolve("replaced-directory"));
+        Files.writeString(replaced.resolve("old.txt"), "old object");
+        var replace = new Gate();
+        heldRead.set(new ReadGate(replaced, false, replace));
+        try {
+            enter(replaced);
+            assertTrue(replace.entered.await(8, TimeUnit.SECONDS));
+            Files.move(replaced, root.resolve("original-directory"));
+            Files.createDirectory(replaced);
+            Path newFile = Files.writeString(replaced.resolve("new.txt"), "new object");
+            replace.release.countDown();
+            acknowledgeFileError();
+            assertTrue(fx(() -> browseAt(next)));
+            go(replaced);
+            assertTrue(fx(() -> listed(newFile)));
+            Files.move(replaced, root.resolve("moved-replacement"));
+            click("refresh");
+            acknowledgeFileError();
+            assertTrue(fx(() -> browseAt(replaced) && browser.items().isEmpty()
+                    && status().contains("当前位置无法访问") && !button("back").isDisabled()));
+            click("back");
+            await(() -> browseAt(next), "recover via history", 10);
+        } finally {
+            replace.release.countDown();
+        }
+    }
+
+    private void runWriteAgainstNavigation(boolean affected) throws Exception {
+        Path sandbox = Files.createDirectory(root.resolve("write-refresh-" + affected));
+        Path from = Files.createDirectory(sandbox.resolve("source"));
+        Path to = Files.createDirectory(sandbox.resolve("target"));
+        Path elsewhere = Files.createDirectory(sandbox.resolve("elsewhere"));
+        Path source = Files.writeString(from.resolve("published.txt"), "completed copy");
+        Path published = to.resolve(source.getFileName());
+        go(from);
+        select(source);
+        click("copy");
+        await(() -> idle() && cutSources().equals(List.of(source)), "copy for refresh race", 8);
+        go(to);
+        var publish = new Gate();
+        var pending = new Gate();
+        heldPublish.set(publish);
+        try {
+            click("paste");
+            assertTrue(publish.entered.await(8, TimeUnit.SECONDS));
+            Path requested = affected ? to : elsewhere;
+            heldRead.set(new ReadGate(requested, false, pending));
+            enter(requested);
+            assertTrue(pending.entered.await(8, TimeUnit.SECONDS));
+            publish.release.countDown();
+            if (affected) {
+                await(() -> idle() && browseAt(to) && listed(published), "fresh read supersedes affected result", 10);
+            } else {
+                await(() -> field(app, "fileTask") == null && field(app, "browseRequest") != null,
+                        "unrelated navigation still owns its request", 10);
+            }
+            pending.release.countDown();
+            await(() -> idle() && browseAt(requested), "preserve latest navigation", 10);
+            assertEquals("completed copy", Files.readString(published));
+            assertEquals("completed copy", Files.readString(source));
+        } finally {
+            publish.release.countDown();
+            pending.release.countDown();
+        }
+    }
+
+    private record ReadGate(Path path, boolean preview, Gate gate) { }
+
+    private void readReady(Path path, boolean preview) {
+        var pending = heldRead.get();
+        if (pending != null && preview == pending.preview() && path.equals(pending.path())
+                && heldRead.compareAndSet(pending, null)) {
+            pending.gate().hold();
+        }
+    }
+
+    private static final class Gate {
+        private final CountDownLatch entered = new CountDownLatch(1);
+        private final CountDownLatch release = new CountDownLatch(1);
+        private final CountDownLatch returned = new CountDownLatch(1);
+
+        void hold() {
+            entered.countDown();
+            boolean interrupted = false;
+            try {
+                while (true) {
+                    try {
+                        assertTrue(release.await(20, TimeUnit.SECONDS), "test gate was not released");
+                        return;
+                    } catch (InterruptedException cancelled) {
+                        interrupted = true;
+                    }
+                }
+            } finally {
+                returned.countDown();
+                if (interrupted) { Thread.currentThread().interrupt(); }
+            }
+        }
     }
 
     private void runUnknownMoveAndUndo() throws Exception {
@@ -312,6 +508,36 @@ class JavaFxFileOperationsTest {
         assertTrue(ImageIO.write(image, "png", captures.resolve(name).toFile()));
     }
 
+    private void captureBrowsing() throws Exception {
+        if (!Boolean.getBoolean("javafx.captureFileOperations")) { return; }
+        if (captures == null) {
+            captures = Files.createTempDirectory(Path.of(System.getProperty("java.io.tmpdir")), "phase24-fx-images-");
+            System.out.println("PHASE24_GUI captures=" + captures);
+        }
+        BufferedImage picture = fx(() -> {
+            // Capture the actual file list and preview, independent of machine-specific sidebar entries.
+            var workspace = scene.lookup("#workspace-split");
+            var main = (javafx.scene.control.SplitPane) workspace;
+            var files = main.getItems().getLast().snapshot(null, null);
+            var progress = progressScene().snapshot(null);
+            int width = (int) (files.getWidth() + progress.getWidth());
+            int height = (int) Math.max(files.getHeight(), progress.getHeight());
+            var result = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+            copyPixels(files, result, 0);
+            copyPixels(progress, result, (int) files.getWidth());
+            return result;
+        });
+        assertTrue(ImageIO.write(picture, "png", captures.resolve("browse-during-copy.png").toFile()));
+    }
+
+    private static void copyPixels(javafx.scene.image.Image image, BufferedImage destination, int offset) {
+        int width = (int) image.getWidth();
+        int height = (int) image.getHeight();
+        var argb = new int[width * height];
+        image.getPixelReader().getPixels(0, 0, width, height, PixelFormat.getIntArgbInstance(), argb, 0, width);
+        destination.setRGB(offset, 0, width, height, argb, 0, width);
+    }
+
     private void runPartialCut() throws Exception {
         Path from = Files.createDirectory(root.resolve("batch-from"));
         Path to = Files.createDirectory(root.resolve("batch-to"));
@@ -353,6 +579,15 @@ class JavaFxFileOperationsTest {
     }
 
     private void go(Path directory) throws Exception {
+        enter(directory);
+        await(() -> browseAt(directory), "directory " + directory, 12);
+    }
+
+    private boolean browseAt(Path directory) throws Exception {
+        return field(app, "browseRequest") == null && directory.equals(call(field(app, "location"), "path"));
+    }
+
+    private void enter(Path directory) throws Exception {
         fx(() -> {
             button("edit-address").fire();
             var editor = (TextField) scene.lookup("#address");
@@ -360,7 +595,12 @@ class JavaFxFileOperationsTest {
             editor.fireEvent(new ActionEvent());
             return null;
         });
-        await(() -> idle() && directory.equals(call(field(app, "location"), "path")), "directory " + directory, 12);
+    }
+
+    private String previewText() {
+        if (!(scene.lookup("#inspector") instanceof javafx.scene.layout.VBox inspector)) { return ""; }
+        return inspector.getChildren().stream().filter(TextArea.class::isInstance).map(TextArea.class::cast)
+                .map(TextArea::getText).findFirst().orElse("");
     }
 
     private void select(Path file) throws Exception {
@@ -414,7 +654,9 @@ class JavaFxFileOperationsTest {
         return browser.items().stream().anyMatch(item -> path.equals(item.path()));
     }
 
-    private boolean idle() throws Exception { return field(app, "activeTask") == null; }
+    private boolean idle() throws Exception {
+        return field(app, "fileTask") == null && field(app, "browseRequest") == null;
+    }
     private String status() { return ((Label) scene.lookup("#status")).getText(); }
 
     private void await(Callable<Boolean> check, String phase, int seconds) throws Exception {
