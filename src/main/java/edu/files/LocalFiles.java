@@ -19,9 +19,13 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.DosFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.function.BooleanSupplier;
@@ -99,6 +103,68 @@ final class LocalFiles {
             throw exception.getCause();
         }
         return new Listing(entries, unreadable, false);
+    }
+
+    static List<Path> recentlyModifiedFolders(Collection<Path> knownFolders, Map<Path, FileTime> recorded,
+                                              List<Path> indexedItems, Visibility visibility, BooleanSupplier cancelled) {
+        Map<Path, FileTime> activity = new HashMap<>();
+        for (Path path : indexedItems) {
+            checkCancelled(cancelled);
+            BasicFileAttributes attributes = visibleAttributes(path, visibility);
+            if (attributes != null) {
+                if (attributes.isDirectory()) {
+                    addFolderActivity(activity, path, attributes.lastModifiedTime());
+                } else if (attributes.isRegularFile()) {
+                    addFolderActivity(activity, path.getParent(), attributes.lastModifiedTime());
+                }
+            }
+        }
+        Set<Path> folders = new LinkedHashSet<>(knownFolders);
+        folders.addAll(recorded.keySet());
+        for (Path folder : folders) {
+            checkCancelled(cancelled);
+            BasicFileAttributes attributes = visibleAttributes(folder, visibility);
+            if (attributes == null || !attributes.isDirectory()) { continue; }
+            addFolderActivity(activity, folder, attributes.lastModifiedTime());
+            FileTime recordedTime = recorded.get(folder);
+            if (recordedTime != null) { addFolderActivity(activity, folder, recordedTime); }
+            try (var children = Files.newDirectoryStream(folder)) {
+                for (Path child : children) {
+                    checkCancelled(cancelled);
+                    BasicFileAttributes item = visibleAttributes(child, visibility);
+                    if (item != null && item.isDirectory()) {
+                        addFolderActivity(activity, child, item.lastModifiedTime());
+                    } else if (item != null && item.isRegularFile()) {
+                        addFolderActivity(activity, folder, item.lastModifiedTime());
+                    }
+                }
+            } catch (IOException | DirectoryIteratorException | SecurityException exception) {
+                // The folder can still contribute its own metadata when its contents are inaccessible.
+            }
+        }
+        return activity.entrySet().stream()
+                .sorted(Map.Entry.<Path, FileTime>comparingByValue().reversed().thenComparing(Map.Entry.comparingByKey()))
+                .map(Map.Entry::getKey)
+                .filter(folder -> {
+                    checkCancelled(cancelled);
+                    var attributes = visibleAttributes(folder, visibility);
+                    return attributes != null && attributes.isDirectory();
+                }).toList();
+    }
+
+    private static void addFolderActivity(Map<Path, FileTime> activity, Path path, FileTime time) {
+        if (path != null && path.getParent() != null) {
+            activity.merge(path, time, (last, next) -> last.compareTo(next) >= 0 ? last : next);
+        }
+    }
+
+    private static BasicFileAttributes visibleAttributes(Path path, Visibility visibility) {
+        try {
+            var attributes = Files.readAttributes(path, ATTRIBUTES, NO_LINKS);
+            return path.getFileName() == null || visibility.includes(path, attributes) ? attributes : null;
+        } catch (IOException | SecurityException exception) {
+            return null;
+        }
     }
 
     static Listing search(Path directory, String query, Visibility visibility, BooleanSupplier cancelled)
@@ -248,15 +314,21 @@ final class LocalFiles {
         }
     }
 
-    static void copy(Path source, Path directory) throws IOException {
+    static Entry copy(Path source, Path directory) throws IOException {
         Path destination = transferTarget(source, directory);
-        requireAvailable(destination);
+        boolean sameFolder = Files.isSameFile(source.toAbsolutePath().getParent(), destination.getParent());
+        if (!sameFolder) { requireAvailable(destination); }
         // Keep incomplete copies out of the destination name until the data is ready.
         Path staging = Files.createTempDirectory(destination.getParent(), ".file-manager-");
         Path stagedItem = staging.resolve(source.getFileName());
+        BasicFileAttributes attributes;
+        Path copied;
         try {
             copyTree(source, stagedItem);
-            Files.move(stagedItem, destination);
+            attributes = Files.readAttributes(stagedItem, BasicFileAttributes.class, NO_LINKS);
+            copied = sameFolder
+                    ? placeDuplicate(stagedItem, destination, attributes.isDirectory())
+                    : Files.move(stagedItem, destination);
         } catch (IOException | RuntimeException exception) {
             try {
                 deleteStaging(staging);
@@ -270,12 +342,40 @@ final class LocalFiles {
         } catch (IOException exception) {
             staging.toFile().deleteOnExit();
         }
+        return entry(copied, attributes);
     }
 
-    static void move(Path source, Path directory) throws IOException {
+    private static Path placeDuplicate(Path stagedItem, Path original, boolean directory) throws IOException {
+        String name = original.getFileName().toString();
+        int split = extensionStart(name, directory);
+        String stem = name.substring(0, split);
+        String extension = name.substring(split);
+        for (int number = 1; ; number++) {
+            String suffix = number == 1 ? " - 副本" : " - 副本 (" + number + ")";
+            Path candidate = original.resolveSibling(stem + suffix + extension);
+            try {
+                requireAvailable(candidate);
+                return Files.move(stagedItem, candidate);
+            } catch (FileAlreadyExistsException exception) {
+                // Another copy may have acquired this name while the data was staged.
+            }
+        }
+    }
+
+    static int extensionStart(String name, boolean directory) {
+        int dot = name.lastIndexOf('.');
+        return !directory && dot > 0 && dot < name.length() - 1 ? dot : name.length();
+    }
+
+    static boolean move(Path source, Path directory) throws IOException {
         Path destination = transferTarget(source, directory);
+        if (Files.isSameFile(source.toAbsolutePath().getParent(), destination.getParent())) {
+            describe(source);
+            return false;
+        }
         requireAvailable(destination);
         Files.move(source, destination);
+        return true;
     }
 
     private static void requireAvailable(Path path) throws FileAlreadyExistsException {

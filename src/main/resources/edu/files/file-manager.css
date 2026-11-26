@@ -499,7 +499,7 @@
     -fx-background-color: white;
 }
 
-.table-view .table-row-cell:odd {
+.table-view .table-row-cell:filled:odd .table-cell {
     -fx-background-color: #f8fbfb;
 }
 
@@ -507,15 +507,15 @@
     -fx-background-color: white;
 }
 
-.table-view .table-row-cell:filled:hover {
+.table-view .table-row-cell:filled .table-cell:hover {
     -fx-background-color: #edf6f4;
 }
 
-.table-view .table-row-cell:filled:selected {
+.table-view .table-row-cell:filled:selected .table-cell {
     -fx-background-color: #cce8e0;
 }
 
-.table-view .table-row-cell:group {
+.table-view .table-row-cell:group .table-cell {
     -fx-background-color: #eaf3f3;
     -fx-font-weight: bold;
 }
@@ -565,29 +565,24 @@
     -fx-background-radius: 3;
 }
 
-.browser-card {
+.icon-entry {
     -fx-padding: 7;
-    -fx-background-color: #f5f9f9;
-    -fx-border-color: #e1eaea;
-    -fx-background-radius: 7;
-    -fx-border-radius: 7;
     -fx-cursor: hand;
 }
 
-#browser-view:compact .browser-card {
+#browser-view:compact .icon-entry {
     -fx-padding: 3 6;
 }
 
-.browser-card:hover {
-    -fx-background-color: #e8f3f0;
+.icon-entry .icon-name {
+    -fx-text-fill: #243f47;
 }
 
-.browser-card:chosen {
+.icon-entry:chosen {
     -fx-background-color: #cce9e1;
-    -fx-border-color: #88bfb3;
 }
 
-.browser-card > .item-check {
+.icon-entry > .item-check {
     -fx-background-color: white;
     -fx-background-radius: 3;
 }

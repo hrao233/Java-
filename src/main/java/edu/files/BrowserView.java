@@ -5,6 +5,7 @@ import javafx.beans.binding.Bindings;
 import javafx.beans.property.ReadOnlyObjectWrapper;
 import javafx.collections.ListChangeListener;
 import javafx.css.PseudoClass;
+import javafx.event.EventTarget;
 import javafx.geometry.Bounds;
 import javafx.geometry.Pos;
 import javafx.geometry.Rectangle2D;
@@ -154,7 +155,7 @@ final class BrowserView extends StackPane {
         BrowserItem item() { return items.isEmpty() ? null : items.getFirst(); }
     }
 
-    private record NameEdit(Path path, String stem, String extension, Consumer<String> commit) { }
+    private record NameEdit(Path path, String text, int selectionEnd, String suffix, Consumer<String> commit) { }
 
     private final TableView<Line> table = new TableView<>();
     private final ListView<Line> tiles = new ListView<>() {
@@ -304,10 +305,15 @@ final class BrowserView extends StackPane {
     void clearSelection() { replaceSelection(List.of()); }
     void invertSelection() { replaceSelection(ordered.stream().filter(item -> !selected.contains(item)).toList()); }
 
-    void editNewName(Path path, String extension, Consumer<String> commit) {
+    void editName(Path path, String extension, boolean keepExtension, Consumer<String> commit) {
         if (!reveal(path)) { return; }
         String fullName = path.getFileName().toString();
-        nameEdit = new NameEdit(path, fullName.substring(0, fullName.length() - extension.length()), extension, commit);
+        int selectionEnd = fullName.length() - extension.length();
+        boolean fixedSuffix = keepExtension || !settings.extensions();
+        String text = fixedSuffix ? fullName.substring(0, selectionEnd) : fullName;
+        String label = fixedSuffix && settings.extensions() ? extension : "";
+        nameEdit = new NameEdit(path, text, selectionEnd, label,
+                name -> commit.accept(fixedSuffix ? name + extension : name));
         refreshNameCells();
     }
 
@@ -334,15 +340,17 @@ final class BrowserView extends StackPane {
 
     private HBox inlineName() {
         NameEdit edit = nameEdit;
-        TextField field = new TextField(edit.stem());
+        TextField field = new TextField(edit.text());
         field.setId("new-name-editor");
-        field.setAccessibleText("新项目名称");
+        field.setAccessibleText("项目名称");
         field.getStyleClass().add("inline-name-editor");
         field.setMinWidth(32);
         field.setPrefColumnCount(9);
         field.addEventFilter(KeyEvent.KEY_PRESSED, event -> {
             if (event.getCode() == KeyCode.ENTER || event.getCode() == KeyCode.ESCAPE) {
                 finishName(edit, field.getText(), event.getCode() == KeyCode.ENTER);
+                if (table.isVisible()) { table.requestFocus(); }
+                else { tiles.requestFocus(); }
                 event.consume();
             }
         });
@@ -352,12 +360,12 @@ final class BrowserView extends StackPane {
         Platform.runLater(() -> {
             if (nameEdit == edit && field.getScene() != null) {
                 field.requestFocus();
-                field.selectAll();
+                field.selectRange(0, edit.selectionEnd());
             }
         });
         HBox.setHgrow(field, Priority.ALWAYS);
         HBox box = new HBox(3, field);
-        if (settings.extensions() && !edit.extension().isEmpty()) { box.getChildren().add(new Label(edit.extension())); }
+        if (!edit.suffix().isEmpty()) { box.getChildren().add(new Label(edit.suffix())); }
         box.setAlignment(Pos.CENTER_LEFT);
         return box;
     }
@@ -366,7 +374,7 @@ final class BrowserView extends StackPane {
         if (nameEdit != edit) { return; }
         nameEdit = null;
         refreshNameCells();
-        if (commit && !edit.stem().equals(text)) { edit.commit().accept(text); }
+        if (commit && !text.isBlank() && !edit.text().equals(text)) { edit.commit().accept(text); }
     }
 
     private void refreshNameCells() {
@@ -415,14 +423,19 @@ final class BrowserView extends StackPane {
         });
         table.setRowFactory(ignored -> new TableRow<>() {
             {
+                addEventFilter(MouseEvent.MOUSE_PRESSED, event -> {
+                    if (!hitsTableCell(event.getTarget(), this)) { event.consume(); }
+                });
                 setOnMouseClicked(event -> {
                     if (event.getButton() == MouseButton.PRIMARY && event.getClickCount() == 2
+                            && hitsTableCell(event.getTarget(), this)
                             && getItem() != null && getItem().item() != null && !editingName(getItem().item())) {
                         onOpen.accept(getItem().item());
                     }
                 });
                 setOnContextMenuRequested(event -> {
-                    BrowserItem item = getItem() == null ? null : getItem().item();
+                    boolean hitsItem = event.isKeyboardTrigger() || hitsTableCell(event.getTarget(), this);
+                    BrowserItem item = hitsItem && getItem() != null ? getItem().item() : null;
                     showContext(item, this, event);
                 });
             }
@@ -495,6 +508,13 @@ final class BrowserView extends StackPane {
             }
             return true;
         });
+    }
+
+    private static boolean hitsTableCell(EventTarget target, TableRow<?> row) {
+        for (Node node = target instanceof Node picked ? picked : null; node != null && node != row; node = node.getParent()) {
+            if (node instanceof TableCell<?, ?>) { return true; }
+        }
+        return false;
     }
 
     private void updateColumns() {
@@ -606,6 +626,8 @@ final class BrowserView extends StackPane {
         tiles.setId("visual-entries");
         tiles.getStyleClass().add("browser-tiles");
         tiles.managedProperty().bind(tiles.visibleProperty());
+        // Each cell lays out a row. Selection belongs to its individual file and folder entries.
+        tiles.setSelectionModel(null);
         tiles.setPlaceholder(new Region());
         tiles.widthProperty().addListener((observable, oldWidth, width) -> {
             if (tiles.isVisible() && settings != null && !settings.home()) {
@@ -629,7 +651,7 @@ final class BrowserView extends StackPane {
             protected void updateItem(Line line, boolean empty) {
                 super.updateItem(line, empty);
                 setText(null);
-                if (line == null || empty) {
+                if (line == null || empty || !tiles.isVisible()) {
                     setGraphic(null);
                 } else if (line == HOME_HEADER) {
                     Region header = homeHeader.get();
@@ -656,7 +678,7 @@ final class BrowserView extends StackPane {
                 } else {
                     HBox row = new HBox(settings.compact() ? 3 : 8);
                     for (BrowserItem item : line.items()) {
-                        row.getChildren().add(card(item));
+                        row.getChildren().add(iconEntry(item));
                     }
                     setGraphic(row);
                 }
@@ -901,22 +923,22 @@ final class BrowserView extends StackPane {
         }
     }
 
-    private Node card(BrowserItem item) {
+    private Node iconEntry(BrowserItem item) {
         Mode mode = settings.mode();
-        Region card;
+        Region content;
         Node name;
         if (editingName(item)) {
             name = inlineName();
         } else {
             Label label = new Label(item.displayName(settings.extensions()));
-            label.getStyleClass().add("card-name");
+            label.getStyleClass().add("icon-name");
             name = label;
         }
-        Node graphic = cardGraphic(item, mode);
+        Node graphic = iconGraphic(item, mode);
         if (mode == Mode.HUGE || mode == Mode.LARGE || mode == Mode.MEDIUM) {
             VBox stack = new VBox(7, graphic, name);
             stack.setAlignment(Pos.CENTER);
-            card = stack;
+            content = stack;
         } else {
             VBox text = new VBox(3, name);
             if (mode == Mode.TILES || mode == Mode.CONTENT) {
@@ -934,15 +956,15 @@ final class BrowserView extends StackPane {
             }
             HBox row = new HBox(9, graphic, text);
             row.setAlignment(Pos.CENTER_LEFT);
-            card = row;
+            content = row;
         }
-        StackPane frame = new StackPane(card);
+        StackPane frame = new StackPane(content);
         if (settings.checkboxes()) {
             CheckBox check = check(item);
             StackPane.setAlignment(check, Pos.TOP_RIGHT);
             frame.getChildren().add(check);
         }
-        frame.getStyleClass().add("browser-card");
+        frame.getStyleClass().add("icon-entry");
         double width = mode.width == 0 ? Math.max(220, tiles.getWidth() - 34) : mode.width;
         frame.setMinWidth(width);
         frame.setPrefWidth(width);
@@ -952,24 +974,27 @@ final class BrowserView extends StackPane {
 
     private Region selectableEntry(Region entry, BrowserItem item) {
         entry.getStyleClass().add("selectable-entry");
+        entry.setPickOnBounds(true);
         entry.setUserData(item);
         entry.setAccessibleText(item.name());
         entry.pseudoClassStateChanged(SELECTED, selected.contains(item));
         entry.setOnContextMenuRequested(event -> showContext(item, entry, event));
         entry.setOnMouseClicked(event -> {
             if (event.getButton() == MouseButton.PRIMARY && !editingName(item)) {
+                event.consume();
                 tiles.requestFocus();
-                if (event.getClickCount() == 2) {
+                if (event.getClickCount() == 2 && item.equals(anchor) && selected.contains(item)
+                        && !event.isShiftDown() && !event.isShortcutDown()) {
                     onOpen.accept(item);
                 } else {
-                    selectCard(item, event);
+                    selectItem(item, event);
                 }
             }
         });
         return entry;
     }
 
-    private Node cardGraphic(BrowserItem item, Mode mode) {
+    private Node iconGraphic(BrowserItem item, Mode mode) {
         if (item.kind() != BrowserItem.Kind.FILE || mode.icon < 40 || !LocalFiles.isImage(item.path())) {
             return icons.graphic(item, mode.icon);
         }
@@ -1005,7 +1030,7 @@ final class BrowserView extends StackPane {
         return check;
     }
 
-    private void selectCard(BrowserItem item, MouseEvent event) {
+    private void selectItem(BrowserItem item, MouseEvent event) {
         if (event.isShiftDown() && anchor != null && ordered.contains(anchor)) {
             int start = ordered.indexOf(anchor);
             int end = ordered.indexOf(item);

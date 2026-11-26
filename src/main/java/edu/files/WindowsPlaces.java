@@ -115,6 +115,19 @@ final class WindowsPlaces {
         return value.isEmpty() ? null : Long.valueOf(value);
     }
 
+    static List<Path> indexedModifiedItems() {
+        List<Path> paths = new ArrayList<>();
+        for (String line : readScriptOutput("windows-modified-items.ps1")) {
+            try {
+                Path path = Path.of(line).normalize();
+                if (path.isAbsolute()) { paths.add(path); }
+            } catch (InvalidPathException exception) {
+                // Skip entries that do not resolve to a local filesystem path.
+            }
+        }
+        return List.copyOf(paths);
+    }
+
     static List<String> readScriptOutput(String resource) {
         if (!WINDOWS) {
             return List.of();
@@ -149,6 +162,91 @@ final class WindowsPlaces {
 
     static void openNetworkDiscovery() throws IOException {
         new ProcessBuilder("explorer.exe", "shell:NetworkPlacesFolder").start();
+    }
+
+    static void showProperties(Path path) throws IOException {
+        var command = powershell("""
+                $ErrorActionPreference = 'Stop'
+                Add-Type -AssemblyName System.Windows.Forms
+                Add-Type -ReferencedAssemblies 'System.Windows.Forms.dll' -TypeDefinition @'
+                using System;
+                using System.Collections.Generic;
+                using System.Diagnostics;
+                using System.Runtime.InteropServices;
+                using System.Text;
+                using System.Threading;
+                using System.Windows.Forms;
+                public static class ShellProperties {
+                    private const uint OwnerWindow = 4;
+                    private delegate bool WindowVisitor(IntPtr window, IntPtr data);
+
+                    [DllImport("shell32.dll", CharSet = CharSet.Unicode, ExactSpelling = true)]
+                    private static extern bool SHObjectProperties(IntPtr owner, uint type, string name, string page);
+                    [DllImport("user32.dll")]
+                    private static extern bool EnumWindows(WindowVisitor callback, IntPtr data);
+                    [DllImport("user32.dll")]
+                    private static extern IntPtr GetWindow(IntPtr window, uint relationship);
+                    [DllImport("user32.dll")]
+                    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+                    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+                    private static extern int GetClassName(IntPtr window, StringBuilder name, int capacity);
+                    [DllImport("user32.dll")]
+                    private static extern bool IsWindowVisible(IntPtr window);
+                    [DllImport("user32.dll")]
+                    private static extern bool IsWindow(IntPtr window);
+
+                    public static bool Show(uint type, string target) {
+                        using (var owner = new Form { ShowInTaskbar = false })
+                        using (var process = Process.GetCurrentProcess()) {
+                            IntPtr ownerHandle = owner.Handle;
+                            if (!SHObjectProperties(ownerHandle, type, target, null)) return false;
+
+                            var windows = new HashSet<IntPtr>();
+                            var startup = Stopwatch.StartNew();
+                            bool opened = false;
+                            WindowVisitor capture = (window, data) => {
+                                if (window != ownerHandle && IsWindowVisible(window)
+                                        && IsPropertyWindow(window, ownerHandle, (uint) process.Id)) {
+                                    windows.Add(window);
+                                }
+                                return true;
+                            };
+                            while (true) {
+                                Application.DoEvents();
+                                EnumWindows(capture, IntPtr.Zero);
+                                windows.RemoveWhere(window => !IsWindow(window));
+                                if (windows.Count > 0) {
+                                    opened = true;
+                                } else if (opened || startup.ElapsedMilliseconds >= 15000) {
+                                    return true;
+                                }
+                                Thread.Sleep(80);
+                            }
+                        }
+                    }
+
+                    private static bool IsPropertyWindow(IntPtr window, IntPtr owner, uint process) {
+                        if (GetWindow(window, OwnerWindow) == owner) return true;
+                        uint windowProcess;
+                        GetWindowThreadProcessId(window, out windowProcess);
+                        if (windowProcess != process) return false;
+                        var name = new StringBuilder(32);
+                        GetClassName(window, name, name.Capacity);
+                        return name.ToString() == "#32770";
+                    }
+                }
+                '@
+                $target = $env:JAVA_FILE_MANAGER_PROPERTIES
+                $kind = 2
+                if ($target -match '^[A-Za-z]:\\\\$') {
+                    $kind = 4
+                    $target = $target.Substring(0, 2)
+                }
+                if (![ShellProperties]::Show($kind, $target)) { exit 1 }
+                """);
+        command.command().add(1, "-STA");
+        command.environment().put("JAVA_FILE_MANAGER_PROPERTIES", path.toAbsolutePath().toString());
+        waitFor(command, "Windows 无法打开属性：" + path);
     }
 
     static boolean supportsDriveTools(BrowserItem item) {

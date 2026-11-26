@@ -16,6 +16,7 @@ import javafx.scene.image.ImageView;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyCodeCombination;
 import javafx.scene.input.KeyCombination;
+import javafx.scene.input.KeyEvent;
 import javafx.scene.input.MouseButton;
 import javafx.scene.input.MouseEvent;
 import javafx.scene.layout.*;
@@ -86,8 +87,14 @@ public final class FileManagerApp extends Application {
     }
     private record SystemCatalog(WindowsPlaces.Places places, List<NewItems.Type> newTypes) { }
     private record Transfer(List<Path> paths, boolean move) { }
-    private record Change(FileAction apply, FileAction undo) { }
-    private record Outcome(List<Change> completed, IOException error) { }
+    private record Change(FileAction apply, FileAction undo, List<Path> folders, BooleanSupplier changed) {
+        Change(FileAction apply, FileAction undo, List<Path> folders) {
+            this(apply, undo, folders, () -> true);
+        }
+    }
+    private record Outcome(List<Change> completed, IOException error) {
+        List<Change> writes() { return completed.stream().filter(change -> change.changed().getAsBoolean()).toList(); }
+    }
 
     @FunctionalInterface
     private interface FileAction { void run() throws IOException; }
@@ -104,8 +111,9 @@ public final class FileManagerApp extends Application {
     private final Map<Page, View> views = new EnumMap<>(Page.class);
     private final Deque<Location> past = new ArrayDeque<>();
     private final Deque<Location> future = new ArrayDeque<>();
-    private final Map<Path, FileTime> recentFolders = new LinkedHashMap<>();
+    private final Map<Path, FileTime> folderHistory = new LinkedHashMap<>();
     private final Map<Path, FileTime> recentFiles = new LinkedHashMap<>();
+    private final Map<Path, FileTime> folderEdits = new LinkedHashMap<>();
     private final Set<Path> extraPins = new LinkedHashSet<>();
     private final Set<Path> removedPins = new LinkedHashSet<>();
     private final Set<Path> favorites = new LinkedHashSet<>();
@@ -141,6 +149,9 @@ public final class FileManagerApp extends Application {
     private LocalFiles.Visibility visibility;
     private Task<?> activeTask;
     private Task<?> previewTask;
+    private Task<List<Path>> modifiedFoldersTask;
+    private List<Path> modifiedFolders = List.of();
+    private boolean modifiedFoldersRefreshQueued;
     private String activeQuery = "";
     private boolean writing;
     private boolean searching;
@@ -166,7 +177,7 @@ public final class FileManagerApp extends Application {
         views.put(Page.GALLERY, new View(Mode.LARGE, Field.MODIFIED, true, Field.MODIFIED));
         browser = new BrowserView(icons, this::selectionChanged, this::open, this::sort, this::contextMenu,
                 () -> updateListingStatus(""), this::homeHeader);
-        browser.setOnKeyPressed(event -> {
+        browser.addEventFilter(KeyEvent.KEY_PRESSED, event -> {
             if (event.getTarget() instanceof TextInputControl) { return; }
             KeyCode key = event.getCode();
             if (key == KeyCode.ENTER) {
@@ -216,6 +227,9 @@ public final class FileManagerApp extends Application {
         stage.setMinWidth(960);
         stage.setMinHeight(550);
         stage.setScene(scene);
+        stage.focusedProperty().addListener((observable, previous, focused) -> {
+            if (focused) { refreshModifiedFolders(); }
+        });
         stage.setOnCloseRequest(event -> {
             if (writing) {
                 event.consume();
@@ -233,6 +247,7 @@ public final class FileManagerApp extends Application {
         if (browser != null) { browser.cancelNewName(); }
         if (activeTask != null && !writing) { activeTask.cancel(); }
         if (previewTask != null) { previewTask.cancel(); }
+        if (modifiedFoldersTask != null) { modifiedFoldersTask.cancel(); }
         disk.shutdownNow();
         if (icons != null) { icons.close(); }
     }
@@ -244,7 +259,10 @@ public final class FileManagerApp extends Application {
                 navButton("↑", "上一级", "up", () -> navigate(parentLocation())),
                 navButton("⟳", "刷新", "refresh", () -> {
                     if (location.page() == Page.COMPUTER) { loadPlaces(false); }
-                    else { refresh(""); }
+                    else {
+                        refreshModifiedFolders();
+                        refresh("");
+                    }
                 }));
         HBox.setHgrow(address, Priority.ALWAYS);
         searchField.setId("search-field");
@@ -360,6 +378,7 @@ public final class FileManagerApp extends Application {
                 restorePreferences();
             }
             rebuildSidebar();
+            refreshModifiedFolders();
             refresh("");
         });
     }
@@ -371,8 +390,9 @@ public final class FileManagerApp extends Application {
         networkLocations.addAll(loadPaths("network"));
         galleryFolders.addAll(loadPaths("gallery"));
         if (galleryFolders.isEmpty()) { galleryFolders.add(places.fixed().get(3).path()); }
-        loadVisits("recentFolders", recentFolders);
+        loadVisits("recentFolders", folderHistory);
         loadVisits("recentFiles", recentFiles);
+        loadVisits("folderEdits", folderEdits);
     }
 
     private void navigateFromAddress(String input) {
@@ -403,7 +423,7 @@ public final class FileManagerApp extends Application {
     private List<String> addressHistory() {
         Map<Path, FileTime> visits = new LinkedHashMap<>();
         if (places != null) { places.recent().forEach(item -> visits.putIfAbsent(item.path(), item.time())); }
-        recentFolders.forEach(visits::put);
+        folderHistory.forEach(visits::put);
         recentFiles.forEach(visits::put);
         return visits.entrySet().stream().sorted(Map.Entry.<Path, FileTime>comparingByValue().reversed())
                 .limit(20).map(entry -> entry.getKey().toString()).toList();
@@ -770,6 +790,7 @@ public final class FileManagerApp extends Application {
         preferences.putBoolean("hidden", filters.hidden());
         preferences.putBoolean("system", filters.protectedSystem());
         rebuildSidebar();
+        refreshModifiedFolders();
         refresh("");
     }
 
@@ -873,7 +894,7 @@ public final class FileManagerApp extends Application {
             }
         }
         commands.add(new SeparatorMenuItem());
-        commands.add(menuItem("属性", "context-properties", item == null ? this::showProperties : () -> showProperties(item)));
+        commands.add(menuItem("属性", "context-properties", item == null ? this::showLocationProperties : () -> showProperties(item)));
         return new ContextMenu(commands.toArray(MenuItem[]::new));
     }
 
@@ -1065,18 +1086,48 @@ public final class FileManagerApp extends Application {
 
     private List<BrowserItem> latestFolders() {
         Set<Path> pinned = new HashSet<>();
-        pins().forEach(item -> pinned.add(item.path()));
-        var candidates = new LinkedHashMap<>(recentFolders);
-        for (var recent : places.recent()) {
-            Path parent = recent.path().getParent();
-            if (parent != null) {
-                candidates.merge(parent, recent.time(), (left, right) -> left.compareTo(right) >= 0 ? left : right);
-            }
+        pins().forEach(item -> pinned.add(item.path().normalize()));
+        return modifiedFolders.stream().filter(folder -> !pinned.contains(folder)).limit(4)
+                .map(folder -> BrowserItem.folder(folder, Location.folder(folder).label())).toList();
+    }
+
+    private void refreshModifiedFolders() {
+        if (places == null) { return; }
+        if (modifiedFoldersTask != null) {
+            modifiedFoldersRefreshQueued = true;
+            return;
         }
-        return candidates.entrySet().stream().filter(entry -> !pinned.contains(entry.getKey())
-                        && entry.getKey().getParent() != null)
-                .sorted(Map.Entry.<Path, FileTime>comparingByValue().reversed()).limit(4)
-                .map(entry -> BrowserItem.folder(entry.getKey(), Location.folder(entry.getKey()).label())).toList();
+        Set<Path> known = new LinkedHashSet<>();
+        Stream.concat(places.fixed().stream(), pins().stream())
+                .map(item -> item.path().normalize()).forEach(known::add);
+        // Recent shortcut paths help locate folders outside the index. Only their real write times are ranked.
+        places.recent().stream().map(recent -> recent.path().normalize().getParent())
+                .filter(Objects::nonNull).forEach(known::add);
+        Map<Path, FileTime> recorded = Map.copyOf(folderEdits);
+        LocalFiles.Visibility filters = visibility;
+        Task<List<Path>> scan = task(cancelled -> LocalFiles.recentlyModifiedFolders(
+                known, recorded, WindowsPlaces.indexedModifiedItems(), filters, cancelled));
+        modifiedFoldersTask = scan;
+        scan.setOnSucceeded(event -> {
+            List<BrowserItem> previous = latestFolders();
+            modifiedFolders = scan.getValue();
+            if (!previous.equals(latestFolders())) {
+                refreshQuickAccess();
+                markLocation();
+                if (homeLayout()) { refreshOverview(); }
+            }
+            finishModifiedFoldersRefresh();
+        });
+        scan.setOnFailed(event -> finishModifiedFoldersRefresh());
+        Thread.startVirtualThread(scan);
+    }
+
+    private void finishModifiedFoldersRefresh() {
+        modifiedFoldersTask = null;
+        if (modifiedFoldersRefreshQueued) {
+            modifiedFoldersRefreshQueued = false;
+            refreshModifiedFolders();
+        }
     }
 
     private void refreshQuickAccess() {
@@ -1106,13 +1157,13 @@ public final class FileManagerApp extends Application {
             refreshQuickAccess();
             refreshOverview();
             markLocation();
+            refreshModifiedFolders();
         }, false);
     }
 
     private void visitFolder(Location target) {
         if (target.path() != null) {
-            rememberVisit("recentFolders", recentFolders, target.path());
-            refreshQuickAccess();
+            rememberVisit("recentFolders", folderHistory, target.path());
         }
     }
 
@@ -1431,8 +1482,18 @@ public final class FileManagerApp extends Application {
         BrowserItem selected = selectedItem();
         if (selected != null) {
             showProperties(selected);
-        } else if (location.path() != null) {
-            Path path = location.path();
+        } else {
+            showLocationProperties();
+        }
+    }
+
+    private void showLocationProperties() {
+        Path path = location.path();
+        if (path == null) {
+            info("属性", location.label() + " · " + browser.items().size() + " 个项目");
+        } else if (WindowsPlaces.WINDOWS) {
+            showNativeProperties(path);
+        } else {
             var drive = places.computer().stream().filter(item -> item.disk() != null && path.equals(item.path())).findFirst();
             if (drive.isPresent()) {
                 showProperties(drive.get());
@@ -1440,12 +1501,22 @@ public final class FileManagerApp extends Application {
                 runTask(task(ignored -> BrowserItem.file(LocalFiles.describe(path))), "正在读取属性…", false,
                         item -> { updateListingStatus(""); showProperties(item); });
             }
-        } else {
-            info("属性", location.label() + " · " + browser.items().size() + " 个项目");
         }
     }
 
-    private void showProperties(BrowserItem item) { info("属性", propertiesText(item)); }
+    private void showProperties(BrowserItem item) {
+        if (WindowsPlaces.WINDOWS && item.path() != null) { showNativeProperties(item.path()); }
+        else { info("属性", propertiesText(item)); }
+    }
+
+    private void showNativeProperties(Path path) {
+        Task<Void> properties = task(ignored -> {
+            WindowsPlaces.showProperties(path);
+            return null;
+        });
+        properties.setOnFailed(event -> showError(properties.getException()));
+        Thread.startVirtualThread(properties);
+    }
 
     private void open(BrowserItem item) {
         if (activeTask != null || item == null) { return; }
@@ -1463,9 +1534,7 @@ public final class FileManagerApp extends Application {
         runTask(task(ignored -> { LocalFiles.open(path); return null; }), "正在打开文件…", false, ignored -> {
             rememberVisit("recentFiles", recentFiles, path);
             if (path.getParent() != null) {
-                rememberVisit("recentFolders", recentFolders, path.getParent());
-                refreshQuickAccess();
-                refreshOverview();
+                rememberVisit("recentFolders", folderHistory, path.getParent());
             }
             if (location.page() == Page.HOME && homeTab == HomeTab.RECENT) { refresh("已打开「" + name + "」"); }
             else { status.setText("已打开「" + name + "」"); }
@@ -1497,30 +1566,32 @@ public final class FileManagerApp extends Application {
         writing = true;
         runTask(task(work), "正在新建" + label + "…", false, created -> {
             undoCreation(created);
+            recordFolderEdits(Stream.of(created.path().getParent()));
             rebuildSidebar();
             request(location, "", "已新建" + label, () -> Platform.runLater(() -> {
                 if (browser.filtersActive() && browser.items().stream().noneMatch(item -> created.path().equals(item.path()))) {
                     browser.clearFilters();
                     updateListingStatus("已新建" + label);
                 }
-                browser.editNewName(created.path(), created.extension(), name -> renameNewItem(created, name));
+                browser.editName(created.path(), created.extension(), true, name -> renameNewItem(created, name));
             }));
         });
     }
 
     private void undoCreation(NewItems.Created created) {
-        undo = List.of(new Change(null, created::undo));
+        undo = List.of(new Change(null, created::undo, List.of(created.path().getParent())));
     }
 
     private void renameNewItem(NewItems.Created created, String name) {
         if (activeTask != null || name.isBlank()) { return; }
         Path original = created.path();
         try {
-            Path target = LocalFiles.childNamed(original.getParent(), name + created.extension());
+            Path target = LocalFiles.childNamed(original.getParent(), name);
             if (original.toString().equals(target.toString())) { return; }
             writing = true;
             runTask(task(ignored -> NewItems.rename(created, target)), "正在命名…", false, renamed -> {
                 undoCreation(renamed);
+                recordFolderEdits(Stream.of(target.getParent()));
                 rebuildSidebar();
                 request(location, "", "已命名", () -> Platform.runLater(() -> browser.reveal(target)));
             });
@@ -1532,12 +1603,17 @@ public final class FileManagerApp extends Application {
     private void renameSelected() {
         BrowserItem selected = selectedItem();
         if (selected == null || selected.entry() == null || browser.selection().size() != 1 || activeTask != null) { return; }
-        chooseText("重命名", "名称", selected.name(), name -> {
-            if (selected.name().equals(name)) { return; }
-            Path target = LocalFiles.childNamed(selected.path().getParent(), name);
-            applyChanges("正在重命名…", "已重命名", List.of(new Change(
-                    () -> LocalFiles.rename(selected.path(), target), () -> LocalFiles.rename(target, selected.path()))),
-                    ignored -> { });
+        String extension = selected.name().substring(LocalFiles.extensionStart(selected.name(), selected.directory()));
+        browser.editName(selected.path(), extension, false, name -> {
+            try {
+                Path target = LocalFiles.childNamed(selected.path().getParent(), name);
+                Change rename = new Change(() -> LocalFiles.rename(selected.path(), target),
+                        () -> LocalFiles.rename(target, selected.path()), List.of(target.getParent()));
+                applyChanges("正在重命名…", "已重命名", List.of(rename), ignored -> { },
+                        () -> Platform.runLater(() -> browser.reveal(target)));
+            } catch (InvalidPathException exception) {
+                showError(exception);
+            }
         });
     }
 
@@ -1563,15 +1639,8 @@ public final class FileManagerApp extends Application {
     private void pasteInto(Path directory) {
         Transfer pending = transfer;
         if (activeTask != null || pending == null) { return; }
-        List<Change> changes = new ArrayList<>();
-        for (Path source : pending.paths()) {
-            Path target = directory.resolve(source.getFileName());
-            if (pending.move()) {
-                changes.add(new Change(() -> LocalFiles.move(source, directory), () -> LocalFiles.rename(target, source)));
-            } else {
-                changes.add(new UndoableCopy(source, directory, target).change());
-            }
-        }
+        List<Change> changes = pending.paths().stream()
+                .map(source -> new PasteItem(source, directory, pending.move()).change()).toList();
         applyChanges(pending.move() ? "正在移动…" : "正在复制…", pending.move() ? "已移动" : "已复制", changes, outcome -> {
             if (!pending.move()) { return; }
             List<Path> remaining = pending.paths().subList(outcome.completed().size(), pending.paths().size());
@@ -1580,26 +1649,39 @@ public final class FileManagerApp extends Application {
         });
     }
 
-    private static final class UndoableCopy {
+    private static final class PasteItem {
         private final Path source;
         private final Path directory;
-        private final Path target;
+        private final boolean move;
         private LocalFiles.Entry copied;
+        private boolean changed;
 
-        UndoableCopy(Path source, Path directory, Path target) {
+        PasteItem(Path source, Path directory, boolean move) {
             this.source = source;
             this.directory = directory;
-            this.target = target;
+            this.move = move;
         }
 
-        Change change() { return new Change(this::copy, this::undo); }
+        Change change() {
+            List<Path> folders = move ? List.of(source.getParent(), directory) : List.of(directory);
+            return new Change(this::paste, this::undo, folders, () -> changed);
+        }
 
-        private void copy() throws IOException {
-            LocalFiles.copy(source, directory);
-            copied = LocalFiles.describe(target);
+        private void paste() throws IOException {
+            if (move) {
+                changed = LocalFiles.move(source, directory);
+            } else {
+                copied = LocalFiles.copy(source, directory);
+                changed = true;
+            }
         }
 
         private void undo() throws IOException {
+            if (move) {
+                LocalFiles.rename(directory.resolve(source.getFileName()), source);
+                return;
+            }
+            Path target = copied.path();
             if (!copied.equals(LocalFiles.describe(target))) {
                 throw new IOException("复制项已更改，无法撤消：" + target);
             }
@@ -1616,29 +1698,36 @@ public final class FileManagerApp extends Application {
         confirm.setTitle("移到回收站");
         confirm.setHeaderText(null);
         if (confirm.showAndWait().orElse(ButtonType.CANCEL) != ButtonType.OK) { return; }
-        List<Change> changes = selected.stream().map(item -> new Change(() -> LocalFiles.trash(item.path()), null)).toList();
+        List<Change> changes = selected.stream().map(item -> new Change(() -> LocalFiles.trash(item.path()), null,
+                List.of(item.path().getParent()))).toList();
         applyChanges("正在移到回收站…", "已移到回收站", changes, ignored -> { });
     }
 
     private void applyChanges(String running, String complete, List<Change> changes, Consumer<Outcome> callback) {
+        applyChanges(running, complete, changes, callback, () -> {});
+    }
+
+    private void applyChanges(String running, String complete, List<Change> changes, Consumer<Outcome> callback,
+                              Runnable reloaded) {
         if (activeTask != null) { return; }
         writing = true;
         runTask(task(cancelled -> processChanges(changes)), running, false, outcome -> {
-            if (!outcome.completed().isEmpty()) {
-                undo = outcome.completed().reversed().stream().filter(change -> change.undo() != null).toList();
+            List<Change> writes = outcome.writes();
+            if (!writes.isEmpty()) {
+                undo = writes.reversed().stream().filter(change -> change.undo() != null).toList();
             }
             callback.accept(outcome);
-            afterWrite(complete, outcome);
+            afterWrite(complete, outcome, reloaded);
         });
     }
 
     private void undo() {
         if (activeTask != null || undo.isEmpty()) { return; }
-        List<Change> reverse = undo.stream().map(change -> new Change(change.undo(), null)).toList();
+        List<Change> reverse = undo.stream().map(change -> new Change(change.undo(), null, change.folders())).toList();
         writing = true;
         runTask(task(cancelled -> processChanges(reverse)), "正在撤消…", false, outcome -> {
             undo = undo.subList(outcome.completed().size(), undo.size());
-            afterWrite("已撤消", outcome);
+            afterWrite("已撤消", outcome, () -> {});
         });
     }
 
@@ -1655,14 +1744,20 @@ public final class FileManagerApp extends Application {
         return new Outcome(List.copyOf(completed), null);
     }
 
-    private void afterWrite(String message, Outcome outcome) {
+    private void afterWrite(String message, Outcome outcome, Runnable reloaded) {
+        List<Change> writes = outcome.writes();
+        recordFolderEdits(writes.stream().flatMap(change -> change.folders().stream()));
         if (outcome.error() == null) {
-            // Expanded branches may include newly created, renamed or moved folders.
-            rebuildSidebar();
-            refresh(message);
+            if (writes.isEmpty()) {
+                updateListingStatus("项目已在目标文件夹");
+            } else {
+                // Expanded branches may include newly created, renamed or moved folders.
+                rebuildSidebar();
+                request(location, activeQuery, message, reloaded);
+            }
         } else {
-            if (!outcome.completed().isEmpty()) { rebuildSidebar(); }
-            refresh(outcome.completed().isEmpty() ? "操作失败" : "已完成 " + outcome.completed().size() + " 项");
+            if (!writes.isEmpty()) { rebuildSidebar(); }
+            refresh(writes.isEmpty() ? "操作失败" : "已完成 " + writes.size() + " 项");
             showError(outcome.error());
         }
     }
@@ -1806,6 +1901,23 @@ public final class FileManagerApp extends Application {
         visits.put(path, FileTime.from(Instant.now()));
         if (visits.size() > 30) { visits.remove(visits.keySet().iterator().next()); }
         saveLines(key, visits.entrySet().stream().map(visit -> visit.getValue().toMillis() + "\t" + visit.getKey()));
+    }
+
+    private void recordFolderEdits(Stream<Path> folders) {
+        List<Path> paths = folders.map(path -> path.toAbsolutePath().normalize()).distinct().toList();
+        if (paths.isEmpty()) { return; }
+        FileTime time = FileTime.from(Instant.now());
+        for (Path path : paths) {
+            folderEdits.remove(path);
+            folderEdits.put(path, time);
+        }
+        while (folderEdits.size() > 30) {
+            var oldest = Collections.min(folderEdits.entrySet(), Map.Entry.comparingByValue());
+            folderEdits.remove(oldest.getKey());
+        }
+        saveLines("folderEdits", folderEdits.entrySet().stream().sorted(Map.Entry.<Path, FileTime>comparingByValue().reversed())
+                .map(edit -> edit.getValue().toMillis() + "\t" + edit.getKey()));
+        refreshModifiedFolders();
     }
 
     private void saveLines(String key, Stream<String> lines) {
