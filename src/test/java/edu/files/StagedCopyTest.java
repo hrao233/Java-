@@ -111,6 +111,29 @@ class StagedCopyTest {
     }
 
     @Test
+    void largerAclGrowsTheSharedBufferAndTheNextFileKeepsItsOwnAcl() throws IOException {
+        Path folder = Files.createDirectory(source.resolve("security"));
+        Path large = Files.writeString(folder.resolve("a-long-acl.txt"), "long ACL");
+        Path ordinary = Files.writeString(folder.resolve("b-ordinary.txt"), "ordinary ACL");
+        var largeAcl = Files.getFileAttributeView(large, AclFileAttributeView.class);
+        var ordinaryAcl = Files.getFileAttributeView(ordinary, AclFileAttributeView.class).getAcl();
+        var entries = new ArrayList<>(largeAcl.getAcl());
+        var rule = AclEntry.newBuilder().setPrincipal(largeAcl.getOwner()).setType(AclEntryType.ALLOW)
+                .setPermissions(AclEntryPermission.READ_ATTRIBUTES).build();
+        for (int i = 0; i < 80; i++) { entries.add(rule); }
+        largeAcl.setAcl(entries);
+
+        var outcome = copy(List.of(folder), (job, sample) -> {}).run();
+        assertEquals(List.of(APPLIED), states(outcome), () -> String.valueOf(outcome.error()));
+        assertTrue(outcome.issues().isEmpty(), () -> outcome.issues().toString());
+        assertEquals(largeAcl.getAcl(), Files.getFileAttributeView(target.resolve("security/a-long-acl.txt"),
+                AclFileAttributeView.class).getAcl());
+        assertEquals(ordinaryAcl, Files.getFileAttributeView(target.resolve("security/b-ordinary.txt"),
+                AclFileAttributeView.class).getAcl());
+        assertNoStaging();
+    }
+
+    @Test
     void fileThatGrowsAfterSelectionSwitchesToUnknownTotal() throws IOException {
         Path file = Files.writeString(source.resolve("live.txt"), "before");
         var task = copy(List.of(file), (job, sample) -> {});

@@ -113,9 +113,11 @@ final class StagedCopy {
             if (identity == null || !identity.equals(observed.objectId())) {
                 throw new IOException("暂存对象身份变化：" + observed.path());
             }
-            int attributes = observed.attributes();
-            if (directory && ((attributes & DIRECTORY_ATTRIBUTE) == 0 || (attributes & REPARSE_POINT_ATTRIBUTE) != 0)) {
-                throw new IOException("暂存目录类型变化：" + observed.path());
+            if (directory) {
+                int attributes = observed.attributes();
+                if ((attributes & DIRECTORY_ATTRIBUTE) == 0 || (attributes & REPARSE_POINT_ATTRIBUTE) != 0) {
+                    throw new IOException("暂存目录类型变化：" + observed.path());
+                }
             }
         }
     }
@@ -128,6 +130,7 @@ final class StagedCopy {
         private final Handle root;
         private final StagedEntry entries;
         private final ArrayDeque<OpenDirectory> opened = new ArrayDeque<>();
+        private final SecurityDescriptors security = new SecurityDescriptors();
         private boolean published;
 
         Stage(Handle parent, FileOperationTask task) throws IOException {
@@ -188,7 +191,12 @@ final class StagedCopy {
             Result result = null;
             try (Handle staged = openRelative(root, item.name, READ_ATTRIBUTES | DELETE_ACCESS)) {
                 item.verify(staged);
-                verifyChildren(item, staged);
+                long checking = CopyDiagnostics.begin();
+                try {
+                    verifyChildren(item, staged);
+                } finally {
+                    CopyDiagnostics.end(CopyDiagnostics.Part.TREE_CHECK, checking);
+                }
                 var attrs = Files.readAttributes(staged.path(), BasicFileAttributes.class, NOFOLLOW_LINKS);
                 Path path = LocalFiles.publishCopy(target, item.directory, sameFolder, candidate -> {
                     task.beforeCommit(PUBLISHING);
@@ -271,7 +279,7 @@ final class StagedCopy {
                 try (Handle copied = openRelative(current.handle(), name, READ_ATTRIBUTES)) {
                     entry.verify(copied);
                     try {
-                        copySecurity(source, target);
+                        security.copy(source, target);
                     } catch (IOException metadata) {
                         task.issue(source, "无法完整复制安全属性", metadata);
                     }
@@ -299,18 +307,20 @@ final class StagedCopy {
 
         @Override
         public void close() {
+            long start = CopyDiagnostics.begin();
             task.phase(CLEANUP);
             while (opened.size() > 1) {
                 try { closeDirectory(opened.removeLast()); }
                 catch (IOException failure) { task.issue(root.path(), "无法关闭暂存目录句柄", failure); }
             }
-            try (root) {
+            try (root; security) {
                 if (!published) { removeChildren(entries, root); }
                 root.deleteOnClose();
             } catch (IOException failure) {
                 task.issue(root.path(), "暂存目录可能仍有残留", failure);
             } finally {
                 task.staging().forget(root.path());
+                CopyDiagnostics.end(CopyDiagnostics.Part.CLEANUP, start);
             }
         }
 
@@ -356,6 +366,7 @@ final class StagedCopy {
         @Override
         public int invoke(long size, long bytes, long streamSize, long streamBytes, int stream, int reason,
                           com.sun.jna.Pointer source, com.sun.jna.Pointer copied, com.sun.jna.Pointer data) {
+            CopyDiagnostics.count(CopyDiagnostics.Part.PROGRESS_CALLBACK);
             try {
                 if (!entry.owned) {
                     entry.identity = objectId(copied, target);

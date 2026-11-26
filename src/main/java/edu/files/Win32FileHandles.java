@@ -12,6 +12,7 @@ import com.sun.jna.win32.StdCallLibrary;
 import java.io.IOException;
 import java.nio.file.Path;
 
+import static edu.files.CopyDiagnostics.Part.*;
 import static java.nio.charset.StandardCharsets.UTF_16LE;
 
 final class Win32FileHandles {
@@ -138,11 +139,14 @@ final class Win32FileHandles {
         }
 
         int attributes() throws IOException {
+            long start = CopyDiagnostics.begin();
             try (Memory basic = new Memory(52)) {
                 if (!Library.KERNEL.GetFileInformationByHandle(pointer, basic)) {
                     throw failure("无法读取目录属性", path);
                 }
                 return basic.getInt(0);
+            } finally {
+                CopyDiagnostics.end(ATTRIBUTES, start);
             }
         }
 
@@ -151,7 +155,10 @@ final class Win32FileHandles {
             if (pointer != null) {
                 Pointer closing = pointer;
                 pointer = null;
-                if (!Library.KERNEL.CloseHandle(closing)) {
+                long start = CopyDiagnostics.begin();
+                boolean closed = Library.KERNEL.CloseHandle(closing);
+                CopyDiagnostics.end(CLOSE_HANDLE, start);
+                if (!closed) {
                     throw failure("无法关闭文件句柄", path);
                 }
             }
@@ -165,8 +172,10 @@ final class Win32FileHandles {
     }
 
     static Handle open(Path path, int access, int sharing) throws IOException {
+        long start = CopyDiagnostics.begin();
         Pointer handle = Library.KERNEL.CreateFileW(windowsPath(path), access, sharing, null, OPEN_EXISTING,
                 BACKUP_SEMANTICS | OPEN_REPARSE_POINT, null);
+        CopyDiagnostics.end(OPEN_PATH, start);
         if (handle == null || Pointer.nativeValue(handle) == -1L) {
             throw failure("无法打开项目", path);
         }
@@ -182,6 +191,7 @@ final class Win32FileHandles {
     }
 
     private static Handle relative(Handle parent, String name, int access, int disposition, int type) throws IOException {
+        long start = CopyDiagnostics.begin();
         Path path = parent.path.resolve(name);
         byte[] filename = name.getBytes(UTF_16LE);
         var output = new PointerByReference();
@@ -207,45 +217,81 @@ final class Win32FileHandles {
                 throw new Failure("无法打开暂存目录项", path, Library.NTDLL.RtlNtStatusToDosError(status));
             }
             return new Handle(path, output.getValue());
+        } finally {
+            CopyDiagnostics.end(OPEN_RELATIVE, start);
         }
     }
 
     static ObjectId objectId(Pointer pointer, Path path) throws IOException {
+        long start = CopyDiagnostics.begin();
         try (Memory fileId = new Memory(24)) {
             if (!Library.KERNEL.GetFileInformationByHandleEx(pointer, FILE_ID_INFO, fileId, (int) fileId.size())) {
                 throw failure("无法读取文件 ID", path);
             }
             return new ObjectId(fileId.getLong(0), fileId.getLong(8), fileId.getLong(16));
+        } finally {
+            CopyDiagnostics.end(FILE_ID, start);
         }
     }
 
     static void copyFile(Path source, Path target, long size, CopyProgress progress) throws IOException {
         int flags = COPY_FILE_FAIL_IF_EXISTS | COPY_FILE_COPY_SYMLINK;
         if (size > 300L * 1024 * 1024) { flags |= COPY_FILE_NO_BUFFERING; }
-        if (!Library.KERNEL.CopyFileExW(windowsPath(source), windowsPath(target), progress, null, null, flags)) {
+        long start = CopyDiagnostics.begin();
+        boolean submitted = Library.KERNEL.CopyFileExW(windowsPath(source), windowsPath(target), progress, null, null, flags);
+        CopyDiagnostics.end(COPY_DATA, start);
+        if (!submitted) {
             throw failure("无法复制到暂存区", source);
         }
     }
 
-    static void copySecurity(Path source, Path target) throws IOException {
-        var security = SecurityLibrary.ADVAPI;
-        var length = new IntByReference();
-        WString from = windowsPath(source);
-        security.GetFileSecurityW(from, SECURITY_INFORMATION, null, 0, length);
-        if (length.getValue() <= 0) { throw failure("无法读取安全属性", source); }
-        try (Memory descriptor = new Memory(length.getValue())) {
-            if (!security.GetFileSecurityW(from, SECURITY_INFORMATION, descriptor, (int) descriptor.size(), length)) {
-                throw failure("无法读取安全属性", source);
+    static final class SecurityDescriptors implements AutoCloseable {
+        private final IntByReference length = new IntByReference();
+        private Memory descriptor;
+
+        void copy(Path source, Path target) throws IOException {
+            if (descriptor == null) { descriptor = new Memory(1024); }
+            WString from = windowsPath(source);
+            length.setValue(0);
+            if (!readSecurity(from, descriptor, (int) descriptor.size(), length)) {
+                int required = length.getValue();
+                if (Native.getLastError() != 122 || required <= descriptor.size()) {
+                    throw failure("无法读取安全属性", source);
+                }
+                descriptor.close();
+                descriptor = new Memory(required);
+                if (!readSecurity(from, descriptor, required, length)) {
+                    throw failure("无法读取安全属性", source);
+                }
             }
             WString to = windowsPath(target);
-            if (!security.SetFileSecurityW(to, SECURITY_INFORMATION, descriptor)) {
+            if (!writeSecurity(to, SECURITY_INFORMATION, descriptor)) {
                 var error = failure("无法完整保留所有者、组和访问控制列表", target);
-                if (!security.SetFileSecurityW(to, 4, descriptor)) {
+                if (!writeSecurity(to, 4, descriptor)) {
                     error.addSuppressed(failure("无法保留访问控制列表", target));
                 }
                 throw error;
             }
         }
+
+        @Override
+        public void close() {
+            if (descriptor != null) { descriptor.close(); }
+        }
+    }
+
+    private static boolean readSecurity(WString from, Pointer descriptor, int capacity, IntByReference length) {
+        long start = CopyDiagnostics.begin();
+        boolean read = SecurityLibrary.ADVAPI.GetFileSecurityW(from, SECURITY_INFORMATION, descriptor, capacity, length);
+        CopyDiagnostics.end(SECURITY_READ, start);
+        return read;
+    }
+
+    private static boolean writeSecurity(WString to, int information, Pointer descriptor) {
+        long start = CopyDiagnostics.begin();
+        boolean written = SecurityLibrary.ADVAPI.SetFileSecurityW(to, information, descriptor);
+        CopyDiagnostics.end(SECURITY_WRITE, start);
+        return written;
     }
 
     private static WString windowsPath(Path path) {
