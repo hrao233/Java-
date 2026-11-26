@@ -11,15 +11,18 @@ import static edu.files.FileChanges.State.*;
 
 final class FileChanges {
     enum State {
-        APPLIED, UNCHANGED, FAILED, UNKNOWN, NOT_RUN, REFUSED;
+        APPLIED, UNCHANGED, FAILED, UNKNOWN, NOT_RUN, CANCELLED, REFUSED;
 
         boolean pending() {
-            return this == FAILED || this == NOT_RUN;
+            return this == FAILED || this == NOT_RUN || this == CANCELLED;
         }
     }
 
     @FunctionalInterface
     interface Action { Effect run() throws IOException; }
+
+    @FunctionalInterface
+    interface TaskAction { Effect run(FileOperationTask task) throws IOException; }
 
     record Selection(LocalFiles.Entry entry, NtfsFileOperations.Item nativeItem) {
         Path path() { return entry.path(); }
@@ -45,8 +48,14 @@ final class FileChanges {
     record Evidence(Path target, LocalFiles.Entry selected, NtfsFileOperations.Item source,
                     NtfsFileOperations.Directory destination) { }
 
-    record Change(Path path, List<Path> folders, Evidence evidence, Action action) {
+    record Change(Path path, List<Path> folders, Evidence evidence, long copyBytes, TaskAction action) {
         Change(Path path, List<Path> folders, Action action) { this(path, folders, null, action); }
+        Change(Path path, List<Path> folders, Evidence evidence, Action action) {
+            this(path, folders, evidence, -1, task -> {
+                task.beforeCommit(FileOperationTask.Phase.EXECUTING);
+                return action.run();
+            });
+        }
     }
 
     record UnknownOperation(String operation, Instant recordedAt, Path path, Evidence evidence,
@@ -71,8 +80,12 @@ final class FileChanges {
 
     record Item(Change change, State state, Change reversal, Receipt receipt, IOException error) { }
 
-    record Outcome(List<Item> items) {
-        Outcome { items = List.copyOf(items); }
+    record Outcome(List<Item> items, List<FileOperationTask.CleanupIssue> cleanupIssues) {
+        Outcome(List<Item> items) { this(items, List.of()); }
+        Outcome {
+            items = List.copyOf(items);
+            cleanupIssues = List.copyOf(cleanupIssues);
+        }
 
         long count(State state) {
             return items.stream().filter(item -> item.state() == state).count();
@@ -125,6 +138,7 @@ final class FileChanges {
             addCount(parts, FAILED, "失败");
             addCount(parts, UNKNOWN, "结果未知");
             addCount(parts, NOT_RUN, "未执行");
+            addCount(parts, CANCELLED, "已取消");
             addCount(parts, REFUSED, "已拒绝撤销");
             return String.join(" · ", parts);
         }
@@ -287,25 +301,36 @@ final class FileChanges {
     }
 
     static Outcome execute(List<Change> changes) {
+        return new FileOperationTask(FileOperationTask.Kind.OTHER, changes).run();
+    }
+
+    static Outcome execute(List<Change> changes, FileOperationTask task) {
         List<Item> results = new ArrayList<>();
         boolean stopped = false;
         for (Change change : changes) {
-            if (stopped) {
+            if (stopped || task.cancellationRequested()) {
                 results.add(new Item(change, NOT_RUN, null, null, null));
                 continue;
             }
+            Item item;
             try {
-                Effect effect = change.action().run();
-                results.add(new Item(change, effect.changed() ? APPLIED : UNCHANGED, effect.reversal(), effect.receipt(), null));
+                task.startItem(change);
+                Effect effect = change.action().run(task);
+                item = new Item(change, effect.changed() ? APPLIED : UNCHANGED, effect.reversal(), effect.receipt(), null);
+            } catch (FileOperationTask.Cancelled cancel) {
+                item = new Item(change, CANCELLED, null, null, null);
+                stopped = true;
             } catch (UndoRefused refusal) {
-                results.add(new Item(change, REFUSED, null, null, refusal));
+                item = new Item(change, REFUSED, null, null, refusal);
             } catch (LocalFiles.UncertainWrite failure) {
-                results.add(new Item(change, UNKNOWN, null, null, failure));
+                item = new Item(change, UNKNOWN, null, null, failure);
                 stopped = true;
             } catch (IOException failure) {
-                results.add(new Item(change, FAILED, null, null, failure));
+                item = new Item(change, FAILED, null, null, failure);
                 stopped = true;
             }
+            results.add(item);
+            task.finishedItem(item.state());
         }
         return new Outcome(results);
     }
