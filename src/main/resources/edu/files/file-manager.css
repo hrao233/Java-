@@ -594,3 +594,73 @@
 .muted-label {
     -fx-font-size: 11px;
 }
+
+.operation-window {
+    -fx-background-color: #f5f8f8;
+}
+
+.operation-heading {
+    -fx-text-fill: #183d38;
+    -fx-font-size: 25px;
+    -fx-font-weight: bold;
+}
+
+.operation-phase {
+    -fx-text-fill: #24695d;
+    -fx-font-size: 15px;
+    -fx-font-weight: bold;
+}
+
+.operation-current, .operation-stat {
+    -fx-text-fill: #25434a;
+}
+
+.operation-muted {
+    -fx-text-fill: #4a6269;
+    -fx-font-size: 12px;
+}
+
+#operation-progress {
+    -fx-pref-height: 11px;
+}
+
+#operation-progress > .track {
+    -fx-background-color: #dae6e5;
+    -fx-background-radius: 5px;
+    -fx-background-insets: 0;
+}
+
+#operation-progress > .bar {
+    -fx-background-color: #217b69;
+    -fx-background-radius: 5px;
+    -fx-background-insets: 0;
+    -fx-padding: 0.38em;
+}
+
+.operation-detail-pane {
+    -fx-background-color: #e8f0ef;
+    -fx-background-insets: 0;
+}
+
+.operation-detail-pane > .viewport {
+    -fx-background-color: transparent;
+}
+
+.operation-details {
+    -fx-padding: 9 11;
+    -fx-text-fill: #24464b;
+}
+
+#operation-action {
+    -fx-min-width: 86px;
+    -fx-padding: 6 14;
+    -fx-background-color: #dbece7;
+    -fx-background-radius: 6px;
+    -fx-border-color: #b8d8cf;
+    -fx-border-radius: 6px;
+    -fx-text-fill: #21564b;
+}
+
+#operation-action:hover {
+    -fx-background-color: #cbe5dc;
+}

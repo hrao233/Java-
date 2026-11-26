@@ -6,11 +6,13 @@ import javafx.event.Event;
 import javafx.scene.Scene;
 import javafx.scene.control.Button;
 import javafx.scene.control.ButtonType;
+import javafx.scene.control.ComboBox;
 import javafx.scene.control.DialogPane;
 import javafx.scene.control.Label;
 import javafx.scene.control.MenuItem;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
+import javafx.scene.image.PixelFormat;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyEvent;
 import javafx.stage.Stage;
@@ -21,6 +23,9 @@ import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
 
+import javax.imageio.ImageIO;
+import java.awt.image.BufferedImage;
+import java.io.IOException;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.nio.file.Files;
@@ -32,6 +37,8 @@ import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.prefs.AbstractPreferences;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -45,6 +52,13 @@ class JavaFxFileOperationsTest {
     private Stage stage;
     private Scene scene;
     private BrowserView browser;
+    private final AtomicBoolean pauseNativeCopy = new AtomicBoolean();
+    private final AtomicBoolean loseMoveReceipt = new AtomicBoolean();
+    private final AtomicBoolean loseUndoReceipt = new AtomicBoolean();
+    private final AtomicInteger injectedWrites = new AtomicInteger();
+    private final CountDownLatch copyHasBytes = new CountDownLatch(1);
+    private final CountDownLatch releaseCopy = new CountDownLatch(1);
+    private Path captures;
 
     @Test
     void windowsWorkflowRestoresLatestBytesAndKeepsPartialCutInSync() throws Exception {
@@ -61,7 +75,7 @@ class JavaFxFileOperationsTest {
         assertTrue(ready.await(10, TimeUnit.SECONDS));
         try {
             fx(() -> {
-                app = new FileManagerApp(new MemoryPreferences(null, ""));
+                app = new FileManagerApp(new MemoryPreferences(null, ""), this::operation);
                 stage = new Stage();
                 stage.setOpacity(0);
                 app.start(stage);
@@ -105,7 +119,10 @@ class JavaFxFileOperationsTest {
             assertEquals("latest edit", Files.readString(copied));
 
             runPartialCut();
+            runLongCopy();
+            runUnknownMoveAndUndo();
         } finally {
+            releaseCopy.countDown();
             fx(() -> {
                 for (var window : List.copyOf(Window.getWindows())) {
                     if (window != stage && window.getScene().getRoot() instanceof DialogPane) { window.hide(); }
@@ -116,6 +133,183 @@ class JavaFxFileOperationsTest {
             });
             Platform.exit();
         }
+    }
+
+    private FileOperationTask operation(FileOperationTask.Kind kind, List<FileChanges.Change> changes) {
+        boolean loseReceipt = switch (kind) {
+            case MOVE -> loseMoveReceipt.getAndSet(false);
+            case UNDO -> loseUndoReceipt.getAndSet(false);
+            default -> false;
+        };
+        if (loseReceipt) {
+            var change = changes.getFirst();
+            var uncertain = new FileChanges.Change(change.path(), change.folders(), change.evidence(), change.copyBytes(), task -> {
+                var effect = change.action().run(task);
+                assertTrue(effect.changed());
+                injectedWrites.incrementAndGet();
+                throw LocalFiles.uncertain("夹具已执行写入并丢失回执", new IOException("test receipt"),
+                        change.path(), effect.receipt().target());
+            });
+            return new FileOperationTask(kind, List.of(uncertain));
+        }
+        return new FileOperationTask(kind, changes, sample -> {
+            if (kind == FileOperationTask.Kind.COPY && sample.transferredBytes() > 0
+                    && pauseNativeCopy.compareAndSet(true, false)) {
+                copyHasBytes.countDown();
+                try {
+                    assertTrue(releaseCopy.await(14, TimeUnit.SECONDS));
+                } catch (InterruptedException failure) {
+                    Thread.currentThread().interrupt();
+                    throw new AssertionError(failure);
+                }
+            }
+        });
+    }
+
+    private void runLongCopy() throws Exception {
+        Path from = Files.createDirectory(root.resolve("progress-source"));
+        Path to = Files.createDirectory(root.resolve("progress-target"));
+        Path file = Files.write(from.resolve("样本视频.bin"), new byte[48 * 1024 * 1024]);
+        go(from);
+        select(file);
+        click("copy");
+        await(() -> idle() && cutSources().equals(List.of(file)), "copy selection", 10);
+        go(to);
+        pauseNativeCopy.set(true);
+        click("paste");
+        assertTrue(copyHasBytes.await(10, TimeUnit.SECONDS));
+        await(() -> progressScene() != null && progressLabel("operation-bytes").contains("48.0 MiB"),
+                "delayed JavaFX progress window", 10);
+        capture("copying.png");
+        assertFalse(Files.exists(to.resolve(file.getFileName())));
+        long request = System.nanoTime();
+        fx(() -> {
+            ((Button) progressScene().lookup("#operation-action")).fire();
+            assertTrue(((FileOperationTask) field(app, "activeFileOperation")).cancellationRequested());
+            assertTrue(progressLabel("operation-stage").contains("取消"));
+            return null;
+        });
+        long confirmed = System.nanoTime();
+        releaseCopy.countDown();
+        await(() -> idle() && "已取消".equals(progressLabel("operation-stage")), "cancelled result", 10);
+        System.out.printf("PHASE23_GUI cancel_event_ms=%.2f cancel_to_final_ui_ms=%.2f%n",
+                (confirmed - request) / 1e6, (System.nanoTime() - request) / 1e6);
+        capture("cancelled.png");
+        assertEquals(48L * 1024 * 1024, Files.size(file));
+        try (var paths = Files.list(to)) { assertEquals(0, paths.count()); }
+        fx(() -> {
+            ((Button) progressScene().lookup("#operation-action")).fire();
+            return null;
+        });
+    }
+
+    private void runUnknownMoveAndUndo() throws Exception {
+        Path from = Files.createDirectory(root.resolve("unknown-source"));
+        Path to = Files.createDirectory(root.resolve("unknown-target"));
+        Path fresh = Files.createDirectory(root.resolve("fresh-target"));
+        Path original = Files.writeString(from.resolve("待核查.txt"), "original object");
+        Path published = to.resolve(original.getFileName());
+        go(from);
+        select(original);
+        click("cut");
+        await(() -> idle() && cutSources().equals(List.of(original)), "cut captured", 10);
+        go(to);
+        loseMoveReceipt.set(true);
+        click("paste");
+        acknowledgeFileError();
+        await(() -> idle() && cutSources().isEmpty() && listed(published), "unknown move result", 12);
+        Files.writeString(original, "replacement object");
+        fx(() -> {
+            assertTrue(button("paste").isDisabled());
+            button("paste").fire();
+            button("unknown-results").fire();
+            return null;
+        });
+        await(() -> unknownDialog() != null, "read-only findings", 12);
+        fx(() -> {
+            var pane = unknownDialog();
+            @SuppressWarnings("unchecked")
+            var paths = (ComboBox<Path>) pane.lookup("#unknown-path");
+            assertEquals(original, paths.getValue());
+            assertTrue(((TextArea) pane.lookup("#unknown-details")).getText().contains("当前路径观测"));
+            var open = pane.getButtonTypes().stream().filter(button -> button.getText().contains("重新选择"))
+                    .findFirst().orElseThrow();
+            ((Button) pane.lookupButton(open)).fire();
+            return null;
+        });
+        await(() -> idle() && listed(original) && cutSources().isEmpty(), "reselect from current directory", 10);
+        assertEquals("replacement object", Files.readString(original));
+        assertEquals("original object", Files.readString(published));
+        select(original);
+        click("cut");
+        await(() -> idle() && cutSources().equals(List.of(original)), "new cut request", 10);
+        go(fresh);
+        click("paste");
+        Path moved = fresh.resolve(original.getFileName());
+        await(() -> idle() && listed(moved), "new move applied", 10);
+        assertEquals("replacement object", Files.readString(moved));
+
+        loseUndoReceipt.set(true);
+        menu("moreItems", "undo");
+        acknowledgeFileError();
+        await(() -> idle() && !listed(moved), "unknown undo result", 10);
+        fx(() -> {
+            call(app, "undo");
+            return null;
+        });
+        assertEquals(2, injectedWrites.get());
+        assertEquals("replacement object", Files.readString(original));
+        assertEquals("original object", Files.readString(published));
+        assertFalse(Files.exists(moved));
+        assertTrue(fx(() -> ((List<?>) field(app, "undo")).isEmpty()));
+    }
+
+    private void acknowledgeFileError() throws Exception {
+        await(() -> errorDialog() != null, "file error", 12);
+        fx(() -> {
+            ((Button) errorDialog().lookupButton(ButtonType.OK)).fire();
+            return null;
+        });
+    }
+
+    private Scene progressScene() {
+        return Window.getWindows().stream().map(Window::getScene)
+                .filter(scene -> scene != null && scene.lookup("#operation-progress") != null)
+                .findFirst().orElse(null);
+    }
+
+    private String progressLabel(String id) {
+        Scene progress = progressScene();
+        return progress == null ? "" : ((Label) progress.lookup("#" + id)).getText();
+    }
+
+    private DialogPane unknownDialog() {
+        for (Window window : List.copyOf(Window.getWindows())) {
+            if (window.getScene().getRoot() instanceof DialogPane pane && pane.lookup("#unknown-details") != null) {
+                window.setOpacity(0);
+                return pane;
+            }
+        }
+        return null;
+    }
+
+    private void capture(String name) throws Exception {
+        if (!Boolean.getBoolean("javafx.captureFileOperations")) { return; }
+        if (captures == null) {
+            captures = Files.createTempDirectory(Path.of(System.getProperty("java.io.tmpdir")), "phase23-fx-images-");
+            System.out.println("PHASE23_GUI captures=" + captures);
+        }
+        BufferedImage image = fx(() -> {
+            var snapshot = progressScene().snapshot(null);
+            int width = (int) snapshot.getWidth();
+            int height = (int) snapshot.getHeight();
+            var argb = new int[width * height];
+            snapshot.getPixelReader().getPixels(0, 0, width, height, PixelFormat.getIntArgbInstance(), argb, 0, width);
+            var result = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
+            result.setRGB(0, 0, width, height, argb, 0, width);
+            return result;
+        });
+        assertTrue(ImageIO.write(image, "png", captures.resolve(name).toFile()));
     }
 
     private void runPartialCut() throws Exception {

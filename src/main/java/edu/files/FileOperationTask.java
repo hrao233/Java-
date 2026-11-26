@@ -83,6 +83,12 @@ final class FileOperationTask {
     }
 
     Snapshot snapshot() { return snapshot; }
+    Duration elapsed() {
+        Snapshot current = snapshot;
+        return current.started() != null && current.result() == null
+                ? Duration.ofNanos(System.nanoTime() - startNanos) : current.elapsed();
+    }
+
     boolean cancellationRequested() { return cancellationRequested; }
 
     synchronized void requestCancellation() {
@@ -120,9 +126,17 @@ final class FileOperationTask {
     }
 
     void copying(Path path) {
+        currentFile(path, Phase.COPYING);
+    }
+
+    void preparing(Path path) {
+        currentFile(path, Phase.PREPARING);
+    }
+
+    private void currentFile(Path path, Phase next) {
         currentPath = path;
-        if (phase == Phase.COPYING) { update(false); }
-        else { phase(Phase.COPYING); }
+        if (phase == next) { update(false); }
+        else { phase(next); }
     }
 
     void reportSize(long actual) {

@@ -12,6 +12,10 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.attribute.DosFileAttributeView;
+import java.nio.file.attribute.AclEntry;
+import java.nio.file.attribute.AclEntryPermission;
+import java.nio.file.attribute.AclEntryType;
+import java.nio.file.attribute.AclFileAttributeView;
 import java.nio.file.attribute.FileTime;
 import java.nio.file.attribute.UserDefinedFileAttributeView;
 import java.time.Instant;
@@ -52,6 +56,12 @@ class StagedCopyTest {
         sourceAttrs.setReadOnly(false);
         alternate.write("test-alternate", ByteBuffer.wrap(stream));
         sourceAttrs.setReadOnly(true);
+        var aclView = Files.getFileAttributeView(first, AclFileAttributeView.class);
+        var entries = new ArrayList<>(aclView.getAcl());
+        var accessRule = AclEntry.newBuilder().setType(AclEntryType.DENY).setPrincipal(aclView.getOwner())
+                .setPermissions(AclEntryPermission.WRITE_DATA).build();
+        entries.addFirst(accessRule);
+        aclView.setAcl(entries);
         var actualTime = Files.getLastModifiedTime(first);
         Path copied = target.resolve(first.getFileName());
         try {
@@ -68,6 +78,7 @@ class StagedCopyTest {
             assertTrue(flags.isReadOnly());
             assertEquals(actualTime, flags.lastModifiedTime());
             assertEquals(Files.getOwner(first), Files.getOwner(copied));
+            assertTrue(Files.getFileAttributeView(copied, AclFileAttributeView.class).getAcl().contains(accessRule));
             var bytes = ByteBuffer.allocate(stream.length);
             Files.getFileAttributeView(copied, UserDefinedFileAttributeView.class).read("test-alternate", bytes);
             assertArrayEquals(stream, bytes.array());
@@ -108,6 +119,26 @@ class StagedCopyTest {
         assertEquals(-1, task.snapshot().totalBytes());
         assertEquals(Files.size(file), task.snapshot().transferredBytes());
         assertEquals("changed at the source before copy", Files.readString(target.resolve("live.txt")));
+        assertNoStaging();
+    }
+
+    @Test
+    void treeCopyReadsTheContentsEncounteredDuringTraversal() throws IOException {
+        Path folder = Files.createDirectory(source.resolve("live"));
+        Path first = Files.writeString(folder.resolve("a.txt"), "initial a");
+        Path second = Files.writeString(folder.resolve("b.txt"), "initial b");
+        var changed = new AtomicReference<Path>();
+        var task = copy(List.of(folder), (job, sample) -> {
+            if (sample.phase() != COPYING || changed.get() != null) { return; }
+            Path next = sample.currentPath().equals(first) ? second : first;
+            try { Files.writeString(next, "edited while walking"); }
+            catch (IOException failure) { throw new UncheckedIOException(failure); }
+            changed.set(next);
+        });
+        assertEquals(List.of(APPLIED), states(task.run()));
+        assertNotNull(changed.get());
+        assertEquals(-1, task.snapshot().totalBytes());
+        assertEquals("edited while walking", Files.readString(target.resolve("live").resolve(changed.get().getFileName())));
         assertNoStaging();
     }
 

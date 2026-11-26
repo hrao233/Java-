@@ -6,9 +6,11 @@ import edu.files.FileChanges.Change;
 import edu.files.FileChanges.Outcome;
 import edu.files.FileChanges.Selection;
 import edu.files.FileChanges.State;
+import edu.files.FileOperationTask.Kind;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.concurrent.Task;
+import javafx.concurrent.WorkerStateEvent;
 import javafx.css.PseudoClass;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
@@ -44,6 +46,7 @@ import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.function.BiFunction;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
@@ -100,11 +103,10 @@ public final class FileManagerApp extends Application {
     private interface Work<T> { T read(BooleanSupplier cancelled) throws Exception; }
 
     private final ExecutorService disk = Executors.newSingleThreadExecutor(work -> {
-        Thread thread = new Thread(work, "file-manager-disk");
-        thread.setDaemon(true);
-        return thread;
+        return new Thread(work, "file-manager-disk");
     });
     private final Preferences preferences;
+    private final BiFunction<Kind, List<Change>, FileOperationTask> operationFactory;
     private final Map<Page, View> views = new EnumMap<>(Page.class);
     private final Deque<Location> past = new ArrayDeque<>();
     private final Deque<Location> future = new ArrayDeque<>();
@@ -145,6 +147,8 @@ public final class FileManagerApp extends Application {
     private Listing listing = new Listing(List.of(), 0, false);
     private List<Change> undo = List.of();
     private Transfer transfer;
+    private FileOperationProgress operationProgress;
+    private FileOperationTask activeFileOperation;
     private LocalFiles.Visibility visibility;
     private Task<?> activeTask;
     private Task<?> previewTask;
@@ -164,12 +168,18 @@ public final class FileManagerApp extends Application {
     }
 
     FileManagerApp(Preferences preferences) {
+        this(preferences, FileOperationTask::new);
+    }
+
+    FileManagerApp(Preferences preferences, BiFunction<Kind, List<Change>, FileOperationTask> operationFactory) {
         this.preferences = preferences;
+        this.operationFactory = operationFactory;
     }
 
     @Override
     public void start(Stage window) {
         stage = window;
+        operationProgress = new FileOperationProgress(window, unknownResults);
         icons = new SystemIcons(window::getOutputScaleX);
         views.put(Page.HOME, new View(Mode.DETAILS, Field.VISITED, true, null));
         views.put(Page.COMPUTER, new View(Mode.TILES, Field.NAME, false, null));
@@ -232,7 +242,8 @@ public final class FileManagerApp extends Application {
         stage.setOnCloseRequest(event -> {
             if (writing) {
                 event.consume();
-                status.setText("正在写入磁盘，请等待操作完成");
+                status.setText("正在处理文件，请等待操作结束");
+                if (activeFileOperation != null) { operationProgress.show(); }
             }
         });
         stage.show();
@@ -247,7 +258,15 @@ public final class FileManagerApp extends Application {
         if (activeTask != null && !writing) { activeTask.cancel(); }
         if (previewTask != null) { previewTask.cancel(); }
         if (modifiedFoldersTask != null) { modifiedFoldersTask.cancel(); }
-        disk.shutdownNow();
+        if (activeFileOperation != null) {
+            activeFileOperation.requestCancellation();
+            disk.shutdown();
+        } else if (writing) {
+            disk.shutdown();
+        } else {
+            disk.shutdownNow();
+        }
+        if (operationProgress != null) { operationProgress.close(); }
         if (icons != null) { icons.close(); }
     }
 
@@ -361,7 +380,7 @@ public final class FileManagerApp extends Application {
         unknownResults.setVisible(false);
         unknownResults.managedProperty().bind(unknownResults.visibleProperty());
         unknownResults.setOnAction(event -> inspectUnknownResults());
-        HBox bar = new HBox(8, progress, status, clipboardStatus, unknownResults);
+        HBox bar = new HBox(8, progress, status, clipboardStatus, operationProgress.launcher(), unknownResults);
         bar.setAlignment(Pos.CENTER_LEFT);
         bar.getStyleClass().add("status-bar");
         return bar;
@@ -1607,7 +1626,7 @@ public final class FileManagerApp extends Application {
                 return;
             }
             Change change = FileChanges.rename(entry, target, entry.needsPathConfirmation());
-            applyChanges("正在重命名…", "已重命名", List.of(change), ignored -> { },
+            applyChanges(Kind.RENAME, "正在重命名…", "已重命名", List.of(change), ignored -> { },
                     () -> Platform.runLater(() -> browser.reveal(target)));
         } catch (InvalidPathException exception) {
             showError(exception);
@@ -1656,12 +1675,13 @@ public final class FileManagerApp extends Application {
             }
             List<Change> changes = pending.sources().stream()
                     .map(source -> FileChanges.transfer(source, destination, pending.move(), unverified.test(source))).toList();
-            applyChanges(pending.move() ? "正在移动…" : "正在复制…", pending.move() ? "已移动" : "已复制", changes, outcome -> {
+            applyChanges(pending.move() ? Kind.MOVE : Kind.COPY, pending.move() ? "正在移动…" : "正在复制…",
+                    pending.move() ? "已移动" : "已复制", changes, outcome -> {
                 List<Selection> remaining = pending.move() ? outcome.remainingCut(pending.sources())
                         : outcome.remainingCopy(pending.sources());
                 transfer = remaining.isEmpty() ? null : new Transfer(remaining, pending.move());
                 describeTransfer();
-            });
+            }, () -> {});
         });
     }
 
@@ -1675,7 +1695,7 @@ public final class FileManagerApp extends Application {
             }
             List<Change> changes = entries.stream()
                     .map(entry -> FileChanges.recycle(entry, entry.needsPathConfirmation(), LocalFiles::desktopTrash)).toList();
-            applyChanges("正在移到回收站…", "已移到回收站", changes, ignored -> { });
+            applyChanges(Kind.RECYCLE, "正在移到回收站…", "已移到回收站", changes, ignored -> { }, () -> {});
         });
     }
 
@@ -1707,43 +1727,54 @@ public final class FileManagerApp extends Application {
         return confirm.showAndWait().orElse(ButtonType.CANCEL) == proceed;
     }
 
-    private void applyChanges(String running, String complete, List<Change> changes, Consumer<Outcome> callback) {
-        applyChanges(running, complete, changes, callback, () -> {});
-    }
-
-    private void applyChanges(String running, String complete, List<Change> changes, Consumer<Outcome> callback,
+    private void applyChanges(Kind kind, String running, String complete, List<Change> changes, Consumer<Outcome> callback,
                               Runnable reloaded) {
-        if (activeTask != null) { return; }
-        writing = true;
-        runTask(task(cancelled -> FileChanges.execute(changes)), running, false, outcome -> {
+        runFileOperation(kind, changes, running, outcome -> {
             if (outcome.count(State.APPLIED) > 0) {
                 undo = outcome.reversals();
             }
             callback.accept(outcome);
-            afterWrite(complete, outcome, reloaded);
+            afterWrite(kind, complete, outcome, reloaded);
         });
     }
 
     private void undo() {
         if (activeTask != null || undo.isEmpty()) { return; }
-        writing = true;
-        List<Change> reverse = undo;
-        runTask(task(cancelled -> FileChanges.execute(reverse)), "正在撤消…", false, outcome -> {
+        runFileOperation(Kind.UNDO, undo, "正在撤消…", outcome -> {
             undo = outcome.pending();
-            afterWrite("已撤消", outcome, () -> {});
+            afterWrite(Kind.UNDO, "已撤消", outcome, () -> {});
         });
     }
 
-    private void afterWrite(String completed, Outcome outcome, Runnable reloaded) {
-        unknownOperations.addAll(outcome.unknownOperations(completed));
+    private void runFileOperation(Kind kind, List<Change> changes, String running, Consumer<Outcome> complete) {
+        if (activeTask != null) { return; }
+        var operation = operationFactory.apply(kind, changes);
+        activeFileOperation = operation;
+        operationProgress.start(operation);
+        writing = true;
+        Task<Outcome> worker = task(ignored -> operation.run());
+        worker.addEventHandler(WorkerStateEvent.WORKER_STATE_FAILED, event -> {
+            activeFileOperation = null;
+            operationProgress.failed(worker.getException());
+        });
+        runTask(worker, running, false, outcome -> {
+            operationProgress.finish(outcome);
+            activeFileOperation = null;
+            complete.accept(outcome);
+        });
+    }
+
+    private void afterWrite(Kind kind, String completed, Outcome outcome, Runnable reloaded) {
+        unknownOperations.addAll(outcome.unknownOperations(FileOperationProgress.operationTitle(kind)));
         unknownResults.setVisible(!unknownOperations.isEmpty());
         recordFolderEdits(outcome.items().stream().filter(item -> item.state() == State.APPLIED)
                 .flatMap(item -> item.change().folders().stream()));
         IOException error = outcome.error();
         String message = outcome.summary(completed);
+        if (!outcome.issues().isEmpty()) { message += " · 查看文件任务详情"; }
         boolean mayHaveWritten = outcome.count(State.APPLIED) + outcome.count(State.UNKNOWN) > 0;
         if (mayHaveWritten) { rebuildSidebar(); }
-        if (mayHaveWritten || outcome.count(State.FAILED) > 0) {
+        if (mayHaveWritten || outcome.count(State.FAILED) > 0 || !outcome.issues().isEmpty()) {
             request(location, activeQuery, message, error == null ? reloaded : () -> {});
         } else {
             updateListingStatus(message);

@@ -25,11 +25,11 @@ final class StagedCopy {
     static Result copy(Path source, Path target, boolean sameFolder, FileOperationTask task) throws IOException {
         task.checkCancellation();
         // Check before creating staging so a missing source leaves the destination untouched.
-        Files.readAttributes(source, BasicFileAttributes.class, NOFOLLOW_LINKS);
+        var sourceAttributes = Files.readAttributes(source, BasicFileAttributes.class, NOFOLLOW_LINKS);
         Result result = null;
         try (var pins = new NtfsFileOperations.PinnedDirectories()) {
             Handle parent = NtfsFileOperations.copyTarget(pins, target.getParent());
-            if (parent == null) { return portableCopy(source, target, sameFolder, task); }
+            if (parent == null) { return portableCopy(source, target, sameFolder, sourceAttributes, task); }
             try (var stage = new Stage(parent, task)) {
                 result = stage.copy(source, target, sameFolder);
             }
@@ -40,18 +40,21 @@ final class StagedCopy {
         return result;
     }
 
-    private static Result portableCopy(Path source, Path target, boolean sameFolder, FileOperationTask task)
-            throws IOException {
+    private static Result portableCopy(Path source, Path target, boolean sameFolder,
+                                       BasicFileAttributes sourceAttributes, FileOperationTask task) throws IOException {
         task.unknownSize();
-        Path staging = Files.createTempDirectory(target.getParent(), ".file-manager-");
-        Path staged = staging.resolve(source.getFileName());
+        Path staged = sourceAttributes.isDirectory()
+                ? Files.createTempDirectory(target.getParent(), ".file-manager-")
+                : target.getParent().resolve(".file-manager-" + UUID.randomUUID());
+        boolean published = false;
         try {
             Files.walkFileTree(source, new SimpleFileVisitor<>() {
                 @Override
                 public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attrs) throws IOException {
                     task.checkCancellation();
+                    task.preparing(directory);
                     rejectJunction(directory, attrs);
-                    Files.createDirectory(staged.resolve(source.relativize(directory)));
+                    if (!source.equals(directory)) { Files.createDirectory(staged.resolve(source.relativize(directory))); }
                     return FileVisitResult.CONTINUE;
                 }
 
@@ -66,13 +69,17 @@ final class StagedCopy {
             });
             task.phase(ATTRIBUTES);
             var attrs = Files.readAttributes(staged, BasicFileAttributes.class, NOFOLLOW_LINKS);
-            return new Result(LocalFiles.publishCopy(target, attrs.isDirectory(), sameFolder, path -> {
+            Path result = LocalFiles.publishCopy(target, attrs.isDirectory(), sameFolder, path -> {
                 task.beforeCommit(PUBLISHING);
                 return LocalFiles.moveWithoutReplacing(staged, path);
-            }), attrs);
+            });
+            published = true;
+            return new Result(result, attrs);
         } finally {
             task.phase(CLEANUP);
-            task.issue(staging, "当前文件系统无法按已验证的句柄清理暂存目录，已保留供核查", null);
+            if (!published && !Files.notExists(staged, NOFOLLOW_LINKS)) {
+                task.issue(staged, "当前文件系统无法按已验证的句柄清理暂存项目，已保留供核查", null);
+            }
         }
     }
 
@@ -127,6 +134,7 @@ final class StagedCopy {
                 @Override
                 public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attrs) throws IOException {
                     task.checkCancellation();
+                    task.preparing(directory);
                     rejectJunction(directory, attrs);
                     openDirectory(directory);
                     return FileVisitResult.CONTINUE;
@@ -141,7 +149,12 @@ final class StagedCopy {
 
                 @Override
                 public FileVisitResult postVisitDirectory(Path directory, IOException error) throws IOException {
-                    closeDirectory(opened.removeLast());
+                    try {
+                        closeDirectory(opened.removeLast());
+                    } catch (IOException closeFailure) {
+                        if (error == null) { throw closeFailure; }
+                        error.addSuppressed(closeFailure);
+                    }
                     if (error != null) { throw error; }
                     task.checkCancellation();
                     return FileVisitResult.CONTINUE;
@@ -150,6 +163,7 @@ final class StagedCopy {
             task.phase(ATTRIBUTES);
             task.checkCancellation();
             StagedEntry item = entries.children.values().iterator().next();
+            Result result = null;
             try (Handle staged = openRelative(root, item.name, READ_ATTRIBUTES | DELETE_ACCESS)) {
                 item.verify(staged);
                 verifyChildren(item, staged);
@@ -168,11 +182,12 @@ final class StagedCopy {
                     published = true;
                     return candidate;
                 });
-                return new Result(path, attrs);
+                result = new Result(path, attrs);
             } catch (IOException failure) {
-                if (!published) { throw failure; }
-                throw LocalFiles.uncertain("发布后无法释放副本句柄", failure, source, target, root.path());
+                if (result == null) { throw failure; }
+                task.issue(result.path(), "已发布副本，但无法释放提交句柄", failure);
             }
+            return result;
         }
 
         private void openDirectory(Path source) throws IOException {
