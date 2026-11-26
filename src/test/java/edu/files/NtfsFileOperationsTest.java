@@ -118,6 +118,103 @@ class NtfsFileOperationsTest {
     }
 
     @Test
+    void applicationRecordsTheActualTargetAndUndoesMoveAfterEditing() throws IOException {
+        Path source = Files.writeString(root.resolve("note.txt"), "before");
+        Path target = Files.createDirectory(root.resolve("target"));
+        var selected = FileChanges.capture(LocalFiles.describe(source));
+        var destination = FileChanges.destination(target);
+        assertFalse(selected.needsPathConfirmation(destination, true));
+
+        var resolved = FileChanges.execute(java.util.List.of(FileChanges.transfer(selected, destination, true, false)));
+        var item = resolved.items().getFirst();
+        assertEquals(FileChanges.State.APPLIED, item.state());
+        Path published = item.receipt().target();
+        assertEquals(target.resolve("note.txt"), published);
+        assertEquals(selected.nativeItem().id(), item.receipt().identity().id());
+        Files.writeString(published, "latest file content");
+
+        var undone = FileChanges.execute(resolved.reversals());
+        assertEquals(FileChanges.State.APPLIED, undone.items().getFirst().state());
+        assertEquals("latest file content", Files.readString(source));
+        assertFalse(Files.exists(published));
+    }
+
+    @Test
+    void applicationRestoresCaseOnlyRenameWithoutDeletingEdits() throws IOException {
+        Path source = Files.writeString(root.resolve("name.txt"), "original");
+        var selected = FileChanges.capture(LocalFiles.describe(source));
+        Path upper = root.resolve("NAME.txt");
+
+        var changed = FileChanges.execute(java.util.List.of(FileChanges.rename(selected, upper, false)));
+        assertEquals(FileChanges.State.APPLIED, changed.items().getFirst().state());
+        Files.writeString(upper, "edited");
+        assertEquals(FileChanges.State.APPLIED, FileChanges.execute(changed.reversals()).items().getFirst().state());
+        try (var entries = Files.list(root)) {
+            assertEquals("name.txt", entries.findFirst().orElseThrow().getFileName().toString());
+        }
+        assertEquals("edited", Files.readString(source));
+    }
+
+    @Test
+    void applicationCopiesWithAPinnedSourceAndStillRefusesDeleteBasedUndo() throws IOException {
+        Path source = Files.writeString(root.resolve("note.txt"), "original");
+        Path folder = Files.createDirectory(root.resolve("target"));
+        var selected = FileChanges.capture(LocalFiles.describe(source));
+        var target = FileChanges.destination(folder);
+        assertFalse(selected.needsPathConfirmation(target, false));
+
+        var copied = FileChanges.execute(java.util.List.of(FileChanges.transfer(selected, target, false, false)));
+        var item = copied.items().getFirst();
+        assertEquals(FileChanges.State.APPLIED, item.state(), () -> String.valueOf(copied.error()));
+        assertEquals(folder.resolve("note.txt"), item.receipt().target());
+        assertEquals(FileChanges.State.REFUSED, FileChanges.execute(copied.reversals()).items().getFirst().state());
+        assertEquals("original", Files.readString(source));
+        assertEquals("original", Files.readString(item.receipt().target()));
+    }
+
+    @Test
+    void replacedOriginalParentAndOccupiedNameAreRefusedDuringUndo() throws IOException {
+        Path origin = Files.createDirectory(root.resolve("origin"));
+        Path source = Files.writeString(origin.resolve("note.txt"), "original");
+        Path target = Files.createDirectory(root.resolve("target"));
+        var selected = FileChanges.capture(LocalFiles.describe(source));
+        var moved = FileChanges.execute(java.util.List.of(
+                FileChanges.transfer(selected, FileChanges.destination(target), true, false)));
+        assertEquals(FileChanges.State.APPLIED, moved.items().getFirst().state());
+
+        Files.writeString(source, "occupied");
+        var conflict = FileChanges.execute(moved.reversals());
+        assertInstanceOf(FileAlreadyExistsException.class, conflict.error());
+        assertEquals("occupied", Files.readString(source));
+        assertEquals(moved.reversals(), conflict.pending());
+
+        Files.move(origin, root.resolve("previous-origin"));
+        Files.createDirectory(origin);
+        var replaced = FileChanges.execute(conflict.pending());
+        assertEquals(FileChanges.State.FAILED, replaced.items().getFirst().state());
+        assertFalse(Files.exists(source));
+        assertEquals("original", Files.readString(target.resolve("note.txt")));
+        assertEquals("occupied", Files.readString(root.resolve("previous-origin/note.txt")));
+    }
+
+    @Test
+    void pathFallbackRequiresConsentAndDoesNotCreateNativeUndo() throws IOException {
+        Path source = Files.writeString(root.resolve("note.txt"), "original");
+        Path folder = Files.createDirectory(root.resolve("target"));
+        var selected = FileChanges.capture(LocalFiles.describe(source));
+        var fallback = new FileChanges.Destination(folder, null);
+        assertTrue(selected.needsPathConfirmation(fallback, true));
+
+        var refused = FileChanges.execute(java.util.List.of(FileChanges.transfer(selected, fallback, true, false)));
+        assertEquals(FileChanges.State.FAILED, refused.items().getFirst().state());
+        assertEquals("original", Files.readString(source));
+        var moved = FileChanges.execute(java.util.List.of(FileChanges.transfer(selected, fallback, true, true)));
+        assertEquals(FileChanges.State.APPLIED, moved.items().getFirst().state());
+        assertEquals(FileChanges.State.REFUSED, FileChanges.execute(moved.reversals()).items().getFirst().state());
+        assertEquals("original", Files.readString(folder.resolve("note.txt")));
+    }
+
+    @Test
     void junctionIsRejectedAsAnAncestorAndAsADestination() throws Exception {
         Path direct = Files.createDirectory(root.resolve("direct"));
         Path file = Files.writeString(direct.resolve("original.txt"), "original");

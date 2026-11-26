@@ -20,14 +20,32 @@ final class FileChanges {
     @FunctionalInterface
     interface Action { Effect run() throws IOException; }
 
-    record Change(Path path, List<Path> folders, Action action) { }
+    record Selection(LocalFiles.Entry entry, NtfsFileOperations.Item nativeItem) {
+        Path path() { return entry.path(); }
 
-    record Effect(boolean changed, Change reversal) {
-        static final Effect UNCHANGED = new Effect(false, null);
-        static Effect written(Change reversal) { return new Effect(true, reversal); }
+        boolean needsPathConfirmation() {
+            return nativeItem == null && !entry.hasIdentity();
+        }
+
+        boolean needsPathConfirmation(Destination destination, boolean moving) {
+            if (nativeItem == null) { return needsPathConfirmation(); }
+            return moving ? !NtfsFileOperations.sameVolume(nativeItem, destination.directory())
+                    : destination.directory() == null;
+        }
     }
 
-    record Item(Change change, State state, Change reversal, IOException error) { }
+    record Destination(Path path, NtfsFileOperations.Directory directory) { }
+    record Receipt(Path source, Path target, NtfsFileOperations.Item identity) { }
+
+    record Change(Path path, List<Path> folders, Action action) { }
+
+    record Effect(boolean changed, Change reversal, Receipt receipt) {
+        static final Effect UNCHANGED = new Effect(false, null, null);
+        static Effect written(Change reversal) { return written(reversal, null); }
+        static Effect written(Change reversal, Receipt receipt) { return new Effect(true, reversal, receipt); }
+    }
+
+    record Item(Change change, State state, Change reversal, Receipt receipt, IOException error) { }
 
     record Outcome(List<Item> items) {
         Outcome { items = List.copyOf(items); }
@@ -44,7 +62,7 @@ final class FileChanges {
             return items.stream().filter(item -> item.state().pending()).map(Item::change).toList();
         }
 
-        List<LocalFiles.Entry> remainingCut(List<LocalFiles.Entry> sources) {
+        <T> List<T> remainingCut(List<T> sources) {
             int completedPrefix = Math.toIntExact(count(APPLIED) + count(UNCHANGED));
             return List.copyOf(sources.subList(completedPrefix, sources.size()));
         }
@@ -83,39 +101,104 @@ final class FileChanges {
 
     private FileChanges() { }
 
+    static Selection capture(LocalFiles.Entry entry) throws IOException {
+        return new Selection(entry, NtfsFileOperations.capture(entry));
+    }
+
+    static Destination destination(Path path) throws IOException {
+        return new Destination(path, NtfsFileOperations.captureDirectory(path));
+    }
+
     static Change transfer(LocalFiles.Entry source, Path directory, boolean move, boolean confirmedCurrentPath) {
+        return transfer(new Selection(source, null), new Destination(directory, null), move, confirmedCurrentPath);
+    }
+
+    static Change transfer(Selection source, Destination destination, boolean move, boolean confirmedCurrentPath) {
+        Path directory = destination.path();
         List<Path> folders = move ? List.of(source.path().getParent(), directory) : List.of(directory);
         return new Change(source.path(), folders, () -> {
-            LocalFiles.Entry selected = LocalFiles.verify(source, confirmedCurrentPath);
-            if (!move) {
-                Path copied = LocalFiles.copy(selected.path(), directory).path();
-                return Effect.written(refuseUndo(copied, "为保护副本及其中的后续修改，复制暂不支持自动撤销"));
+            if (source.needsPathConfirmation(destination, move) && !confirmedCurrentPath) {
+                throw new IOException("无法确认身份，请刷新后重新选择：" + source.path());
             }
+            var nativeItem = source.nativeItem();
+            if (move && nativeItem != null && NtfsFileOperations.sameVolume(nativeItem, destination.directory())) {
+                return moveByHandle(nativeItem, destination.directory(), nativeItem.name(), true);
+            }
+            if (!move) {
+                Path copied;
+                if (nativeItem != null) {
+                    copied = NtfsFileOperations.copy(nativeItem, directory, destination.directory()).path();
+                } else {
+                    LocalFiles.Entry selected = LocalFiles.verify(source.entry(), confirmedCurrentPath);
+                    copied = LocalFiles.copy(selected.path(), directory).path();
+                }
+                return Effect.written(refuseUndo(copied, "为保护副本及其中的后续修改，复制暂不支持自动撤销"),
+                        new Receipt(source.path(), copied, null));
+            }
+            LocalFiles.Entry selected = verifyPathSource(source, confirmedCurrentPath);
             LocalFiles.Entry parent = originalParent(selected);
             Path target = LocalFiles.move(selected.path(), directory);
-            return target == null ? Effect.UNCHANGED : Effect.written(reverseMove(selected, parent, target));
+            return target == null ? Effect.UNCHANGED : Effect.written(reverseMove(selected, parent, target),
+                    new Receipt(selected.path(), target, null));
         });
     }
 
     static Change rename(LocalFiles.Entry source, Path target, boolean confirmedCurrentPath) {
+        return rename(new Selection(source, null), target, confirmedCurrentPath);
+    }
+
+    static Change rename(Selection source, Path target, boolean confirmedCurrentPath) {
         return new Change(source.path(), List.of(source.path().getParent()), () -> {
-            LocalFiles.Entry selected = LocalFiles.verify(source, confirmedCurrentPath);
+            var nativeItem = source.nativeItem();
+            if (nativeItem != null) {
+                return moveByHandle(nativeItem, nativeItem.parent(), target.getFileName().toString(), true);
+            }
+            LocalFiles.Entry selected = LocalFiles.verify(source.entry(), confirmedCurrentPath);
             Path destination = LocalFiles.childNamed(selected.path().getParent(), target.getFileName().toString());
             if (selected.path().toString().equals(destination.toString())) {
                 return Effect.UNCHANGED;
             }
             LocalFiles.Entry parent = originalParent(selected);
             LocalFiles.rename(selected.path(), destination);
-            return Effect.written(reverseMove(selected, parent, destination));
+            return Effect.written(reverseMove(selected, parent, destination), new Receipt(selected.path(), destination, null));
         });
     }
 
     static Change recycle(LocalFiles.Entry source, boolean confirmedCurrentPath, LocalFiles.RecycleBin recycleBin) {
+        return recycle(new Selection(source, null), confirmedCurrentPath, recycleBin);
+    }
+
+    static Change recycle(Selection source, boolean confirmedCurrentPath, LocalFiles.RecycleBin recycleBin) {
         return new Change(source.path(), List.of(source.path().getParent()), () -> {
-            LocalFiles.Entry selected = LocalFiles.verify(source, confirmedCurrentPath);
+            LocalFiles.Entry selected = verifyPathSource(source, confirmedCurrentPath);
             LocalFiles.trash(selected.path(), recycleBin);
-            return Effect.written(refuseUndo(selected.path(), "请在系统回收站查看已回收的项目"));
+            return Effect.written(refuseUndo(selected.path(), "请在系统回收站查看已回收的项目"),
+                    new Receipt(selected.path(), null, null));
         });
+    }
+
+    private static LocalFiles.Entry verifyPathSource(Selection source, boolean confirmedCurrentPath) throws IOException {
+        if (source.nativeItem() != null) {
+            NtfsFileOperations.verify(source.nativeItem());
+            return source.entry();
+        }
+        return LocalFiles.verify(source.entry(), confirmedCurrentPath);
+    }
+
+    private static Effect moveByHandle(NtfsFileOperations.Item source, NtfsFileOperations.Directory destination,
+                                       String name, boolean keepReversal) throws IOException {
+        var moved = NtfsFileOperations.move(source, destination, name);
+        if (moved == null) { return Effect.UNCHANGED; }
+        Change reversal = null;
+        if (keepReversal) {
+            if (moved.result() == null) {
+                reversal = refuseUndo(moved.target(), "改名已完成，但无法取得目标身份，已禁用自动撤销");
+            } else {
+                reversal = new Change(moved.target(), List.of(source.parent().path(), destination.path()),
+                        () -> moveByHandle(moved.result(), source.parent(), source.name(), false));
+            }
+        }
+        return Effect.written(reversal, new Receipt(source.path(), moved.target(), moved.result()));
     }
 
     static Change undoCreation(Path path) {
@@ -156,19 +239,19 @@ final class FileChanges {
         boolean stopped = false;
         for (Change change : changes) {
             if (stopped) {
-                results.add(new Item(change, NOT_RUN, null, null));
+                results.add(new Item(change, NOT_RUN, null, null, null));
                 continue;
             }
             try {
                 Effect effect = change.action().run();
-                results.add(new Item(change, effect.changed() ? APPLIED : UNCHANGED, effect.reversal(), null));
+                results.add(new Item(change, effect.changed() ? APPLIED : UNCHANGED, effect.reversal(), effect.receipt(), null));
             } catch (UndoRefused refusal) {
-                results.add(new Item(change, REFUSED, null, refusal));
+                results.add(new Item(change, REFUSED, null, null, refusal));
             } catch (LocalFiles.UncertainWrite failure) {
-                results.add(new Item(change, UNKNOWN, null, failure));
+                results.add(new Item(change, UNKNOWN, null, null, failure));
                 stopped = true;
             } catch (IOException failure) {
-                results.add(new Item(change, FAILED, null, failure));
+                results.add(new Item(change, FAILED, null, null, failure));
                 stopped = true;
             }
         }

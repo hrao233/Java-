@@ -4,6 +4,7 @@ import edu.files.BrowserView.Field;
 import edu.files.BrowserView.Mode;
 import edu.files.FileChanges.Change;
 import edu.files.FileChanges.Outcome;
+import edu.files.FileChanges.Selection;
 import edu.files.FileChanges.State;
 import javafx.application.Application;
 import javafx.application.Platform;
@@ -45,6 +46,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.Predicate;
 import java.util.prefs.Preferences;
 import java.util.stream.Stream;
 
@@ -89,7 +91,7 @@ public final class FileManagerApp extends Application {
         }
     }
     private record SystemCatalog(WindowsPlaces.Places places, List<NewItems.Type> newTypes) { }
-    private record Transfer(List<LocalFiles.Entry> sources, boolean move) { }
+    private record Transfer(List<Selection> sources, boolean move) { }
 
     @FunctionalInterface
     private interface FileAction { void run() throws IOException; }
@@ -1574,24 +1576,31 @@ public final class FileManagerApp extends Application {
     }
 
     private void renameNewItem(NewItems.Created created, String name) {
-        renameEntry(created.entry(), name);
+        if (activeTask != null || name.isBlank()) { return; }
+        runTask(task(ignored -> FileChanges.capture(created.entry())), "正在核对新建项目…", false,
+                selection -> renameEntry(selection, name));
     }
 
     private void renameSelected() {
         BrowserItem selected = selectedItem();
         if (selected == null || selected.entry() == null || browser.selection().size() != 1 || activeTask != null) { return; }
         String extension = selected.name().substring(LocalFiles.extensionStart(selected.name(), selected.directory()));
-        browser.editName(selected.path(), extension, false, name -> renameEntry(selected.entry(), name));
+        runTask(task(ignored -> FileChanges.capture(selected.entry())), "正在核对所选项目…", false, selection -> {
+            updateListingStatus("");
+            browser.editName(selected.path(), extension, false, name -> renameEntry(selection, name));
+        });
     }
 
-    private void renameEntry(LocalFiles.Entry entry, String name) {
+    private void renameEntry(Selection entry, String name) {
         if (activeTask != null || name.isBlank()) { return; }
         try {
             Path target = LocalFiles.childNamed(entry.path().getParent(), name);
-            if (entry.path().toString().equals(target.toString()) || !confirmCurrentPaths(List.of(entry), "重命名", false)) {
+            if (entry.path().toString().equals(target.toString())
+                    || !confirmCurrentPaths(List.of(entry), Selection::needsPathConfirmation, "重命名", false)) {
+                updateListingStatus("");
                 return;
             }
-            Change change = FileChanges.rename(entry, target, !entry.hasIdentity());
+            Change change = FileChanges.rename(entry, target, entry.needsPathConfirmation());
             applyChanges("正在重命名…", "已重命名", List.of(change), ignored -> { },
                     () -> Platform.runLater(() -> browser.reveal(target)));
         } catch (InvalidPathException exception) {
@@ -1602,14 +1611,26 @@ public final class FileManagerApp extends Application {
     private void rememberSelection(boolean move) {
         List<BrowserItem> selected = browser.selection();
         if (!canModify(selected) || activeTask != null) { return; }
-        transfer = new Transfer(selected.stream().map(BrowserItem::entry).toList(), move);
-        describeTransfer();
-        updateControls();
+        captureSelection(selected, sources -> {
+            transfer = new Transfer(sources, move);
+            describeTransfer();
+            updateListingStatus("");
+        });
+    }
+
+    private void captureSelection(List<BrowserItem> selected, Consumer<List<Selection>> ready) {
+        runTask(task(ignored -> {
+            List<Selection> result = new ArrayList<>();
+            for (BrowserItem item : selected) {
+                result.add(FileChanges.capture(item.entry()));
+            }
+            return List.copyOf(result);
+        }), "正在核对所选项目…", false, ready);
     }
 
     private void describeTransfer() {
         if (transfer == null) { clipboardStatus.setText(""); return; }
-        String label = transfer.sources().size() == 1 ? transfer.sources().getFirst().name()
+        String label = transfer.sources().size() == 1 ? transfer.sources().getFirst().entry().name()
                 : transfer.sources().size() + " 个项目";
         clipboardStatus.setText((transfer.move() ? "已剪切 · " : "待粘贴 · ") + label);
     }
@@ -1621,34 +1642,47 @@ public final class FileManagerApp extends Application {
     private void pasteInto(Path directory) {
         Transfer pending = transfer;
         if (activeTask != null || pending == null) { return; }
-        if (!confirmCurrentPaths(pending.sources(), pending.move() ? "移动" : "复制", false)) { return; }
-        List<Change> changes = pending.sources().stream()
-                .map(source -> FileChanges.transfer(source, directory, pending.move(), !source.hasIdentity())).toList();
-        applyChanges(pending.move() ? "正在移动…" : "正在复制…", pending.move() ? "已移动" : "已复制", changes, outcome -> {
-            if (!pending.move()) { return; }
-            List<LocalFiles.Entry> remaining = outcome.remainingCut(pending.sources());
-            transfer = remaining.isEmpty() ? null : new Transfer(remaining, true);
-            describeTransfer();
+        runTask(task(ignored -> FileChanges.destination(directory)), "正在核对目标文件夹…", false, destination -> {
+            Predicate<Selection> unverified = source -> source.needsPathConfirmation(destination, pending.move());
+            if (!confirmCurrentPaths(pending.sources(), unverified, pending.move() ? "移动" : "复制", false)) {
+                updateListingStatus("");
+                return;
+            }
+            List<Change> changes = pending.sources().stream()
+                    .map(source -> FileChanges.transfer(source, destination, pending.move(), unverified.test(source))).toList();
+            applyChanges(pending.move() ? "正在移动…" : "正在复制…", pending.move() ? "已移动" : "已复制", changes, outcome -> {
+                if (!pending.move()) { return; }
+                List<Selection> remaining = outcome.remainingCut(pending.sources());
+                transfer = remaining.isEmpty() ? null : new Transfer(remaining, true);
+                describeTransfer();
+            });
         });
     }
 
     private void trashSelected() {
         List<BrowserItem> selected = browser.selection();
         if (!canModify(selected) || activeTask != null) { return; }
-        List<LocalFiles.Entry> entries = selected.stream().map(BrowserItem::entry).toList();
-        if (!confirmCurrentPaths(entries, "移到回收站", true)) { return; }
-        List<Change> changes = entries.stream()
-                .map(entry -> FileChanges.recycle(entry, !entry.hasIdentity(), LocalFiles::desktopTrash)).toList();
-        applyChanges("正在移到回收站…", "已移到回收站", changes, ignored -> { });
+        captureSelection(selected, entries -> {
+            if (!confirmCurrentPaths(entries, Selection::needsPathConfirmation, "移到回收站", true)) {
+                updateListingStatus("");
+                return;
+            }
+            List<Change> changes = entries.stream()
+                    .map(entry -> FileChanges.recycle(entry, entry.needsPathConfirmation(), LocalFiles::desktopTrash)).toList();
+            applyChanges("正在移到回收站…", "已移到回收站", changes, ignored -> { });
+        });
     }
 
-    private boolean confirmCurrentPaths(List<LocalFiles.Entry> entries, String action, boolean recycle) {
-        List<LocalFiles.Entry> unverified = entries.stream().filter(entry -> !entry.hasIdentity()).toList();
+    private boolean confirmCurrentPaths(List<Selection> entries, Predicate<Selection> needsApproval, String action, boolean recycle) {
+        List<Selection> unverified = entries.stream().filter(needsApproval).toList();
         if (unverified.isEmpty() && !recycle) { return true; }
-        String name = entries.size() == 1 ? "「" + entries.getFirst().name() + "」" : entries.size() + " 个项目";
+        String name = entries.size() == 1 ? "「" + entries.getFirst().entry().name() + "」" : entries.size() + " 个项目";
         String message = unverified.isEmpty()
                 ? "将" + name + "移到回收站？"
-                : "无法核对 " + unverified.size() + " 个项目的文件身份。请确认要" + action + "下列路径当前的项目。";
+                : "有 " + unverified.size() + " 个项目需要按路径处理。请确认要" + action + "下列路径当前的项目。";
+        if (recycle) {
+            message += "\n系统回收站按路径处理，确认后请避免同时改动这些项目。";
+        }
         ButtonType proceed = new ButtonType(unverified.isEmpty() ? "移到回收站" : "按当前路径继续",
                 ButtonBar.ButtonData.OK_DONE);
         Alert confirm = new Alert(Alert.AlertType.CONFIRMATION, message, ButtonType.CANCEL, proceed);
