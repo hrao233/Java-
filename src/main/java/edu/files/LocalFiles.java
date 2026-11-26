@@ -358,40 +358,22 @@ final class LocalFiles {
     }
 
     static Entry copy(Path source, Path directory) throws IOException {
+        return copy(source, directory, new FileOperationTask(FileOperationTask.Kind.COPY, List.of()));
+    }
+
+    static Entry copy(Path source, Path directory, FileOperationTask task) throws IOException {
         Path destination = transferTarget(source, directory);
         boolean sameFolder = Files.isSameFile(source.toAbsolutePath().getParent(), destination.getParent());
         if (!sameFolder) { requireAvailable(destination); }
-        // Keep incomplete copies out of the destination name until the data is ready.
-        Path staging = Files.createTempDirectory(destination.getParent(), ".file-manager-");
-        Path stagedItem = staging.resolve(source.getFileName());
-        BasicFileAttributes attributes;
-        Path copied;
-        try {
-            copyTree(source, stagedItem);
-            attributes = Files.readAttributes(stagedItem, BasicFileAttributes.class, NO_LINKS);
-            copied = sameFolder
-                    ? placeDuplicate(stagedItem, destination, attributes.isDirectory())
-                    : moveWithoutReplacing(stagedItem, destination);
-        } catch (IOException | RuntimeException exception) {
-            try {
-                deleteStaging(staging);
-            } catch (IOException cleanupFailure) {
-                exception.addSuppressed(cleanupFailure);
-                if (exception instanceof IOException) {
-                    throw uncertain("无法确认复制结果，暂存清理也失败", exception, source, destination, staging);
-                }
-            }
-            throw exception;
-        }
-        try {
-            Files.delete(staging);
-        } catch (IOException exception) {
-            staging.toFile().deleteOnExit();
-        }
-        return entry(copied, attributes);
+        var result = StagedCopy.copy(source, destination, sameFolder, task);
+        return entry(result.path(), result.attributes());
     }
 
-    private static Path placeDuplicate(Path stagedItem, Path original, boolean directory) throws IOException {
+    @FunctionalInterface
+    interface Publisher { Path publish(Path target) throws IOException; }
+
+    static Path publishCopy(Path original, boolean directory, boolean sameFolder, Publisher publisher) throws IOException {
+        if (!sameFolder) { return publisher.publish(original); }
         String name = original.getFileName().toString();
         int split = extensionStart(name, directory);
         String stem = name.substring(0, split);
@@ -400,7 +382,7 @@ final class LocalFiles {
             String suffix = number == 1 ? " - 副本" : " - 副本 (" + number + ")";
             Path candidate = original.resolveSibling(stem + suffix + extension);
             try {
-                return moveWithoutReplacing(stagedItem, candidate);
+                return publisher.publish(candidate);
             } catch (FileAlreadyExistsException exception) {
                 // Another copy may have acquired this name while the data was staged.
             }
@@ -422,7 +404,7 @@ final class LocalFiles {
         return moveWithoutReplacing(source, destination);
     }
 
-    private static Path moveWithoutReplacing(Path source, Path target) throws IOException {
+    static Path moveWithoutReplacing(Path source, Path target) throws IOException {
         requireAvailable(target);
         try {
             return Files.move(source, target);
@@ -488,45 +470,6 @@ final class LocalFiles {
             throw new IOException("目标文件夹位于源文件夹内");
         }
         return destination;
-    }
-
-    private static void copyTree(Path source, Path target) throws IOException {
-        Files.walkFileTree(source, new SimpleFileVisitor<>() {
-            @Override
-            public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attributes)
-                    throws IOException {
-                if (attributes.isOther()) {
-                    throw new IOException("无法复制目录联接：" + directory);
-                }
-                Files.createDirectory(target.resolve(source.relativize(directory)));
-                return FileVisitResult.CONTINUE;
-            }
-
-            @Override
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) throws IOException {
-                Files.copy(file, target.resolve(source.relativize(file)), NO_LINKS, StandardCopyOption.COPY_ATTRIBUTES);
-                return FileVisitResult.CONTINUE;
-            }
-        });
-    }
-
-    private static void deleteStaging(Path directory) throws IOException {
-        Files.walkFileTree(directory, new SimpleFileVisitor<>() {
-            @Override
-            public FileVisitResult visitFile(Path file, BasicFileAttributes attributes) throws IOException {
-                Files.delete(file);
-                return FileVisitResult.CONTINUE;
-            }
-
-            @Override
-            public FileVisitResult postVisitDirectory(Path path, IOException exception) throws IOException {
-                if (exception != null) {
-                    throw exception;
-                }
-                Files.delete(path);
-                return FileVisitResult.CONTINUE;
-            }
-        });
     }
 
     private static Desktop desktopFor(Desktop.Action action) throws IOException {

@@ -80,11 +80,11 @@ final class FileChanges {
 
     record Item(Change change, State state, Change reversal, Receipt receipt, IOException error) { }
 
-    record Outcome(List<Item> items, List<FileOperationTask.CleanupIssue> cleanupIssues) {
+    record Outcome(List<Item> items, List<FileOperationTask.Issue> issues) {
         Outcome(List<Item> items) { this(items, List.of()); }
         Outcome {
             items = List.copyOf(items);
-            cleanupIssues = List.copyOf(cleanupIssues);
+            issues = List.copyOf(issues);
         }
 
         long count(State state) {
@@ -173,22 +173,25 @@ final class FileChanges {
         Path directory = destination.path();
         List<Path> folders = move ? List.of(source.path().getParent(), directory) : List.of(directory);
         var evidence = evidence(source, directory.resolve(source.path().getFileName()), destination.directory());
-        return new Change(source.path(), folders, evidence, () -> {
+        LocalFiles.Entry entry = source.entry();
+        long size = move || entry.directory() || entry.link() || entry.other() ? -1 : entry.size();
+        return new Change(source.path(), folders, evidence, size, task -> {
             if (source.needsPathConfirmation(destination, move) && !confirmedCurrentPath) {
                 throw new IOException("无法确认身份，请刷新后重新选择：" + source.path());
             }
             var nativeItem = source.nativeItem();
             if (move && nativeItem != null && NtfsFileOperations.sameVolume(nativeItem, destination.directory())) {
+                task.beforeCommit(FileOperationTask.Phase.EXECUTING);
                 return moveByHandle(nativeItem, destination.directory(), nativeItem.name(), true);
             }
             if (!move) {
                 Path copied;
                 if (nativeItem != null) {
-                    copied = NtfsFileOperations.copy(nativeItem, directory, destination.directory()).path();
+                    copied = NtfsFileOperations.copy(nativeItem, directory, destination.directory(), task).path();
                 } else {
                     LocalFiles.Entry selected = LocalFiles.verify(source.entry(), confirmedCurrentPath);
                     destination.verifyIfKnown();
-                    copied = LocalFiles.copy(selected.path(), directory).path();
+                    copied = LocalFiles.copy(selected.path(), directory, task).path();
                 }
                 return Effect.written(refuseUndo(copied, "为保护副本及其中的后续修改，复制暂不支持自动撤销"),
                         new Receipt(source.path(), copied, null));
@@ -196,6 +199,7 @@ final class FileChanges {
             LocalFiles.Entry selected = verifyPathSource(source, confirmedCurrentPath);
             LocalFiles.Entry parent = originalParent(selected);
             destination.verifyIfKnown();
+            task.beforeCommit(FileOperationTask.Phase.EXECUTING);
             Path target = LocalFiles.move(selected.path(), directory);
             return target == null ? Effect.UNCHANGED : Effect.written(reverseMove(selected, parent, target),
                     new Receipt(selected.path(), target, null));

@@ -16,7 +16,7 @@ final class FileOperationTask {
     enum Phase { WAITING, PREPARING, EXECUTING, COPYING, ATTRIBUTES, PUBLISHING, CLEANUP, FINISHED }
     enum Result { COMPLETED, PARTIAL, CANCELLED, FAILED, UNKNOWN }
 
-    record CleanupIssue(Path staging, IOException cause) { }
+    record Issue(Path path, String detail, IOException cause) { }
 
     record Snapshot(UUID id, Kind kind, Phase phase, Result result, Instant started, Duration elapsed,
                     Path currentPath, Path target, int itemCount, int processed, int applied, int failed,
@@ -34,7 +34,7 @@ final class FileOperationTask {
     private final Kind kind;
     private final List<FileChanges.Change> changes;
     private final Consumer<Snapshot> observer;
-    private final List<CleanupIssue> cleanupIssues = new ArrayList<>();
+    private final List<Issue> issues = new ArrayList<>();
     private volatile Snapshot snapshot;
     private volatile boolean cancellationRequested;
     // The disk worker owns the fields below once run() starts.
@@ -52,6 +52,7 @@ final class FileOperationTask {
     private long transferred;
     private long published;
     private long itemStartBytes;
+    private long plannedItemBytes;
     private long lastSample;
     private long speedSample;
     private long speedBytes;
@@ -78,7 +79,7 @@ final class FileOperationTask {
         var outcome = FileChanges.execute(changes, this);
         result = finishResult(outcome);
         phase(Phase.FINISHED);
-        return new FileChanges.Outcome(outcome.items(), cleanupIssues);
+        return new FileChanges.Outcome(outcome.items(), issues);
     }
 
     Snapshot snapshot() { return snapshot; }
@@ -109,6 +110,7 @@ final class FileOperationTask {
         currentPath = change.path();
         target = change.evidence() == null ? null : change.evidence().target();
         itemStartBytes = transferred;
+        plannedItemBytes = change.copyBytes();
         phase(Phase.PREPARING);
     }
 
@@ -123,8 +125,15 @@ final class FileOperationTask {
         else { phase(Phase.COPYING); }
     }
 
-    void reportSize(long expected, long actual) {
-        if (totalBytes >= 0 && expected != actual) {
+    void reportSize(long actual) {
+        if (totalBytes >= 0 && plannedItemBytes != actual) {
+            totalBytes = -1;
+            update(true);
+        }
+    }
+
+    void unknownSize() {
+        if (totalBytes >= 0) {
             totalBytes = -1;
             update(true);
         }
@@ -137,8 +146,8 @@ final class FileOperationTask {
         update(firstBytes);
     }
 
-    void cleanupIssue(Path path, IOException error) {
-        cleanupIssues.add(new CleanupIssue(path, error));
+    void issue(Path path, String detail, IOException error) {
+        issues.add(new Issue(path, detail, error));
     }
 
     void finishedItem(FileChanges.State state) {

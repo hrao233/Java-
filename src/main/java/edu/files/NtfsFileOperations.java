@@ -103,15 +103,34 @@ final class NtfsFileOperations {
     }
 
     static LocalFiles.Entry copy(Item selected, Path directory, Directory target) throws IOException {
+        return copy(selected, directory, target, new FileOperationTask(FileOperationTask.Kind.COPY, java.util.List.of()));
+    }
+
+    static LocalFiles.Entry copy(Item selected, Path directory, Directory target, FileOperationTask task) throws IOException {
+        LocalFiles.Entry result = null;
         try (var directories = new PinnedDirectories()) {
             directories.verify(selected.parent());
             if (target != null) { directories.verify(target); }
             try (var source = open(selected.path(), READ_ATTRIBUTES | READ_DATA, SHARE_READ_WRITE)) {
                 verifyItem(selected, source);
-                return LocalFiles.copy(selected.path(), directory);
+                result = LocalFiles.copy(selected.path(), directory, task);
+                return result;
             }
         } catch (Failure failure) {
+            if (result != null) {
+                task.issue(result.path(), "无法释放复制使用的句柄", failure);
+                return result;
+            }
             throw mappedFailure(selected.path(), failure);
+        }
+    }
+
+    static Handle copyTarget(PinnedDirectories directories, Path path) throws IOException {
+        if (!Availability.ENABLED) { return null; }
+        try {
+            return directories.openDirectory(path);
+        } catch (UnsupportedPath unsupported) {
+            return null;
         }
     }
 
@@ -183,7 +202,7 @@ final class NtfsFileOperations {
                 Math.floorMod(unixTicks, TICKS_PER_SECOND) * 100));
     }
 
-    private static final class PinnedDirectories implements AutoCloseable {
+    static final class PinnedDirectories implements AutoCloseable {
         private final SequencedMap<Path, Handle> handles = new LinkedHashMap<>();
 
         Handle verify(Directory expected) throws IOException {
