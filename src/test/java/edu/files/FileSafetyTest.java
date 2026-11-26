@@ -261,7 +261,7 @@ class FileSafetyTest {
     }
 
     @Test
-    void uncertainCutItemIsRetainedEvenWhenAFailureFollowsAWrite() throws IOException {
+    void uncertainCutItemCannotBeExecutedAgainAfterAWrite() throws IOException {
         Path folder = Files.createDirectory(root.resolve("target"));
         Path file = Files.writeString(root.resolve("a.txt"), "first");
         var source = LocalFiles.describe(file);
@@ -272,10 +272,60 @@ class FileSafetyTest {
 
         var outcome = run(change);
         assertEquals(UNKNOWN, state(outcome));
-        assertEquals(List.of(source), outcome.remainingCut(List.of(source)));
+        assertEquals(List.of(), outcome.remainingCut(List.of(source)));
         assertTrue(outcome.reversals().isEmpty());
         assertFalse(Files.exists(file));
         assertEquals("first", Files.readString(folder.resolve("a.txt")));
+    }
+
+    @Test
+    void uncertainUndoIsExcludedFromRetryWhileAnIndependentReversalCanRun() throws IOException {
+        Path file = Files.writeString(root.resolve("moved.txt"), "first");
+        Path original = root.resolve("original.txt");
+        Path second = Files.writeString(root.resolve("second.txt"), "second");
+        Path restored = root.resolve("restored.txt");
+        var uncertain = new FileChanges.Change(file, List.of(root), () -> {
+            Files.move(file, original);
+            throw LocalFiles.uncertain("未收到撤销回执", new IOException("receipt lost"), file, original);
+        });
+        var independent = new FileChanges.Change(second, List.of(root), () -> {
+            Files.move(second, restored);
+            return FileChanges.Effect.written(null);
+        });
+
+        var outcome = FileChanges.execute(List.of(uncertain, independent));
+        assertEquals(List.of(UNKNOWN, NOT_RUN), states(outcome));
+        assertEquals(List.of(independent), outcome.pending());
+        var record = outcome.unknownOperations("撤销").getFirst();
+        assertEquals(List.of(file, original), record.paths());
+        assertEquals(List.of("不存在", "存在"), record.error().observations().stream()
+                .map(LocalFiles.Observation::state).toList());
+        assertEquals(APPLIED, state(FileChanges.execute(outcome.pending())));
+        assertEquals("first", Files.readString(original));
+        assertEquals("second", Files.readString(restored));
+        assertFalse(Files.exists(file));
+    }
+
+    @Test
+    void knownConflictCanRetryButReplacementNeedsANewSelection() throws IOException {
+        Path file = Files.writeString(root.resolve("request.txt"), "original");
+        Path target = root.resolve("present.txt");
+        Files.writeString(target, "occupant");
+        var selected = LocalFiles.describe(file);
+        var request = FileChanges.rename(selected, target, true);
+        assertEquals(FAILED, state(run(request)));
+        assertEquals("occupant", Files.readString(target));
+        Files.move(target, root.resolve("parked-target.txt"));
+        assertEquals(APPLIED, state(run(request)));
+        assertEquals("original", Files.readString(target));
+
+        Files.writeString(file, "different object");
+        Path next = root.resolve("fresh.txt");
+        assertEquals(FAILED, state(run(FileChanges.rename(selected, next, true))));
+        var chosenAgain = LocalFiles.describe(file);
+        assertEquals(APPLIED, state(run(FileChanges.rename(chosenAgain, next, true))));
+        assertEquals("different object", Files.readString(next));
+        assertEquals("original", Files.readString(target));
     }
 
     @Test

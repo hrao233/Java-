@@ -121,6 +121,8 @@ public final class FileManagerApp extends Application {
     private final TextField searchField = new TextField();
     private final Label status = new Label();
     private final Label clipboardStatus = new Label();
+    private final Button unknownResults = new Button("核查结果");
+    private final List<FileChanges.UnknownOperation> unknownOperations = new ArrayList<>();
     private final ProgressIndicator progress = new ProgressIndicator();
     private final VBox overview = new VBox(13);
     private final VBox inspector = new VBox(10);
@@ -355,7 +357,11 @@ public final class FileManagerApp extends Application {
         status.setMaxWidth(Double.MAX_VALUE);
         HBox.setHgrow(status, Priority.ALWAYS);
         clipboardStatus.setMaxWidth(280);
-        HBox bar = new HBox(8, progress, status, clipboardStatus);
+        unknownResults.setId("unknown-results");
+        unknownResults.setVisible(false);
+        unknownResults.managedProperty().bind(unknownResults.visibleProperty());
+        unknownResults.setOnAction(event -> inspectUnknownResults());
+        HBox bar = new HBox(8, progress, status, clipboardStatus, unknownResults);
         bar.setAlignment(Pos.CENTER_LEFT);
         bar.getStyleClass().add("status-bar");
         return bar;
@@ -1651,9 +1657,9 @@ public final class FileManagerApp extends Application {
             List<Change> changes = pending.sources().stream()
                     .map(source -> FileChanges.transfer(source, destination, pending.move(), unverified.test(source))).toList();
             applyChanges(pending.move() ? "正在移动…" : "正在复制…", pending.move() ? "已移动" : "已复制", changes, outcome -> {
-                if (!pending.move()) { return; }
-                List<Selection> remaining = outcome.remainingCut(pending.sources());
-                transfer = remaining.isEmpty() ? null : new Transfer(remaining, true);
+                List<Selection> remaining = pending.move() ? outcome.remainingCut(pending.sources())
+                        : outcome.remainingCopy(pending.sources());
+                transfer = remaining.isEmpty() ? null : new Transfer(remaining, pending.move());
                 describeTransfer();
             });
         });
@@ -1710,7 +1716,7 @@ public final class FileManagerApp extends Application {
         if (activeTask != null) { return; }
         writing = true;
         runTask(task(cancelled -> FileChanges.execute(changes)), running, false, outcome -> {
-            if (outcome.count(State.APPLIED) + outcome.count(State.UNKNOWN) > 0) {
+            if (outcome.count(State.APPLIED) > 0) {
                 undo = outcome.reversals();
             }
             callback.accept(outcome);
@@ -1729,6 +1735,8 @@ public final class FileManagerApp extends Application {
     }
 
     private void afterWrite(String completed, Outcome outcome, Runnable reloaded) {
+        unknownOperations.addAll(outcome.unknownOperations(completed));
+        unknownResults.setVisible(!unknownOperations.isEmpty());
         recordFolderEdits(outcome.items().stream().filter(item -> item.state() == State.APPLIED)
                 .flatMap(item -> item.change().folders().stream()));
         IOException error = outcome.error();
@@ -1740,7 +1748,29 @@ public final class FileManagerApp extends Application {
         } else {
             updateListingStatus(message);
         }
-        if (error != null) { showError(error); }
+        if (outcome.count(State.UNKNOWN) > 0) {
+            showError(new IOException(error.getMessage() + "\n可用状态栏的「核查结果」查看路径并重新选择。", error));
+        } else if (error != null) {
+            showError(error);
+        }
+    }
+
+    private void inspectUnknownResults() {
+        if (activeTask != null || unknownOperations.isEmpty()) { return; }
+        var records = List.copyOf(unknownOperations.reversed());
+        runTask(task(ignored -> {
+            Map<FileChanges.UnknownOperation, List<LocalFiles.Observation>> observations = new LinkedHashMap<>();
+            for (var operation : records) { observations.put(operation, LocalFiles.observe(operation.paths())); }
+            return observations;
+        }), "正在只读核查路径…", false, observations -> UnknownResultsDialog.show(stage, observations)
+                .filter(path -> path.getParent() != null).ifPresent(path -> {
+                    Location target = Location.folder(path.getParent());
+                    if (!target.equals(location)) {
+                        past.addFirst(location);
+                        future.clear();
+                    }
+                    request(target, "", "请检查当前项目并重新发起操作", () -> browser.reveal(path));
+                }));
     }
 
     private <T> void runTask(Task<T> task, String running, boolean cancellable, Consumer<T> success) {
@@ -1776,6 +1806,7 @@ public final class FileManagerApp extends Application {
 
     private void updateControls() {
         boolean busy = activeTask != null;
+        unknownResults.setDisable(busy);
         boolean unavailable = busy || places == null;
         boolean writableFolder = !unavailable && location.path() != null;
         List<BrowserItem> selected = browser.selection();

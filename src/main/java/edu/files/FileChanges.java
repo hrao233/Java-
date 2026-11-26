@@ -2,6 +2,7 @@ package edu.files;
 
 import java.io.IOException;
 import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -13,7 +14,7 @@ final class FileChanges {
         APPLIED, UNCHANGED, FAILED, UNKNOWN, NOT_RUN, REFUSED;
 
         boolean pending() {
-            return this == FAILED || this == UNKNOWN || this == NOT_RUN;
+            return this == FAILED || this == NOT_RUN;
         }
     }
 
@@ -41,7 +42,26 @@ final class FileChanges {
     }
     record Receipt(Path source, Path target, NtfsFileOperations.Item identity) { }
 
-    record Change(Path path, List<Path> folders, Action action) { }
+    record Evidence(Path target, LocalFiles.Entry selected, NtfsFileOperations.Item source,
+                    NtfsFileOperations.Directory destination) { }
+
+    record Change(Path path, List<Path> folders, Evidence evidence, Action action) {
+        Change(Path path, List<Path> folders, Action action) { this(path, folders, null, action); }
+    }
+
+    record UnknownOperation(String operation, Instant recordedAt, Path path, Evidence evidence,
+                            LocalFiles.UncertainWrite error) {
+        List<Path> paths() {
+            List<Path> paths = new ArrayList<>();
+            paths.add(path);
+            if (evidence != null && evidence.target() != null) { paths.add(evidence.target()); }
+            error.observations().stream().map(LocalFiles.Observation::path).forEach(paths::add);
+            return paths.stream().distinct().toList();
+        }
+
+        @Override
+        public String toString() { return operation + " · " + path.getFileName(); }
+    }
 
     record Effect(boolean changed, Change reversal, Receipt receipt) {
         static final Effect UNCHANGED = new Effect(false, null, null);
@@ -67,8 +87,26 @@ final class FileChanges {
         }
 
         <T> List<T> remainingCut(List<T> sources) {
-            int completedPrefix = Math.toIntExact(count(APPLIED) + count(UNCHANGED));
-            return List.copyOf(sources.subList(completedPrefix, sources.size()));
+            return remaining(sources, State::pending);
+        }
+
+        <T> List<T> remainingCopy(List<T> sources) {
+            return remaining(sources, state -> state != UNKNOWN);
+        }
+
+        private <T> List<T> remaining(List<T> sources, java.util.function.Predicate<State> keep) {
+            if (sources.size() != items.size()) { throw new IllegalArgumentException("Selection does not match batch"); }
+            List<T> remaining = new ArrayList<>();
+            for (int index = 0; index < items.size(); index++) {
+                if (keep.test(items.get(index).state())) { remaining.add(sources.get(index)); }
+            }
+            return List.copyOf(remaining);
+        }
+
+        List<UnknownOperation> unknownOperations(String operation) {
+            return items.stream().filter(item -> item.state() == UNKNOWN)
+                    .map(item -> new UnknownOperation(operation, Instant.now(), item.change().path(),
+                            item.change().evidence(), (LocalFiles.UncertainWrite) item.error())).toList();
         }
 
         IOException error() {
@@ -120,7 +158,8 @@ final class FileChanges {
     static Change transfer(Selection source, Destination destination, boolean move, boolean confirmedCurrentPath) {
         Path directory = destination.path();
         List<Path> folders = move ? List.of(source.path().getParent(), directory) : List.of(directory);
-        return new Change(source.path(), folders, () -> {
+        var evidence = evidence(source, directory.resolve(source.path().getFileName()), destination.directory());
+        return new Change(source.path(), folders, evidence, () -> {
             if (source.needsPathConfirmation(destination, move) && !confirmedCurrentPath) {
                 throw new IOException("无法确认身份，请刷新后重新选择：" + source.path());
             }
@@ -154,7 +193,8 @@ final class FileChanges {
     }
 
     static Change rename(Selection source, Path target, boolean confirmedCurrentPath) {
-        return new Change(source.path(), List.of(source.path().getParent()), () -> {
+        var nativeParent = source.nativeItem() == null ? null : source.nativeItem().parent();
+        return new Change(source.path(), List.of(source.path().getParent()), evidence(source, target, nativeParent), () -> {
             var nativeItem = source.nativeItem();
             if (nativeItem != null) {
                 return moveByHandle(nativeItem, nativeItem.parent(), target.getFileName().toString(), true);
@@ -175,7 +215,7 @@ final class FileChanges {
     }
 
     static Change recycle(Selection source, boolean confirmedCurrentPath, LocalFiles.RecycleBin recycleBin) {
-        return new Change(source.path(), List.of(source.path().getParent()), () -> {
+        return new Change(source.path(), List.of(source.path().getParent()), evidence(source, null, null), () -> {
             LocalFiles.Entry selected = verifyPathSource(source, confirmedCurrentPath);
             LocalFiles.trash(selected.path(), recycleBin);
             return Effect.written(refuseUndo(selected.path(), "请在系统回收站查看已回收的项目"),
@@ -191,6 +231,10 @@ final class FileChanges {
         return LocalFiles.verify(source.entry(), confirmedCurrentPath);
     }
 
+    private static Evidence evidence(Selection source, Path target, NtfsFileOperations.Directory destination) {
+        return new Evidence(target, source.entry(), source.nativeItem(), destination);
+    }
+
     private static Effect moveByHandle(NtfsFileOperations.Item source, NtfsFileOperations.Directory destination,
                                        String name, boolean keepReversal) throws IOException {
         var moved = NtfsFileOperations.move(source, destination, name);
@@ -201,6 +245,7 @@ final class FileChanges {
                 reversal = refuseUndo(moved.target(), "改名已完成，但无法取得目标身份，已禁用自动撤销");
             } else {
                 reversal = new Change(moved.target(), List.of(source.parent().path(), destination.path()),
+                        new Evidence(source.path(), null, moved.result(), source.parent()),
                         () -> moveByHandle(moved.result(), source.parent(), source.name(), false));
             }
         }
@@ -220,7 +265,8 @@ final class FileChanges {
             try {
                 LocalFiles.Entry moved = LocalFiles.describe(target);
                 if (source.sameObject(moved)) {
-                    return new Change(target, List.of(source.path().getParent(), target.getParent()), () -> {
+                    var evidence = new Evidence(source.path(), moved, null, null);
+                    return new Change(target, List.of(source.path().getParent(), target.getParent()), evidence, () -> {
                         LocalFiles.verify(originalParent, false);
                         LocalFiles.Entry current = LocalFiles.verify(moved, false);
                         LocalFiles.rename(current.path(), source.path());

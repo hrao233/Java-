@@ -434,11 +434,32 @@ final class LocalFiles {
     }
 
     static final class UncertainWrite extends IOException {
-        UncertainWrite(String message, Exception cause) { super(message, cause); }
+        private final List<Observation> observations;
+
+        UncertainWrite(String message, Exception cause) { this(message, cause, List.of()); }
+
+        UncertainWrite(String message, Exception cause, List<Observation> observations) {
+            super(message, cause);
+            this.observations = List.copyOf(observations);
+        }
+
+        List<Observation> observations() { return observations; }
     }
 
     static UncertainWrite uncertain(String message, Exception failure, Path... paths) {
-        List<String> observations = new ArrayList<>();
+        var observations = observe(List.of(paths));
+        String reason = Objects.requireNonNullElse(failure.getMessage(), failure.getClass().getSimpleName());
+        return new UncertainWrite(message + "。\n原因：" + reason
+                + "\n检查时的路径状态：" + String.join("、", observations.stream().map(Observation::toString).toList()),
+                failure, observations);
+    }
+
+    record Observation(Path path, String state) {
+        @Override public String toString() { return path + "（" + state + "）"; }
+    }
+
+    static List<Observation> observe(List<Path> paths) {
+        List<Observation> observations = new ArrayList<>();
         for (Path path : paths) {
             String state;
             try {
@@ -449,11 +470,9 @@ final class LocalFiles {
             } catch (IOException | SecurityException inaccessible) {
                 state = "无法读取";
             }
-            observations.add(path + "（" + state + "）");
+            observations.add(new Observation(path, state));
         }
-        String reason = Objects.requireNonNullElse(failure.getMessage(), failure.getClass().getSimpleName());
-        return new UncertainWrite(message + "。\n原因：" + reason
-                + "\n检查时的路径状态：" + String.join("、", observations), failure);
+        return List.copyOf(observations);
     }
 
     private static void requireAvailable(Path path) throws FileAlreadyExistsException {

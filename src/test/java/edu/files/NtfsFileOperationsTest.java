@@ -240,7 +240,7 @@ class NtfsFileOperationsTest {
         var result = FileChanges.execute(List.of(firstMove, secondMove, thirdMove));
         assertEquals(List.of(FileChanges.State.APPLIED, FileChanges.State.UNKNOWN, FileChanges.State.NOT_RUN),
                 result.items().stream().map(FileChanges.Item::state).toList());
-        assertEquals(List.of(second, third), result.remainingCut(List.of(first, second, third)));
+        assertEquals(List.of(third), result.remainingCut(List.of(first, second, third)));
         assertEquals(target.resolve("first.txt"), result.items().getFirst().receipt().target());
         assertEquals(1, result.reversals().size());
         assertEquals(FileChanges.State.APPLIED, FileChanges.execute(result.reversals()).items().getFirst().state());
