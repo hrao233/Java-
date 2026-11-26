@@ -129,7 +129,7 @@ final class DirectoryWatcher implements AutoCloseable {
                 if (key != null && current(target)) { receive(key); }
             }
             clearDirectory();
-            if (parent != null) { parent.cancel(); }
+            clearParent();
         }
 
         private void check() {
@@ -149,8 +149,9 @@ final class DirectoryWatcher implements AutoCloseable {
 
         private void bind() {
             Path path = target.directory();
+            clearParent();
             try {
-                if (path.getParent() != null && (parent == null || !parent.isValid())) {
+                if (path.getParent() != null) {
                     parent = path.getParent().register(service, ENTRY_CREATE, ENTRY_DELETE, ENTRY_MODIFY);
                 }
                 var before = identities.read(path);
@@ -206,14 +207,18 @@ final class DirectoryWatcher implements AutoCloseable {
             identity = null;
         }
 
+        private void clearParent() {
+            if (parent != null) { parent.cancel(); }
+            parent = null;
+        }
+
         private void setStatus(Status value, boolean catchUp) {
             registrations = (directory == null ? 0 : 1) + (parent == null || !parent.isValid() ? 0 : 1);
             if (status == value && !catchUp) { return; }
-            boolean read = catchUp || value == Status.WAITING || status == Status.ACTIVE;
             status = value;
             // The next full read also covers events already recorded before rebinding.
-            if (read) { events.clear(); }
-            var batch = read ? new DirectoryEvents.Batch(Set.of(), true, System.nanoTime()) : null;
+            events.clear();
+            var batch = new DirectoryEvents.Batch(Set.of(), true, System.nanoTime());
             publish(target, value, batch);
         }
     }

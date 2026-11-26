@@ -58,6 +58,7 @@ public final class FileManagerApp extends Application {
     private static final PseudoClass NAV_DIVIDER = PseudoClass.getPseudoClass("nav-divider");
     private static final double MIN_NAV_WIDTH = 146;
     private static final double MAX_NAV_WIDTH = 480;
+    private static final int MAX_RETAINED_SELECTION = 64;
 
     private enum Page {
         HOME("主文件夹", SystemIcons.Namespace.HOME), GALLERY("图库", SystemIcons.Namespace.GALLERY),
@@ -97,9 +98,20 @@ public final class FileManagerApp extends Application {
     private record SystemCatalog(WindowsPlaces.Places places, List<NewItems.Type> newTypes) { }
     private record Transfer(List<Selection> sources, boolean move) { }
     private record BrowseIntent(Location location, String query, HomeTab tab, String message,
-                                boolean openAddressFile, Runnable committed) { }
-    private record BrowseData(Listing listing, DirectoryIdentity identity, Path file) { }
-    private record BrowseRequest(BrowseIntent intent, Task<BrowseData> task) { }
+                                boolean openAddressFile, Runnable committed, DirectoryEvents.Batch changes) {
+        BrowseIntent(Location location, String query, HomeTab tab, String message,
+                     boolean openAddressFile, Runnable committed) {
+            this(location, query, tab, message, openAddressFile, committed, null);
+        }
+
+        boolean automatic() { return changes != null; }
+    }
+    private record BrowseData(Listing listing, DirectoryIdentity identity, Path file,
+                              Map<BrowserItem, SelectedItem> verified) { }
+    private record BrowseRequest(BrowseIntent intent, Task<BrowseData> task, long queuedAt) { }
+    private record FileRefresh(String message, Runnable committed) { }
+    private record SelectedItem(BrowserItem item, Selection proof) { }
+    private record CreatedItem(NewItems.Created created, Selection proof) { }
     private record PreviewData(Image image, String text) { }
 
     @FunctionalInterface
@@ -118,6 +130,8 @@ public final class FileManagerApp extends Application {
     private final ExecutorService writes = Executors.newSingleThreadExecutor(work -> new Thread(work, "file-manager-write"));
     private final ReadExecutor reads = new ReadExecutor();
     private final ActiveStaging staging = new ActiveStaging();
+    private final DirectoryWatcher watcher = new DirectoryWatcher(DirectoryIdentity::read, staging::contains,
+            notice -> Platform.runLater(() -> directoryChanged(notice)));
     private final Preferences preferences;
     private final BiFunction<Kind, List<Change>, FileOperationTask> operationFactory;
     private final ReadObserver readObserver;
@@ -137,6 +151,7 @@ public final class FileManagerApp extends Application {
     private final TextField searchField = new TextField();
     private final Label status = new Label();
     private final Label clipboardStatus = new Label();
+    private final Label watchStatus = new Label();
     private final Label writeNotice = new Label("文件写入命令暂不可用");
     private final Button unknownResults = new Button("核查结果");
     private final List<FileChanges.UnknownOperation> unknownOperations = new ArrayList<>();
@@ -172,8 +187,17 @@ public final class FileManagerApp extends Application {
     private boolean directoryUnavailable;
     private boolean closing;
     private long listingVersion;
+    private long listingQueuedAt;
     private String deferredRefresh;
+    private boolean automaticRefresh;
+    private DirectoryWatcher.Target watchTarget;
+    private DirectoryEvents.Batch pendingChanges;
+    private FileRefresh pendingFileRefresh;
     private Task<?> previewTask;
+    private boolean previewLoaded;
+    private boolean keepPreview;
+    private Task<Map<BrowserItem, Selection>> selectionRead;
+    private Map<BrowserItem, Selection> selectionProof = Map.of();
     private final Map<TreeItem<SideNode>, Task<?>> treeReads = new HashMap<>();
     private long sidebarVersion;
     private Task<List<Path>> modifiedFoldersTask;
@@ -208,13 +232,14 @@ public final class FileManagerApp extends Application {
     @Override
     public void start(Stage window) {
         stage = window;
+        automaticRefresh = preferences.getBoolean("automaticRefresh", true);
         operationProgress = new FileOperationProgress(window, unknownResults, this::locateReportedPath);
         icons = new SystemIcons(window::getOutputScaleX);
         views.put(Page.HOME, new View(Mode.DETAILS, Field.VISITED, true, null));
         views.put(Page.COMPUTER, new View(Mode.TILES, Field.NAME, false, null));
         views.put(Page.GALLERY, new View(Mode.LARGE, Field.MODIFIED, true, Field.MODIFIED));
         browser = new BrowserView(icons, this::selectionChanged, this::open, this::sort, this::contextMenu,
-                () -> updateListingStatus(""), this::homeHeader);
+                () -> updateListingStatus(""), this::homeHeader, this::flushWatchRefresh);
         browser.addEventFilter(KeyEvent.KEY_PRESSED, event -> {
             if (event.getTarget() instanceof TextInputControl) { return; }
             KeyCode key = event.getCode();
@@ -259,6 +284,7 @@ public final class FileManagerApp extends Application {
         scene.getStylesheets().add(getClass().getResource("file-manager.css").toExternalForm());
         scene.getAccelerators().put(new KeyCodeCombination(KeyCode.L, KeyCombination.SHORTCUT_DOWN), address::beginEdit);
         scene.getAccelerators().put(new KeyCodeCombination(KeyCode.D, KeyCombination.ALT_DOWN), address::beginEdit);
+        scene.getAccelerators().put(new KeyCodeCombination(KeyCode.F5), () -> fire("refresh"));
         scene.getAccelerators().put(new KeyCodeCombination(KeyCode.N, KeyCombination.SHORTCUT_DOWN, KeyCombination.SHIFT_DOWN),
                 () -> { if (!newTypes.isEmpty()) { create(newTypes.getFirst()); } });
         stage.setTitle("本地文件管理器");
@@ -282,12 +308,15 @@ public final class FileManagerApp extends Application {
     @Override
     public void stop() {
         closing = true;
+        watchTarget = null;
+        watcher.close();
         rememberNavigationWidth();
         preferences.putDouble("navigationWidth", navigationWidth);
         if (browser != null) { browser.cancelNewName(); }
         cancelBrowse();
         if (fileTask != null && !writing) { fileTask.cancel(); }
         if (previewTask != null) { reads.cancel(previewTask); }
+        if (selectionRead != null) { reads.cancel(selectionRead); }
         if (modifiedFoldersTask != null) { reads.cancel(modifiedFoldersTask); }
         reads.close();
         if (activeFileOperation != null) {
@@ -408,6 +437,8 @@ public final class FileManagerApp extends Application {
         status.setMaxWidth(Double.MAX_VALUE);
         HBox.setHgrow(status, Priority.ALWAYS);
         clipboardStatus.setMaxWidth(280);
+        watchStatus.setId("watch-status");
+        updateWatchStatus("手动刷新");
         unknownResults.setId("unknown-results");
         unknownResults.setVisible(false);
         unknownResults.managedProperty().bind(unknownResults.visibleProperty());
@@ -415,7 +446,7 @@ public final class FileManagerApp extends Application {
         writeNotice.setId("write-notice");
         writeNotice.managedProperty().bind(writeNotice.visibleProperty());
         writeNotice.setVisible(false);
-        HBox bar = new HBox(8, progress, status, clipboardStatus, operationProgress.launcher(), writeNotice, unknownResults);
+        HBox bar = new HBox(8, progress, status, watchStatus, clipboardStatus, operationProgress.launcher(), writeNotice, unknownResults);
         bar.setAlignment(Pos.CENTER_LEFT);
         bar.getStyleClass().add("status-bar");
         return bar;
@@ -609,15 +640,18 @@ public final class FileManagerApp extends Application {
         cancelBrowse();
         Location target = intent.location();
         Work<Listing> work = listingWork(target, intent.query(), intent.tab());
+        Map<BrowserItem, Selection> selected = intent.automatic() ? selectionProof : Map.of();
         long queued = System.nanoTime();
         var worker = task(cancelled -> {
             readObserver.started(target.path(), intent.query(), System.nanoTime() - queued);
-            return readBrowse(intent, work, cancelled);
+            return readBrowse(intent, work, selected, cancelled);
         });
-        var request = new BrowseRequest(intent, worker);
+        var request = new BrowseRequest(intent, worker, queued);
         browseRequest = request;
-        status.setText(intent.query().isEmpty() ? "正在读取「" + target.label() + "」…"
-                : "正在搜索「" + intent.query() + "」…");
+        if (!intent.automatic()) {
+            status.setText(intent.query().isEmpty() ? "正在读取「" + target.label() + "」…"
+                    : "正在搜索「" + intent.query() + "」…");
+        }
         worker.setOnSucceeded(event -> {
             if (owns(request)) { commitBrowse(request, worker.getValue()); }
         });
@@ -628,21 +662,45 @@ public final class FileManagerApp extends Application {
         if (!reads.listing(worker)) { browseFailed(request, new IOException("读取队列暂满，请稍后刷新")); }
     }
 
-    private BrowseData readBrowse(BrowseIntent intent, Work<Listing> work, BooleanSupplier cancelled) throws Exception {
+    private BrowseData readBrowse(BrowseIntent intent, Work<Listing> work, Map<BrowserItem, Selection> selected,
+                                  BooleanSupplier cancelled) throws Exception {
         Path path = intent.location().path();
-        if (path == null) { return new BrowseData(work.read(cancelled), null, null); }
+        if (path == null) { return new BrowseData(work.read(cancelled), null, null, Map.of()); }
         requireVisible(path);
         var attributes = Files.readAttributes(path, BasicFileAttributes.class);
-        if (!attributes.isDirectory() && intent.openAddressFile()) { return new BrowseData(null, null, path); }
+        if (!attributes.isDirectory() && intent.openAddressFile()) {
+            return new BrowseData(null, null, path, Map.of());
+        }
         var before = DirectoryIdentity.read(path, attributes);
         var data = work.read(cancelled);
         readObserver.ready(path, false);
         if (cancelled.getAsBoolean()) { return null; }
+        var verified = verifySelection(selected, data.items(), before, cancelled);
         var after = DirectoryIdentity.read(path);
         if ((before.known() || after.known()) && !before.equals(after)) {
             throw new IOException("读取期间目录身份已变化，请刷新：" + path);
         }
-        return new BrowseData(data, after, null);
+        return new BrowseData(data, after, null, verified);
+    }
+
+    private static Map<BrowserItem, SelectedItem> verifySelection(Map<BrowserItem, Selection> selected,
+            List<BrowserItem> items, DirectoryIdentity directory, BooleanSupplier cancelled) {
+        if (selected.isEmpty() || directory.ntfs() == null) { return Map.of(); }
+        var expected = new HashMap<Path, BrowserItem>();
+        selected.forEach((item, proof) -> {
+            if (directory.ntfs().equals(proof.nativeItem().parent())) { expected.put(item.path(), item); }
+        });
+        var verified = new HashMap<BrowserItem, SelectedItem>();
+        for (BrowserItem item : items) {
+            if (cancelled.getAsBoolean()) { break; }
+            var previous = expected.get(item.path());
+            if (previous == null) { continue; }
+            Selection proof = observeSelection(item);
+            if (proof != null && selected.get(previous).nativeItem().equals(proof.nativeItem())) {
+                verified.put(previous, new SelectedItem(item, proof));
+            }
+        }
+        return verified;
     }
 
     private boolean owns(BrowseRequest request) { return !closing && browseRequest == request; }
@@ -669,6 +727,9 @@ public final class FileManagerApp extends Application {
         var intent = request.intent();
         deferredRefresh = null;
         boolean sameLocation = location.equals(intent.location());
+        if (!sameLocation || !activeQuery.equals(intent.query()) || homeTab != intent.tab()) {
+            pendingFileRefresh = null;
+        }
         boolean replaced = sameLocation && directoryIdentity != null && directoryIdentity.known()
                 && !directoryIdentity.equals(data.identity());
         if (!sameLocation || !activeQuery.equals(intent.query()) || homeTab != intent.tab() || replaced) {
@@ -680,13 +741,21 @@ public final class FileManagerApp extends Application {
         directoryIdentity = data.identity();
         directoryUnavailable = false;
         listing = data.listing();
+        listingQueuedAt = request.queuedAt();
         listingVersion++;
-        updateLocation();
-        render(false);
+        syncDirectoryWatch();
+        if (intent.automatic()) {
+            renderAutomatic(data, intent.changes());
+        } else {
+            selectionProof = Map.of();
+            updateLocation();
+            render(false);
+        }
         intent.committed().run();
         updateControls();
         updateListingStatus(replaced ? "目录身份已变化，已重新读取" : intent.message());
         readObserver.committed(location.path(), System.nanoTime() - applyStarted);
+        flushWatchRefresh();
     }
 
     private void browseFailed(BrowseRequest request, Throwable failure) {
@@ -699,8 +768,17 @@ public final class FileManagerApp extends Application {
             listingVersion++;
             render(false);
         }
-        settleBrowse(directoryUnavailable ? "当前位置无法访问，可返回或上移" : "读取失败，当前页面已保留");
-        showError(failure);
+        boolean automatic = request.intent().automatic();
+        String message = directoryUnavailable ? "当前位置无法访问，可返回或上移"
+                : automatic ? "自动刷新失败，可按 F5 重试" : "读取失败，当前页面已保留";
+        if (automatic) {
+            updateControls();
+            updateListingStatus(message);
+            flushWatchRefresh();
+        } else {
+            settleBrowse(message);
+            showError(failure);
+        }
     }
 
     private void settleBrowse(String message) {
@@ -711,6 +789,64 @@ public final class FileManagerApp extends Application {
             String refresh = deferredRefresh;
             deferredRefresh = null;
             request(location, activeQuery, refresh, () -> {});
+        }
+        flushWatchRefresh();
+    }
+
+    private void syncDirectoryWatch() {
+        if (closing) { return; }
+        Path path = automaticRefresh && activeQuery.isEmpty() && directoryIdentity != null
+                && directoryIdentity.ntfs() != null ? location.path() : null;
+        if (watchTarget != null && watchTarget.directory().equals(path)) { return; }
+        pendingChanges = null;
+        selectionProof = Map.of();
+        if (selectionRead != null) {
+            reads.cancel(selectionRead);
+            selectionRead = null;
+        }
+        if (path != null) {
+            watchTarget = watcher.watch(path);
+            updateWatchStatus("正在启动自动刷新");
+        } else {
+            watchTarget = null;
+            watcher.pause();
+            updateWatchStatus(automaticRefresh ? "手动刷新" : "自动刷新已关闭");
+        }
+    }
+
+    private void directoryChanged(DirectoryWatcher.Notice notice) {
+        if (closing || notice.target() != watchTarget) { return; }
+        updateWatchStatus(switch (notice.status()) {
+            case ACTIVE -> "自动刷新已开启";
+            case WAITING -> "等待目录恢复 · F5";
+            case UNAVAILABLE -> "监听不可用 · F5";
+        });
+        var batch = notice.changes();
+        if (batch != null && !batch.coveredBy(listingQueuedAt)) {
+            queueWatchChanges(batch);
+            flushWatchRefresh();
+        }
+    }
+
+    private void queueWatchChanges(DirectoryEvents.Batch batch) {
+        pendingChanges = pendingChanges == null ? batch : pendingChanges.merge(batch);
+    }
+
+    private void updateWatchStatus(String message) {
+        if (!message.equals(watchStatus.getText())) { watchStatus.setText(message); }
+    }
+
+    private void flushWatchRefresh() {
+        if (closing || browseRequest != null || browser.editingName() || (fileTask != null && !writing)) { return; }
+        var batch = pendingChanges;
+        var written = pendingFileRefresh;
+        pendingChanges = null;
+        pendingFileRefresh = null;
+        if (written != null) {
+            request(location, activeQuery, written.message(), written.committed());
+        } else if (batch != null && !batch.coveredBy(listingQueuedAt)
+                && dependsOn(batch.impact(location.path()), location, activeQuery, homeTab)) {
+            startBrowse(new BrowseIntent(location, activeQuery, homeTab, "", false, () -> {}, batch));
         }
     }
 
@@ -834,6 +970,10 @@ public final class FileManagerApp extends Application {
     }
 
     private void render(boolean preserveSelection) {
+        render(preserveSelection, null);
+    }
+
+    private void render(boolean preserveSelection, List<BrowserItem> verifiedSelection) {
         View config = currentView();
         boolean computer = location.page() == Page.COMPUTER;
         boolean gallery = location.page() == Page.GALLERY;
@@ -841,7 +981,27 @@ public final class FileManagerApp extends Application {
         Field sort = config.sort() == Field.VISITED && !recent ? Field.NAME : config.sort();
         browser.render(listing.items(), new BrowserView.Settings(config.mode(), sort, config.descending(), config.group(),
                 compact, checkboxes, extensions, computer, !activeQuery.isEmpty(), recent, homeLayout(), gallery,
-                listing.imageRatios()), preserveSelection);
+                listing.imageRatios()), preserveSelection, verifiedSelection);
+    }
+
+    private void renderAutomatic(BrowseData data, DirectoryEvents.Batch changes) {
+        var selected = browser.selection();
+        var retained = new LinkedHashMap<BrowserItem, Selection>();
+        for (BrowserItem previous : selected) {
+            var verified = data.verified().get(previous);
+            if (verified != null) { retained.put(verified.item(), verified.proof()); }
+        }
+        BrowserItem previous = selected.size() == 1 ? selected.getFirst() : null;
+        var verified = previous == null ? null : data.verified().get(previous);
+        keepPreview = pane == Pane.PREVIEW && previewLoaded && verified != null
+                && previous.entry().sameMetadata(verified.item().entry())
+                && !changes.full() && !changes.impact(location.path()).affectsEntry(previous.path());
+        selectionProof = Map.copyOf(retained);
+        try {
+            render(false, List.copyOf(retained.keySet()));
+        } finally {
+            keepPreview = false;
+        }
     }
 
     private void sort(Field field, boolean descending) {
@@ -943,6 +1103,12 @@ public final class FileManagerApp extends Application {
         if (!result.isEmpty()) { result.add(new SeparatorMenuItem()); }
         result.add(checkItem("详细信息窗格", "show-details", pane == Pane.DETAILS, enabled -> changePane(Pane.DETAILS)));
         result.add(checkItem("预览窗格", "show-preview", pane == Pane.PREVIEW, enabled -> changePane(Pane.PREVIEW)));
+        result.add(checkItem("自动刷新", "auto-refresh", automaticRefresh, enabled -> {
+            automaticRefresh = enabled;
+            preferences.putBoolean("automaticRefresh", enabled);
+            syncDirectoryWatch();
+            observeVisibleSelection();
+        }));
         result.add(new SeparatorMenuItem());
         result.add(submenu("显示", List.of(
                 checkItem("导航窗格", "show-navigation", navigationPane, value -> {
@@ -1582,7 +1748,58 @@ public final class FileManagerApp extends Application {
 
     private void selectionChanged() {
         updateControls();
-        refreshInspector();
+        observeVisibleSelection();
+        if (!keepPreview || browser.selection().size() != 1) { refreshInspector(); }
+    }
+
+    private void observeVisibleSelection() {
+        if (selectionRead != null) {
+            reads.cancel(selectionRead);
+            selectionRead = null;
+        }
+        var selected = browser.selection();
+        if (watchTarget == null || selected.isEmpty() || selected.size() > MAX_RETAINED_SELECTION) {
+            selectionProof = Map.of();
+            return;
+        }
+        var retained = new HashMap<BrowserItem, Selection>();
+        for (BrowserItem item : selected) {
+            var proof = selectionProof.get(item);
+            if (proof != null) { retained.put(item, proof); }
+        }
+        selectionProof = Map.copyOf(retained);
+        var missing = selected.stream().filter(item -> !retained.containsKey(item)).toList();
+        if (missing.isEmpty()) { return; }
+        var directory = directoryIdentity.ntfs();
+        var target = watchTarget;
+        var read = task(cancelled -> {
+            var observed = new HashMap<>(retained);
+            for (BrowserItem item : missing) {
+                if (cancelled.getAsBoolean()) { break; }
+                var proof = observeSelection(item);
+                if (proof != null && directory.equals(proof.nativeItem().parent())) { observed.put(item, proof); }
+            }
+            return Map.copyOf(observed);
+        });
+        selectionRead = read;
+        readDetail(read, observed -> {
+            if (selectionRead == read && watchTarget == target) {
+                selectionRead = null;
+                selectionProof = observed;
+            }
+        }, failure -> {
+            if (selectionRead == read) { selectionRead = null; }
+        });
+    }
+
+    private static Selection observeSelection(BrowserItem item) {
+        if (item.entry() == null) { return null; }
+        try {
+            var selection = FileChanges.capture(item.entry());
+            return selection.nativeItem() == null ? null : selection;
+        } catch (IOException | SecurityException unavailable) {
+            return null;
+        }
     }
 
     private void changePane(Pane next) {
@@ -1592,6 +1809,7 @@ public final class FileManagerApp extends Application {
     }
 
     private void refreshInspector() {
+        previewLoaded = false;
         if (previewTask != null) {
             reads.cancel(previewTask);
             previewTask = null;
@@ -1623,9 +1841,11 @@ public final class FileManagerApp extends Application {
         Label hint = new Label("正在读取预览…");
         inspector.getChildren().add(hint);
         long version = listingVersion;
+        Selection known = selectionProof.get(item);
         var read = task(cancelled -> {
             requireVisible(item.path());
-            var selection = FileChanges.capture(item.entry());
+            var selection = known == null ? FileChanges.capture(item.entry()) : known;
+            if (known != null) { NtfsFileOperations.verify(known.nativeItem()); }
             LocalFiles.verify(item.entry(), true);
             PreviewData data;
             try (var input = Files.newInputStream(item.path())) {
@@ -1649,6 +1869,7 @@ public final class FileManagerApp extends Application {
         readDetail(read, result -> {
             if (previewTask != read || listingVersion != version || selectedItem() != item) { return; }
             previewTask = null;
+            previewLoaded = true;
             if (result.image() != null) {
                 var image = new ImageView(result.image());
                 image.setPreserveRatio(true);
@@ -1782,7 +2003,15 @@ public final class FileManagerApp extends Application {
         if (fileCommandsUnavailable()) { return; }
         Location origin = location;
         long view = listingVersion;
-        runFileTask(task(work), "正在新建" + label + "…", true, created -> {
+        runFileTask(task(cancelled -> {
+            var created = work.read(cancelled);
+            try {
+                return new CreatedItem(created, FileChanges.capture(created.entry()));
+            } catch (IOException | SecurityException unavailable) {
+                return new CreatedItem(created, null);
+            }
+        }), "正在新建" + label + "…", true, result -> {
+            var created = result.created();
             undo = List.of(FileChanges.undoCreation(created.path()));
             recordFolderEdits(Stream.of(created.path().getParent()));
             rebuildSidebar();
@@ -1795,27 +2024,34 @@ public final class FileManagerApp extends Application {
                     browser.clearFilters();
                     updateListingStatus("已新建" + label);
                 }
-                browser.editName(created.path(), created.extension(), true, name -> renameNewItem(created, name));
+                if (result.proof() == null) {
+                    updateListingStatus("无法确认新建项目身份，请重新选择后改名");
+                } else {
+                    editName(result.proof(), created.extension(), true);
+                }
             });
         });
-    }
-
-    private void renameNewItem(NewItems.Created created, String name) {
-        if (fileCommandsUnavailable() || name.isBlank()) { return; }
-        runFileTask(task(ignored -> FileChanges.capture(created.entry())), "正在核对新建项目…", false,
-                selection -> renameEntry(selection, name));
     }
 
     private void renameSelected() {
         BrowserItem selected = selectedItem();
         if (selected == null || selected.entry() == null || browser.selection().size() != 1 || fileCommandsUnavailable()) { return; }
         String extension = selected.name().substring(LocalFiles.extensionStart(selected.name(), selected.directory()));
-        runFileTask(task(ignored -> FileChanges.capture(selected.entry())), "正在核对所选项目…", false, selection -> {
+        Selection known = selectionProof.get(selected);
+        runFileTask(task(ignored -> captureSelected(selected, known)), "正在核对所选项目…", false, selection -> {
             updateListingStatus("");
             if (browseRequest == null && selectedItem() == selected) {
-                browser.editName(selected.path(), extension, false, name -> renameEntry(selection, name));
+                editName(selection, extension, false);
             }
         });
+    }
+
+    private void editName(Selection selection, String extension, boolean keepExtension) {
+        if (watchTarget != null && selection.needsPathConfirmation()) {
+            updateListingStatus("无法确认项目身份，已取消行内编辑");
+            return;
+        }
+        browser.editName(selection.path(), extension, keepExtension, name -> renameEntry(selection, name));
     }
 
     private void renameEntry(Selection entry, String name) {
@@ -1846,13 +2082,20 @@ public final class FileManagerApp extends Application {
     }
 
     private void captureSelection(List<BrowserItem> selected, Consumer<List<Selection>> ready) {
+        var known = selectionProof;
         runFileTask(task(ignored -> {
             List<Selection> result = new ArrayList<>();
             for (BrowserItem item : selected) {
-                result.add(FileChanges.capture(item.entry()));
+                result.add(captureSelected(item, known.get(item)));
             }
             return List.copyOf(result);
         }), "正在核对所选项目…", false, ready);
+    }
+
+    private static Selection captureSelected(BrowserItem item, Selection known) throws IOException {
+        if (known == null) { return FileChanges.capture(item.entry()); }
+        NtfsFileOperations.verify(known.nativeItem());
+        return known;
     }
 
     private void describeTransfer() {
@@ -1996,6 +2239,11 @@ public final class FileManagerApp extends Application {
         }
         if (sidebarAffected) { rebuildSidebar(); }
         boolean affectsCurrent = dependsOn(impact, location, activeQuery, homeTab);
+        if (affectsCurrent && browseRequest != null && browseRequest.intent().automatic()) {
+            pendingFileRefresh = new FileRefresh(message, reloaded);
+            return;
+        }
+        if (affectsCurrent) { pendingFileRefresh = null; }
         if (browseRequest == null) {
             if (affectsCurrent) { request(location, activeQuery, message, reloaded); }
             else { updateListingStatus(message); }
@@ -2055,6 +2303,10 @@ public final class FileManagerApp extends Application {
 
     private <T> void runFileTask(Task<T> task, String running, boolean writesDisk, Consumer<T> success) {
         if (fileTask != null || closing) { return; }
+        if (browseRequest != null && browseRequest.intent().automatic()) {
+            if (watchTarget != null) { queueWatchChanges(browseRequest.intent().changes()); }
+            cancelBrowse();
+        }
         fileTask = task;
         writing = writesDisk;
         if (browseRequest == null) { status.setText(running); }
@@ -2064,6 +2316,7 @@ public final class FileManagerApp extends Application {
             if (!closing) {
                 success.accept(task.getValue());
                 updateControls();
+                flushWatchRefresh();
             }
         });
         task.setOnFailed(event -> {
@@ -2072,11 +2325,15 @@ public final class FileManagerApp extends Application {
                 updateListingStatus("操作失败");
                 updateControls();
                 showError(task.getException());
+                flushWatchRefresh();
             }
         });
         task.setOnCancelled(event -> {
             finishFileTask();
-            if (!closing) { updateControls(); }
+            if (!closing) {
+                updateControls();
+                flushWatchRefresh();
+            }
         });
         writes.execute(task);
     }
@@ -2116,11 +2373,12 @@ public final class FileManagerApp extends Application {
         for (String id : List.of("sort", "view", "more", "gallery-sources")) { controls.get(id).setDisable(unavailable); }
         controls.get("gallery-sources").setVisible(location.page() == Page.GALLERY);
         controls.get("details-pane").setDisable(places == null);
-        progress.setVisible(browseRequest != null || fileTask != null || catalogTask != null);
+        progress.setVisible((browseRequest != null && !browseRequest.intent().automatic()) || fileTask != null || catalogTask != null);
     }
 
     private boolean fileCommandsUnavailable() {
-        return closing || places == null || fileTask != null || browseRequest != null || directoryUnavailable;
+        return closing || places == null || fileTask != null || directoryUnavailable
+                || (browseRequest != null && !browseRequest.intent().automatic());
     }
 
     private BrowserItem selectedItem() { return browser.selection().stream().findFirst().orElse(null); }

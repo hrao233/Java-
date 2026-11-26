@@ -156,6 +156,7 @@ final class BrowserView extends StackPane {
     }
 
     private record NameEdit(Path path, String text, int selectionEnd, String suffix, Consumer<String> commit) { }
+    private record ScrollPosition(VirtualFlow<?> flow, Path firstPath, int index, double position) { }
 
     private final TableView<Line> table = new TableView<>();
     private final ListView<Line> tiles = new ListView<>() {
@@ -186,6 +187,7 @@ final class BrowserView extends StackPane {
     private final Function<BrowserItem, ContextMenu> onContext;
     private final Runnable onFiltersChanged;
     private final Supplier<Region> homeHeader;
+    private final Runnable onEditFinished;
     private final Label empty = new Label("没有可显示的项目");
     private final Label galleryDate = new Label();
     private List<Line> lines = List.of();
@@ -203,7 +205,8 @@ final class BrowserView extends StackPane {
     private boolean homeFilesExpanded = true;
 
     BrowserView(SystemIcons icons, Runnable onSelection, Consumer<BrowserItem> onOpen, BiConsumer<Field, Boolean> onSort,
-                Function<BrowserItem, ContextMenu> onContext, Runnable onFiltersChanged, Supplier<Region> homeHeader) {
+                Function<BrowserItem, ContextMenu> onContext, Runnable onFiltersChanged, Supplier<Region> homeHeader,
+                Runnable onEditFinished) {
         this.icons = icons;
         this.onSelection = onSelection;
         this.onOpen = onOpen;
@@ -211,6 +214,7 @@ final class BrowserView extends StackPane {
         this.onContext = onContext;
         this.onFiltersChanged = onFiltersChanged;
         this.homeHeader = homeHeader;
+        this.onEditFinished = onEditFinished;
         setId("browser-view");
         buildTable();
         buildTiles();
@@ -226,6 +230,7 @@ final class BrowserView extends StackPane {
     List<BrowserItem> selection() { return List.copyOf(selected); }
     List<BrowserItem> items() { return ordered; }
     boolean filtersActive() { return filters.active(); }
+    boolean editingName() { return nameEdit != null; }
 
     boolean homeFilesExpanded() { return homeFilesExpanded; }
 
@@ -248,7 +253,8 @@ final class BrowserView extends StackPane {
         applyFilters();
     }
 
-    void render(List<BrowserItem> items, Settings next, boolean retainSelection) {
+    void render(List<BrowserItem> items, Settings next, boolean retainSelection, List<BrowserItem> verifiedSelection) {
+        ScrollPosition scroll = verifiedSelection == null ? null : scrollPosition();
         boolean columnsChanged = !next.equals(settings);
         boolean layoutChanged = settings == null || next.home() != settings.home() || next.gallery() != settings.gallery();
         source = items;
@@ -256,6 +262,7 @@ final class BrowserView extends StackPane {
         galleryDate.setVisible(false);
         if (!retainSelection) {
             selected.clear();
+            if (verifiedSelection != null) { selected.addAll(verifiedSelection); }
             anchor = null;
             nameEdit = null;
         }
@@ -270,7 +277,7 @@ final class BrowserView extends StackPane {
         List<BrowserItem> sorted = items.stream().filter(item -> filters.includes(item, today)).sorted(order).toList();
         lines = buildLines(sorted);
         ordered = lines.stream().flatMap(line -> line.items().stream()).toList();
-        if (retainSelection) { selected.retainAll(ordered); }
+        if (retainSelection || verifiedSelection != null) { selected.retainAll(ordered); }
         empty.setText(filters.active() ? "没有符合筛选条件的项目" : "没有可显示的项目");
         empty.setVisible(ordered.isEmpty() && !next.home());
         boolean details = next.mode() == Mode.DETAILS && !next.home() && !next.gallery();
@@ -295,10 +302,35 @@ final class BrowserView extends StackPane {
                 updateTiles();
             }
             if (!details && layoutChanged) { tiles.scrollTo(0); }
+            if (scroll != null) { restoreScroll(scroll); }
         } finally {
             syncing = false;
         }
         onSelection.run();
+    }
+
+    private ScrollPosition scrollPosition() {
+        var control = table.isVisible() ? table : tiles;
+        if (!(control.lookup(".virtual-flow") instanceof VirtualFlow<?> flow)) { return null; }
+        var first = flow.getFirstVisibleCell();
+        int index = first == null ? -1 : first.getIndex();
+        var displayed = table.isVisible() ? table.getItems() : tiles.getItems();
+        BrowserItem item = index >= 0 && index < displayed.size() ? displayed.get(index).item() : null;
+        return new ScrollPosition(flow, item == null ? null : item.path(), index, flow.getPosition());
+    }
+
+    private void restoreScroll(ScrollPosition scroll) {
+        if (scroll.firstPath() != null) {
+            var displayed = table.isVisible() ? table.getItems() : tiles.getItems();
+            for (int index = 0; index < displayed.size(); index++) {
+                if (displayed.get(index).items().stream().anyMatch(item -> scroll.firstPath().equals(item.path()))) {
+                    if (index == scroll.index()) { break; }
+                    scroll.flow().scrollToTop(index);
+                    return;
+                }
+            }
+        }
+        scroll.flow().setPosition(scroll.position());
     }
 
     void selectAll() { replaceSelection(ordered); }
@@ -375,6 +407,7 @@ final class BrowserView extends StackPane {
         nameEdit = null;
         refreshNameCells();
         if (commit && !text.isBlank() && !edit.text().equals(text)) { edit.commit().accept(text); }
+        onEditFinished.run();
     }
 
     private void refreshNameCells() {
@@ -618,7 +651,7 @@ final class BrowserView extends StackPane {
     }
 
     private void applyFilters() {
-        render(source, settings, true);
+        render(source, settings, true, null);
         onFiltersChanged.run();
     }
 
