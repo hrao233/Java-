@@ -6,7 +6,13 @@ import edu.files.FileChanges.Change;
 import edu.files.FileChanges.Outcome;
 import edu.files.FileChanges.Selection;
 import edu.files.FileChanges.State;
+import edu.files.FileClipboard.Snapshot;
+import edu.files.FileClipboard.Transfer;
 import edu.files.FileOperationTask.Kind;
+import javafx.animation.Animation;
+import javafx.animation.KeyFrame;
+import javafx.animation.PauseTransition;
+import javafx.animation.Timeline;
 import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.concurrent.Task;
@@ -28,6 +34,7 @@ import javafx.scene.input.MouseEvent;
 import javafx.scene.layout.*;
 import javafx.stage.DirectoryChooser;
 import javafx.stage.Stage;
+import javafx.util.Duration;
 
 import java.awt.Desktop;
 import java.io.IOException;
@@ -96,7 +103,13 @@ public final class FileManagerApp extends Application {
         }
     }
     private record SystemCatalog(WindowsPlaces.Places places, List<NewItems.Type> newTypes) { }
-    private record Transfer(List<Selection> sources, boolean move) { }
+    private record PasteRequest(Snapshot snapshot, Transfer local, List<Path> external) {
+        boolean move() { return local != null && local.move(); }
+    }
+    private record PasteTarget(Path path, Location origin, DirectoryIdentity knownDirectory, BrowserItem folder,
+                               Selection knownFolder) { }
+    private record PreparedPaste(FileChanges.Destination destination, List<Selection> sources) { }
+    private record ExternalExclusion(FileClipboard.State state, Set<Path> paths) { }
     private record BrowseIntent(Location location, String query, HomeTab tab, String message,
                                 boolean openAddressFile, Runnable committed, DirectoryEvents.Batch changes) {
         BrowseIntent(Location location, String query, HomeTab tab, String message,
@@ -129,6 +142,14 @@ public final class FileManagerApp extends Application {
 
     private final ExecutorService writes = Executors.newSingleThreadExecutor(work -> new Thread(work, "file-manager-write"));
     private final ReadExecutor reads = new ReadExecutor();
+    private final ExecutorService clipboardWorker = Executors.newSingleThreadExecutor(work -> {
+        var thread = new Thread(work, "file-manager-clipboard");
+        thread.setDaemon(true);
+        return thread;
+    });
+    private final FileClipboard clipboard;
+    private final Timeline clipboardTimer = new Timeline(new KeyFrame(Duration.millis(450), event -> pollClipboard()));
+    private final PauseTransition clipboardDeadline = new PauseTransition(Duration.seconds(3));
     private final ActiveStaging staging = new ActiveStaging();
     private final DirectoryWatcher watcher = new DirectoryWatcher(DirectoryIdentity::read, staging::contains,
             notice -> Platform.runLater(() -> directoryChanged(notice)));
@@ -177,6 +198,15 @@ public final class FileManagerApp extends Application {
     private Listing listing = new Listing(List.of(), 0, false);
     private List<Change> undo = List.of();
     private Transfer transfer;
+    private UUID lastClipboardToken;
+    private FileClipboard.State clipboardState;
+    private FileClipboard.State unsupportedMove;
+    private ExternalExclusion externalExclusion;
+    private Task<FileClipboard.State> clipboardProbe;
+    private Task<?> clipboardCommand;
+    private Task<Set<BrowserItem>> cutMarkRead;
+    private boolean clipboardUnavailable;
+    private boolean clipboardExpired;
     private FileOperationProgress operationProgress;
     private FileOperationTask activeFileOperation;
     private LocalFiles.Visibility visibility;
@@ -211,7 +241,8 @@ public final class FileManagerApp extends Application {
     private boolean checkboxes;
 
     public FileManagerApp() {
-        this(Preferences.userNodeForPackage(FileManagerApp.class).node("explorer"));
+        this(Preferences.userNodeForPackage(FileManagerApp.class).node("explorer"), FileOperationTask::new,
+                (path, preview) -> {}, FileClipboard.system());
     }
 
     FileManagerApp(Preferences preferences) {
@@ -224,9 +255,15 @@ public final class FileManagerApp extends Application {
 
     FileManagerApp(Preferences preferences, BiFunction<Kind, List<Change>, FileOperationTask> operationFactory,
                    ReadObserver readObserver) {
+        this(preferences, operationFactory, readObserver, new MemoryClipboard(false));
+    }
+
+    FileManagerApp(Preferences preferences, BiFunction<Kind, List<Change>, FileOperationTask> operationFactory,
+                   ReadObserver readObserver, FileClipboard clipboard) {
         this.preferences = preferences;
         this.operationFactory = operationFactory;
         this.readObserver = readObserver;
+        this.clipboard = clipboard;
     }
 
     @Override
@@ -249,12 +286,6 @@ public final class FileManagerApp extends Application {
                 fire("rename");
             } else if (key == KeyCode.DELETE) {
                 fire("trash");
-            } else if (event.isShortcutDown() && key == KeyCode.C) {
-                fire("copy");
-            } else if (event.isShortcutDown() && key == KeyCode.X) {
-                fire("cut");
-            } else if (event.isShortcutDown() && key == KeyCode.V) {
-                fire("paste");
             } else if (event.isShortcutDown() && key == KeyCode.A) {
                 browser.selectAll();
             } else if (event.isShortcutDown() && key == KeyCode.Z) {
@@ -281,6 +312,7 @@ public final class FileManagerApp extends Application {
         layout.setCenter(workspace);
         layout.setBottom(statusBar());
         Scene scene = new Scene(layout, 1200, 760);
+        scene.addEventFilter(KeyEvent.KEY_PRESSED, this::fileClipboardKey);
         scene.getStylesheets().add(getClass().getResource("file-manager.css").toExternalForm());
         scene.getAccelerators().put(new KeyCodeCombination(KeyCode.L, KeyCombination.SHORTCUT_DOWN), address::beginEdit);
         scene.getAccelerators().put(new KeyCodeCombination(KeyCode.D, KeyCombination.ALT_DOWN), address::beginEdit);
@@ -292,7 +324,10 @@ public final class FileManagerApp extends Application {
         stage.setMinHeight(550);
         stage.setScene(scene);
         stage.focusedProperty().addListener((observable, previous, focused) -> {
-            if (focused) { refreshModifiedFolders(); }
+            if (focused) {
+                refreshModifiedFolders();
+                pollClipboard();
+            }
         });
         stage.setOnCloseRequest(event -> {
             if (writing) {
@@ -302,12 +337,20 @@ public final class FileManagerApp extends Application {
             }
         });
         stage.show();
+        clipboardTimer.setCycleCount(Animation.INDEFINITE);
+        clipboardTimer.play();
+        pollClipboard();
         loadPlaces(true);
     }
 
     @Override
     public void stop() {
         closing = true;
+        clipboardTimer.stop();
+        clipboardDeadline.stop();
+        if (clipboardCommand != null) { clipboardCommand.cancel(true); }
+        clipboardWorker.shutdownNow();
+        if (cutMarkRead != null) { reads.cancel(cutMarkRead); }
         watchTarget = null;
         watcher.close();
         rememberNavigationWidth();
@@ -437,6 +480,7 @@ public final class FileManagerApp extends Application {
         status.setMaxWidth(Double.MAX_VALUE);
         HBox.setHgrow(status, Priority.ALWAYS);
         clipboardStatus.setMaxWidth(280);
+        clipboardStatus.setId("clipboard-status");
         watchStatus.setId("watch-status");
         updateWatchStatus("手动刷新");
         unknownResults.setId("unknown-results");
@@ -743,6 +787,7 @@ public final class FileManagerApp extends Application {
         listing = data.listing();
         listingQueuedAt = request.queuedAt();
         listingVersion++;
+        browser.cutItems(Set.of());
         syncDirectoryWatch();
         if (intent.automatic()) {
             renderAutomatic(data, intent.changes());
@@ -752,6 +797,7 @@ public final class FileManagerApp extends Application {
             render(false);
         }
         intent.committed().run();
+        verifyCutMarks();
         updateControls();
         updateListingStatus(replaced ? "目录身份已变化，已重新读取" : intent.message());
         readObserver.committed(location.path(), System.nanoTime() - applyStarted);
@@ -766,6 +812,7 @@ public final class FileManagerApp extends Application {
             directoryUnavailable = true;
             listing = new Listing(List.of(), 0, false);
             listingVersion++;
+            browser.cutItems(Set.of());
             render(false);
         }
         boolean automatic = request.intent().automatic();
@@ -1213,6 +1260,7 @@ public final class FileManagerApp extends Application {
     private ContextMenu contextMenu(BrowserItem item) {
         if (places == null || closing) { return null; }
         boolean unavailable = fileCommandsUnavailable();
+        boolean transferUnavailable = unavailable || clipboardCommand != null;
         List<MenuItem> commands = new ArrayList<>();
         if (item == null) {
             commands.add(menuItem("刷新", "context-refresh", () -> fire("refresh")));
@@ -1221,7 +1269,7 @@ public final class FileManagerApp extends Application {
             if (location.path() != null) {
                 commands.add(new SeparatorMenuItem());
                 if (canCreate()) { commands.add(submenu("新建", newItems())); }
-                commands.add(menuItem("粘贴", "context-paste", this::paste, unavailable || transfer == null));
+                commands.add(menuItem("粘贴", "context-paste", this::paste, transferUnavailable || !clipboardHasFiles()));
             }
         } else {
             commands.add(menuItem("打开", "context-open", () -> open(item)));
@@ -1230,15 +1278,18 @@ public final class FileManagerApp extends Application {
             }
             if (canModify(browser.selection())) {
                 commands.add(new SeparatorMenuItem());
-                commands.add(menuItem("剪切", "context-cut", () -> rememberSelection(true), unavailable));
-                commands.add(menuItem("复制", "context-copy", () -> rememberSelection(false), unavailable));
-                if (item.directory()) {
-                    commands.add(menuItem("粘贴到此文件夹", "context-paste-folder", () -> pasteInto(item.path()),
-                            unavailable || transfer == null));
-                }
+                commands.add(menuItem("剪切", "context-cut", () -> rememberSelection(true), transferUnavailable));
+                commands.add(menuItem("复制", "context-copy", () -> rememberSelection(false), transferUnavailable));
                 commands.add(menuItem("重命名", "context-rename", this::renameSelected,
                         unavailable || browser.selection().size() != 1));
                 commands.add(menuItem("移到回收站", "context-trash", this::trashSelected, unavailable));
+            }
+            if (item.directory() && item.path() != null) {
+                commands.add(menuItem("粘贴到此文件夹", "context-paste-folder", () -> pasteInto(item.path(), item),
+                        transferUnavailable || !clipboardHasFiles()));
+            }
+            if (item.path() != null) {
+                commands.add(menuItem("复制为路径", "context-copy-path", this::copyPaths, transferUnavailable));
             }
             if (item.directory() && item.path() != null && item.kind() != BrowserItem.Kind.DRIVE) {
                 commands.add(pinItem(item.path()));
@@ -2073,11 +2124,26 @@ public final class FileManagerApp extends Application {
 
     private void rememberSelection(boolean move) {
         List<BrowserItem> selected = browser.selection();
-        if (!canModify(selected) || fileCommandsUnavailable()) { return; }
+        if (!canModify(selected) || fileCommandsUnavailable() || clipboardCommand != null) { return; }
+        if (selected.size() > ClipboardFiles.MAX_ITEMS) {
+            updateListingStatus("一次最多可复制或剪切 " + ClipboardFiles.MAX_ITEMS + " 个项目");
+            return;
+        }
         captureSelection(selected, sources -> {
-            transfer = new Transfer(sources, move);
-            describeTransfer();
-            updateListingStatus("");
+            var token = UUID.randomUUID();
+            lastClipboardToken = token;
+            runClipboardTask(task(ignored -> {
+                var eligible = new LinkedHashMap<Path, Selection>();
+                for (var source : sources) { eligible.putIfAbsent(source.path(), source); }
+                var paths = ClipboardFiles.paths(eligible.keySet().stream().map(Path::toString).toList());
+                var offer = new FileClipboard.Offer(token, move, paths);
+                var state = clipboard.publish(offer);
+                return new Transfer(state, token, move, List.copyOf(eligible.values()));
+            }), published -> {
+                transfer = published;
+                observeClipboard(published.state());
+                updateListingStatus(move ? "已剪切，可在当前窗口粘贴" : "已复制到文件剪贴板");
+            });
         });
     }
 
@@ -2098,35 +2164,293 @@ public final class FileManagerApp extends Application {
         return known;
     }
 
+    private void fileClipboardKey(KeyEvent event) {
+        if (!event.isShortcutDown() || event.isAltDown()
+                || event.getTarget() instanceof TextInputControl
+                || stage.getScene().getFocusOwner() instanceof TextInputControl) { return; }
+        switch (event.getCode()) {
+            case C -> { if (event.isShiftDown()) { copyPaths(); } else { fire("copy"); } }
+            case X -> { if (event.isShiftDown()) { return; } fire("cut"); }
+            case V -> { if (event.isShiftDown()) { return; } paste(); }
+            default -> { return; }
+        }
+        event.consume();
+    }
+
+    private void copyPaths() {
+        if (fileCommandsUnavailable() || clipboardCommand != null) { return; }
+        var paths = browser.selection().stream().map(BrowserItem::path).filter(Objects::nonNull).distinct().toList();
+        if (paths.isEmpty()) { return; }
+        runClipboardTask(task(ignored -> clipboard.text(ClipboardFiles.quotedPaths(paths))), state -> {
+            observeClipboard(state);
+            updateListingStatus("已复制 " + paths.size() + " 个路径");
+        });
+    }
+
+    private void pollClipboard() {
+        if (closing || clipboardProbe != null || clipboardCommand != null) { return; }
+        var probe = task(ignored -> clipboard.probe());
+        clipboardProbe = probe;
+        probe.setOnSucceeded(event -> {
+            clipboardProbe = null;
+            if (!closing) { observeClipboard(probe.getValue()); }
+        });
+        probe.setOnFailed(event -> {
+            clipboardProbe = null;
+            if (!closing) { clipboardReadFailed(); }
+        });
+        clipboardWorker.execute(probe);
+    }
+
+    private <T> void runClipboardTask(Task<T> command, Consumer<T> success) {
+        runClipboardTask(command, false, success);
+    }
+
+    private <T> void runClipboardTask(Task<T> command, boolean pasteRead, Consumer<T> success) {
+        if (closing || clipboardCommand != null) { return; }
+        clipboardCommand = command;
+        clipboardExpired = false;
+        if (pasteRead) {
+            clipboardDeadline.setOnFinished(event -> {
+                clipboardExpired = true;
+                clipboardReadFailed();
+                updateListingStatus("等待剪贴板超时，请稍后重试");
+            });
+            clipboardDeadline.playFromStart();
+        }
+        command.setOnSucceeded(event -> {
+            boolean accept = !clipboardExpired;
+            finishClipboardTask();
+            if (closing) { return; }
+            if (accept) { success.accept(command.getValue()); }
+            else { pollClipboard(); }
+            updateControls();
+        });
+        command.setOnFailed(event -> {
+            finishClipboardTask();
+            if (closing) { return; }
+            clipboardReadFailed();
+            Throwable failure = command.getException();
+            updateListingStatus(Objects.requireNonNullElse(failure.getMessage(), "剪贴板操作失败"));
+        });
+        updateControls();
+        clipboardWorker.execute(command);
+    }
+
+    private void finishClipboardTask() {
+        clipboardDeadline.stop();
+        clipboardCommand = null;
+    }
+
+    private void observeClipboard(FileClipboard.State state) {
+        if (!clipboardUnavailable && state.equals(clipboardState)) { return; }
+        clipboardUnavailable = false;
+        clipboardState = state;
+        if (transfer != null && !transfer.state().equals(state)) { transfer = null; }
+        if (externalExclusion != null && !externalExclusion.state().equals(state)) { externalExclusion = null; }
+        if (unsupportedMove != null && !unsupportedMove.equals(state)) { unsupportedMove = null; }
+        describeTransfer();
+        verifyCutMarks();
+        updateControls();
+    }
+
+    private void clipboardReadFailed() {
+        if (clipboardUnavailable) { return; }
+        clipboardUnavailable = true;
+        describeTransfer();
+        verifyCutMarks();
+        updateControls();
+    }
+
+    private boolean clipboardHasFiles() {
+        if (clipboardUnavailable || clipboardState == null || clipboardState.equals(unsupportedMove)) { return false; }
+        if (transfer != null && transfer.state().equals(clipboardState)) { return !transfer.sources().isEmpty(); }
+        return clipboardState.kind() == FileClipboard.Kind.FILES;
+    }
+
     private void describeTransfer() {
-        if (transfer == null) { clipboardStatus.setText(""); return; }
+        if (clipboardUnavailable) {
+            clipboardStatus.setText("剪贴板暂不可读取");
+            return;
+        }
+        if (clipboardState != null && clipboardState.equals(unsupportedMove)) {
+            clipboardStatus.setText("外部剪切请改用复制");
+            return;
+        }
+        if (transfer == null || transfer.sources().isEmpty()) {
+            clipboardStatus.setText(clipboardState == null ? "" : switch (clipboardState.kind()) {
+                case FILES -> transfer == null ? "系统剪贴板中的文件" : "此批次暂无可粘贴项目";
+                case CUT -> "剪切仅限发起窗口";
+                case UNSUPPORTED -> "此剪贴板格式不支持文件粘贴";
+                case EMPTY -> "";
+            });
+            return;
+        }
         String label = transfer.sources().size() == 1 ? transfer.sources().getFirst().entry().name()
                 : transfer.sources().size() + " 个项目";
-        clipboardStatus.setText((transfer.move() ? "已剪切 · " : "待粘贴 · ") + label);
+        clipboardStatus.setText((transfer.move() ? "已剪切（本窗口） · " : "待粘贴 · ") + label);
     }
 
     private void paste() {
-        if (location.path() != null) { pasteInto(location.path()); }
+        if (location.path() != null) { pasteInto(location.path(), null); }
     }
 
-    private void pasteInto(Path directory) {
-        Transfer pending = transfer;
-        if (fileCommandsUnavailable() || pending == null) { return; }
-        runFileTask(task(ignored -> FileChanges.destination(directory)), "正在核对目标文件夹…", false, destination -> {
+    private void pasteInto(Path directory, BrowserItem folder) {
+        if (fileCommandsUnavailable() || clipboardCommand != null) { return; }
+        var target = new PasteTarget(directory, location, directory.equals(location.path()) ? directoryIdentity : null,
+                folder, folder == null ? null : selectionProof.get(folder));
+        updateListingStatus("正在读取文件剪贴板…");
+        runClipboardTask(task(ignored -> clipboard.read()), true, data -> {
+            observeClipboard(data.state());
+            var request = pasteRequest(data);
+            if (request != null && pasteTargetCurrent(target)) { preparePaste(target, request); }
+        });
+    }
+
+    private PasteRequest pasteRequest(Snapshot data) {
+        if (transfer != null && transfer.matches(data)) {
+            if (!transfer.sources().isEmpty()) { return new PasteRequest(data, transfer, List.of()); }
+            updateListingStatus("此批次暂无可粘贴项目，可在「核查结果」查看未知项");
+            return null;
+        }
+        if (data.externalMove()) {
+            unsupportedMove = data.state();
+            describeTransfer();
+            updateListingStatus("资源管理器的剪切暂不可在此粘贴，请在来源重新选择复制");
+        } else if (data.state().kind() == FileClipboard.Kind.CUT) {
+            updateListingStatus("请返回发起剪切的窗口粘贴，跨窗口传输可使用复制");
+        } else if (data.token() != null && data.token().equals(lastClipboardToken)) {
+            updateListingStatus("剪贴板会话已失效，请重新选择并复制");
+        } else if (data.state().kind() == FileClipboard.Kind.FILES) {
+            var paths = externalExclusion == null ? data.paths()
+                    : data.paths().stream().filter(path -> !externalExclusion.paths().contains(path)).toList();
+            if (!paths.isEmpty()) { return new PasteRequest(data, null, paths); }
+            updateListingStatus("此剪贴板批次的项目需要核查，请重新选择");
+        } else {
+            updateListingStatus(data.state().kind() == FileClipboard.Kind.UNSUPPORTED
+                    ? "仅支持有实际路径的文件和文件夹，请先保存此项目" : "剪贴板中没有可粘贴的文件");
+        }
+        return null;
+    }
+
+    private boolean pasteTargetCurrent(PasteTarget target) {
+        if (location.equals(target.origin()) && !fileCommandsUnavailable()) { return true; }
+        updateListingStatus("当前位置已变化或正忙，请重新发起粘贴");
+        return false;
+    }
+
+    private void preparePaste(PasteTarget target, PasteRequest pending) {
+        runFileTask(task(cancelled -> {
+            var destination = FileChanges.destination(target.path());
+            var expected = target.knownDirectory();
+            if (expected != null && expected.known() && (expected.ntfs() != null
+                    ? !expected.ntfs().equals(destination.directory())
+                    : !expected.equals(DirectoryIdentity.read(target.path())))) {
+                throw new IOException("粘贴目标文件夹已变化，请重新选择");
+            }
+            if (target.folder() != null && target.folder().entry() != null) {
+                var source = captureSelected(target.folder(), target.knownFolder());
+                if (source.nativeItem() != null && (destination.directory() == null
+                        || !source.nativeItem().id().equals(destination.directory().id()))) {
+                    throw new IOException("粘贴目标文件夹已变化，请重新选择");
+                }
+            }
+            if (pending.local() != null) { return new PreparedPaste(destination, pending.local().sources()); }
+            var sources = new ArrayList<Selection>();
+            for (Path path : pending.external()) {
+                if (cancelled.getAsBoolean()) { throw new IOException("已取消粘贴准备"); }
+                var entry = LocalFiles.describe(path);
+                if (entry.link() || entry.other()) { throw new IOException("此剪贴板含链接或特殊项目，请重新选择：" + path); }
+                sources.add(FileChanges.capture(entry));
+            }
+            return new PreparedPaste(destination, List.copyOf(sources));
+        }), "正在核对粘贴来源和目标…", false, prepared -> {
+            if (!pasteTargetCurrent(target)) { return; }
+            var destination = prepared.destination();
+            var sources = prepared.sources();
             Predicate<Selection> unverified = source -> source.needsPathConfirmation(destination, pending.move());
-            if (!confirmCurrentPaths(pending.sources(), unverified, pending.move() ? "移动" : "复制", false)) {
+            if (!confirmCurrentPaths(sources, unverified, pending.move() ? "移动" : "复制", false)) {
                 updateListingStatus("");
                 return;
             }
-            List<Change> changes = pending.sources().stream()
+            List<Change> changes = sources.stream()
                     .map(source -> FileChanges.transfer(source, destination, pending.move(), unverified.test(source))).toList();
             applyChanges(pending.move() ? Kind.MOVE : Kind.COPY, pending.move() ? "正在移动…" : "正在复制…",
-                    pending.move() ? "已移动" : "已复制", changes, outcome -> {
-                List<Selection> remaining = pending.move() ? outcome.remainingCut(pending.sources())
-                        : outcome.remainingCopy(pending.sources());
-                transfer = remaining.isEmpty() ? null : new Transfer(remaining, pending.move());
-                describeTransfer();
-            }, () -> {});
+                    pending.move() ? "已移动" : "已复制", changes, outcome -> clipboardAfterPaste(pending, sources, outcome),
+                    () -> {});
+        });
+    }
+
+    private void clipboardAfterPaste(PasteRequest request, List<Selection> sources, Outcome outcome) {
+        Transfer local = request.local();
+        if (local == null) {
+            if (outcome.count(State.UNKNOWN) > 0 && request.snapshot().state().equals(clipboardState)) {
+                var excluded = new HashSet<Path>();
+                if (externalExclusion != null) { excluded.addAll(externalExclusion.paths()); }
+                for (int i = 0; i < sources.size(); i++) {
+                    if (outcome.items().get(i).state() == State.UNKNOWN) { excluded.add(sources.get(i).path()); }
+                }
+                externalExclusion = new ExternalExclusion(clipboardState, Set.copyOf(excluded));
+            }
+            return;
+        }
+        if (transfer != local) { return; }
+        var remaining = local.after(outcome);
+        transfer = remaining;
+        describeTransfer();
+        browser.cutItems(Set.of());
+        verifyCutMarks();
+        if (remaining.sources().size() == local.sources().size()) { return; }
+        // Partial cuts keep their private marker and update their in-memory list.
+        if (local.move() && !remaining.sources().isEmpty()) { return; }
+        FileClipboard.Offer replacement = remaining.sources().isEmpty() ? null : remaining.offer();
+        runClipboardTask(task(ignored -> clipboard.replace(local.state(), local.token(), replacement)), result -> {
+            if (result.applied() && transfer == remaining) {
+                transfer = remaining.sources().isEmpty() ? null
+                        : new Transfer(result.state(), remaining.token(), remaining.move(), remaining.sources());
+            }
+            observeClipboard(result.state());
+            describeTransfer();
+        });
+    }
+
+    private void verifyCutMarks() {
+        if (cutMarkRead != null) {
+            reads.cancel(cutMarkRead);
+            cutMarkRead = null;
+        }
+        var current = transfer;
+        if (clipboardUnavailable || current == null || !current.move() || current.sources().isEmpty()) {
+            browser.cutItems(Set.of());
+            return;
+        }
+        var wanted = new HashMap<Path, Selection>();
+        for (var source : current.sources()) {
+            if (source.nativeItem() != null) { wanted.put(source.path(), source); }
+        }
+        List<BrowserItem> candidates = listing.items().stream().filter(item -> wanted.containsKey(item.path())).toList();
+        if (candidates.isEmpty()) {
+            browser.cutItems(Set.of());
+            return;
+        }
+        long version = listingVersion;
+        var read = task(cancelled -> {
+            Set<BrowserItem> verified = new HashSet<>();
+            for (var item : candidates) {
+                if (cancelled.getAsBoolean()) { break; }
+                var proof = observeSelection(item);
+                if (proof != null && wanted.get(item.path()).nativeItem().equals(proof.nativeItem())) { verified.add(item); }
+            }
+            return Set.copyOf(verified);
+        });
+        cutMarkRead = read;
+        readDetail(read, marks -> {
+            if (cutMarkRead == read && transfer == current && listingVersion == version && !clipboardUnavailable) {
+                cutMarkRead = null;
+                browser.cutItems(marks);
+            }
+        }, failure -> {
+            if (cutMarkRead == read) { cutMarkRead = null; }
         });
     }
 
@@ -2365,11 +2689,11 @@ public final class FileManagerApp extends Application {
         controls.get("clear-search").setVisible(!isSearching() && !activeQuery.isEmpty());
         controls.get("clear-search").setDisable(unavailable);
         controls.get("new").setDisable(unavailable || !canCreate());
-        controls.get("copy").setDisable(!editable);
-        controls.get("cut").setDisable(!editable);
+        controls.get("copy").setDisable(!editable || clipboardCommand != null);
+        controls.get("cut").setDisable(!editable || clipboardCommand != null);
         controls.get("trash").setDisable(!editable);
         controls.get("rename").setDisable(!editable || selected.size() != 1);
-        controls.get("paste").setDisable(!writableFolder || transfer == null);
+        controls.get("paste").setDisable(!writableFolder || clipboardCommand != null || !clipboardHasFiles());
         for (String id : List.of("sort", "view", "more", "gallery-sources")) { controls.get(id).setDisable(unavailable); }
         controls.get("gallery-sources").setVisible(location.page() == Page.GALLERY);
         controls.get("details-pane").setDisable(places == null);

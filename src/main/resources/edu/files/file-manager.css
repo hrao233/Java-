@@ -664,3 +664,7 @@
 #operation-action:hover {
     -fx-background-color: #cbe5dc;
 }
+.table-row-cell:cut-file .table-cell,
+.selectable-entry:cut-file {
+    -fx-opacity: 0.52;
+}

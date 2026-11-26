@@ -178,7 +178,9 @@ final class BrowserView extends StackPane {
     private final Map<Field, Button> filterButtons = new LinkedHashMap<>();
     private final ColumnFilters filters = new ColumnFilters();
     private final TableColumn<Line, BrowserItem> checkColumn = new TableColumn<>();
+    private static final PseudoClass CUT_FILE = PseudoClass.getPseudoClass("cut-file");
     private final Set<BrowserItem> selected = new LinkedHashSet<>();
+    private Set<BrowserItem> cutItems = Set.of();
     private final Map<String, Image> thumbnails = new LinkedHashMap<>(64, 0.75f, true);
     private final SystemIcons icons;
     private final Runnable onSelection;
@@ -231,6 +233,23 @@ final class BrowserView extends StackPane {
     List<BrowserItem> items() { return ordered; }
     boolean filtersActive() { return filters.active(); }
     boolean editingName() { return nameEdit != null; }
+
+    void cutItems(Set<BrowserItem> items) {
+        if (cutItems.equals(items)) { return; }
+        cutItems = items;
+        table.lookupAll(".table-row-cell").forEach(node -> {
+            if (node instanceof TableRow<?> row && row.getItem() instanceof Line line) {
+                markCut(row, line.item());
+            }
+        });
+        tiles.lookupAll(".selectable-entry").forEach(node -> {
+            if (node.getUserData() instanceof BrowserItem item) { markCut(node, item); }
+        });
+    }
+
+    private void markCut(Node node, BrowserItem item) {
+        node.pseudoClassStateChanged(CUT_FILE, item != null && cutItems.contains(item));
+    }
 
     boolean homeFilesExpanded() { return homeFilesExpanded; }
 
@@ -477,6 +496,7 @@ final class BrowserView extends StackPane {
             protected void updateItem(Line line, boolean empty) {
                 super.updateItem(line, empty);
                 pseudoClassStateChanged(GROUP, line != null && line.heading() != null);
+                markCut(this, line == null ? null : line.item());
             }
         });
         table.setOnContextMenuRequested(event -> showContext(null, table, event));
@@ -1011,6 +1031,7 @@ final class BrowserView extends StackPane {
         entry.setUserData(item);
         entry.setAccessibleText(item.name());
         entry.pseudoClassStateChanged(SELECTED, selected.contains(item));
+        markCut(entry, item);
         entry.setOnContextMenuRequested(event -> showContext(item, entry, event));
         entry.setOnMouseClicked(event -> {
             if (event.getButton() == MouseButton.PRIMARY && !editingName(item)) {

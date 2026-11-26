@@ -10,6 +10,7 @@ import javafx.scene.control.Button;
 import javafx.scene.control.ButtonType;
 import javafx.scene.control.CheckMenuItem;
 import javafx.scene.control.ComboBox;
+import javafx.scene.control.ContextMenu;
 import javafx.scene.control.DialogPane;
 import javafx.scene.control.Label;
 import javafx.scene.control.MenuItem;
@@ -74,6 +75,7 @@ class JavaFxFileOperationsTest {
     private final CountDownLatch releaseCopy = new CountDownLatch(1);
     private final AtomicReference<ReadGate> heldRead = new AtomicReference<>();
     private final AtomicReference<Gate> heldPublish = new AtomicReference<>();
+    private final AtomicReference<Gate> heldMove = new AtomicReference<>();
     private final AtomicInteger browseCommits = new AtomicInteger();
     private Path captures;
 
@@ -95,6 +97,7 @@ class JavaFxFileOperationsTest {
         releaseCopy.countDown();
         if (heldRead.get() != null) { heldRead.get().gate().release.countDown(); }
         if (heldPublish.get() != null) { heldPublish.get().release.countDown(); }
+        if (heldMove.get() != null) { heldMove.get().release.countDown(); }
         fx(() -> {
             for (var window : List.copyOf(Window.getWindows())) {
                 if (window != stage && window.getScene().getRoot() instanceof DialogPane) { window.hide(); }
@@ -107,10 +110,16 @@ class JavaFxFileOperationsTest {
             var watcher = (DirectoryWatcher) field(app, "watcher");
             assertTrue(watcher.awaitClosed(Duration.ofSeconds(4)));
             assertEquals(0, watcher.registrationCount());
+            var reader = (ExecutorService) field(app, "clipboardWorker");
+            assertTrue(reader.awaitTermination(4, TimeUnit.SECONDS));
         }
     }
 
     private void openWindow(boolean automaticRefresh) throws Exception {
+        openWindow(automaticRefresh, new MemoryClipboard(false));
+    }
+
+    private void openWindow(boolean automaticRefresh, FileClipboard clipboard) throws Exception {
         fx(() -> {
             var preferences = new MemoryPreferences(null, "");
             if (!automaticRefresh) { preferences.putBoolean("automaticRefresh", false); }
@@ -120,7 +129,7 @@ class JavaFxFileOperationsTest {
 
                 @Override
                 public void committed(Path path, long applyNanos) { browseCommits.incrementAndGet(); }
-            });
+            }, clipboard);
             stage = new Stage();
             stage.setOpacity(0);
             app.start(stage);
@@ -249,7 +258,10 @@ class JavaFxFileOperationsTest {
             var group = FileManagerApp.class.getDeclaredMethod("group", BrowserView.Field.class);
             group.setAccessible(true);
             group.invoke(app, BrowserView.Field.TYPE);
+            scene.getRoot().applyCss();
+            scene.getRoot().layout();
             entriesFlow().scrollToTop(55);
+            scene.getRoot().layout();
             return null;
         });
         await(() -> entriesFlow().getFirstVisibleCell().getIndex() >= 50, "scroll away from first rows", 8);
@@ -412,7 +424,240 @@ class JavaFxFileOperationsTest {
         assertEquals(List.of(source), fx(this::cutSources));
     }
 
+    @Test
+    void clipboardCutMarksRequireTheOriginalObjectAndFollowClipboardChanges() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        var clipboard = new TestClipboard();
+        Path from = Files.createDirectory(root.resolve("source"));
+        Path to = Files.createDirectory(root.resolve("target"));
+        Path file = Files.writeString(from.resolve("a-cut-file.txt"), "original");
+        Files.writeString(from.resolve("b-normal-file.txt"), "normal");
+        openWindow(true, clipboard);
+        goWatched(from);
+        select(file);
+        fx(() -> {
+            var table = scene.lookup("#entries");
+            table.requestFocus();
+            shortcut(table, KeyCode.X, false);
+            return null;
+        });
+        await(() -> idle() && hasCutMark(file), "verified cut mark", 12);
+        saveCutCapture();
+
+        long changeStarted = System.nanoTime();
+        Path unrelated = Files.writeString(from.resolve("c-external.txt"), "external");
+        await(() -> listed(unrelated) && hasCutMark(file), "cut survives a real refresh", 10);
+        System.out.printf(java.util.Locale.ROOT, "PHASE26_GUI disk-change-to-cut-mark %.2f ms%n",
+                (System.nanoTime() - changeStarted) / 1e6);
+        Path original = Files.move(file, from.resolve("kept-original.txt"));
+        Files.copy(original, file, StandardCopyOption.COPY_ATTRIBUTES);
+        await(() -> idle() && listed(original) && !hasCutMark(file), "same-name replacement loses cut mark", 10);
+        goWatched(to);
+        click("paste");
+        acknowledgeFileError();
+        assertFalse(Files.exists(to.resolve(file.getFileName())));
+        assertEquals("original", Files.readString(file));
+        assertEquals("original", Files.readString(original));
+
+        clipboard.text("text outside the program");
+        await(() -> idle() && cutSources().isEmpty() && button("paste").isDisabled(), "text revokes local transfer", 10);
+        goWatched(from);
+        select(file);
+        AtomicInteger delivered = new AtomicInteger();
+        fx(() -> {
+            TextField search = (TextField) scene.lookup("#search-field");
+            search.addEventFilter(KeyEvent.KEY_PRESSED, event -> {
+                delivered.incrementAndGet();
+                event.consume(); // avoid materializing the real system clipboard in this fixture
+            });
+            for (KeyCode key : List.of(KeyCode.C, KeyCode.X, KeyCode.V)) { shortcut(search, key, false); }
+            return null;
+        });
+        assertEquals(3, delivered.get());
+        assertEquals("text outside the program", clipboard.textValue());
+        context(file, "context-copy-path");
+        await(() -> ("\"" + file + "\"").equals(clipboard.textValue()) && idle(), "quoted path text", 10);
+        fx(() -> { browser.selectAll(); return null; });
+        context(file, "context-copy-path");
+        await(() -> clipboard.textValue().contains(System.lineSeparator())
+                && clipboard.textValue().contains("\"" + original + "\""), "multiple quoted paths", 10);
+    }
+
+    @Test
+    void externalFilesCopyAndRepeatWhileExternalCutKeepsTheSource() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        var clipboard = new TestClipboard();
+        Path from = Files.createDirectory(root.resolve("external-source"));
+        Path to = Files.createDirectory(root.resolve("target"));
+        Path again = Files.createDirectory(root.resolve("repeat"));
+        Path childTarget = Files.createDirectory(to.resolve("folder paste"));
+        Path file = Files.writeString(from.resolve("有 空格.txt"), "external file");
+        Path folder = Files.createDirectory(from.resolve("资料夹"));
+        Files.writeString(folder.resolve("child.txt"), "external folder");
+        openWindow(true, clipboard);
+        goWatched(to);
+        long changedAt = System.nanoTime();
+        var version = clipboard.external(FileClipboard.Kind.FILES, List.of(file, folder), false);
+        await(() -> !button("paste").isDisabled(), "external files enable paste", 10);
+        System.out.printf(java.util.Locale.ROOT, "PHASE26_GUI clipboard-change-to-paste-enabled %.2f ms%n",
+                (System.nanoTime() - changedAt) / 1e6);
+        select(childTarget);
+        context(childTarget, "context-paste-folder");
+        await(() -> idle() && Files.exists(childTarget.resolve("资料夹/child.txt")), "copy into context folder", 15);
+        assertEquals("external file", Files.readString(childTarget.resolve(file.getFileName())));
+        assertEquals("external folder", Files.readString(childTarget.resolve("资料夹/child.txt")));
+        goWatched(again);
+        fx(() -> { browser.requestFocus(); shortcut(browser, KeyCode.V, false); return null; });
+        await(() -> idle() && listed(again.resolve(file.getFileName())), "repeat external copy", 12);
+        assertEquals(version, clipboard.probe());
+
+        click("paste");
+        acknowledgeFileError();
+        assertEquals("external file", Files.readString(again.resolve(file.getFileName())));
+        clipboard.external(FileClipboard.Kind.FILES, List.of(file), true);
+        goWatched(to);
+        click("paste");
+        await(() -> idle() && status().contains("重新选择复制") && button("paste").isDisabled(), "external cut refused", 10);
+        assertFalse(Files.exists(to.resolve(file.getFileName())));
+        assertEquals("external file", Files.readString(file));
+
+        clipboard.external(FileClipboard.Kind.UNSUPPORTED, List.of(), false);
+        await(() -> button("paste").isDisabled()
+                && ((Label) scene.lookup("#clipboard-status")).getText().contains("格式"), "virtual format refused", 10);
+    }
+
+    @Test
+    void completingAMoveCannotReplaceAnotherClipboardOwner() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        var clipboard = new TestClipboard();
+        Path from = Files.createDirectory(root.resolve("source"));
+        Path to = Files.createDirectory(root.resolve("target"));
+        Path file = Files.writeString(from.resolve("moving.txt"), "move payload");
+        openWindow(false, clipboard);
+        go(from);
+        select(file);
+        click("cut");
+        await(() -> idle() && cutSources().equals(List.of(file)), "local cut pending", 8);
+        go(to);
+        fx(() -> { ((javafx.animation.Timeline) field(app, "clipboardTimer")).stop(); return null; });
+        var gate = new Gate();
+        heldMove.set(gate);
+        try {
+            click("paste");
+            assertTrue(gate.entered.await(8, TimeUnit.SECONDS));
+            clipboard.text("new owner");
+        } finally {
+            gate.release.countDown();
+        }
+        await(() -> idle() && listed(to.resolve(file.getFileName())), "moved with old request", 10);
+        assertEquals("new owner", clipboard.textValue());
+        assertEquals(1, clipboard.replaceAttempts());
+        assertTrue(fx(() -> cutSources().isEmpty() && button("paste").isDisabled()));
+        assertFalse(Files.exists(file));
+    }
+
+    @Test
+    void readsFailClosedAndCannotUseAReplacedPasteTarget() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        var clipboard = new TestClipboard();
+        Path from = Files.createDirectory(root.resolve("source"));
+        Path to = Files.createDirectory(root.resolve("target"));
+        Path file = Files.writeString(from.resolve("copy.txt"), "copy payload");
+        openWindow(false, clipboard);
+        go(from);
+        select(file);
+        click("copy");
+        await(() -> idle() && cutSources().equals(List.of(file)), "original copy", 8);
+        go(to);
+        clipboard.nextRead.set(() -> { throw new IOException("剪贴板暂被占用"); });
+        click("paste");
+        await(() -> idle() && status().contains("暂被占用"), "clipboard failure", 10);
+        assertFalse(Files.exists(to.resolve("copy.txt")));
+        await(() -> !button("paste").isDisabled(), "retry after clipboard unlock", 10);
+
+        var gate = new Gate();
+        clipboard.nextRead.set(() -> {
+            gate.hold();
+            return clipboard.snapshot();
+        });
+        try {
+            click("paste");
+            assertTrue(gate.entered.await(8, TimeUnit.SECONDS));
+            Path displaced = Files.move(to, root.resolve("original-directory"));
+            Files.createDirectory(to);
+            gate.release.countDown();
+            acknowledgeFileError();
+            assertFalse(Files.exists(displaced.resolve("copy.txt")));
+            assertFalse(Files.exists(to.resolve("copy.txt")));
+            assertEquals("copy payload", Files.readString(file));
+        } finally {
+            gate.release.countDown();
+        }
+
+        go(to);
+        Path original = Files.move(file, from.resolve("kept-copy.txt"));
+        Files.writeString(file, "substitute");
+        click("paste");
+        acknowledgeFileError();
+        assertFalse(Files.exists(to.resolve("copy.txt")));
+        assertEquals("copy payload", Files.readString(original));
+        var newVersion = clipboard.external(FileClipboard.Kind.FILES, List.of(file), false);
+        await(() -> field(app, "clipboardState").equals(newVersion), "new clipboard with identical path", 8);
+        click("paste");
+        await(() -> idle() && listed(to.resolve("copy.txt")), "new version captures the new object", 10);
+        assertEquals("substitute", Files.readString(to.resolve("copy.txt")));
+    }
+
+    private boolean hasCutMark(Path path) throws Exception {
+        return ((Set<?>) field(browser, "cutItems")).stream()
+                .filter(BrowserItem.class::isInstance).map(BrowserItem.class::cast)
+                .anyMatch(item -> path.equals(item.path()));
+    }
+
+    private void saveCutCapture() throws Exception {
+        if (!Boolean.getBoolean("javafx.captureClipboard")) { return; }
+        var output = Files.createTempDirectory("phase26-fx-");
+        var image = fx(() -> {
+            var node = ((javafx.scene.control.SplitPane) scene.lookup("#workspace-split")).getItems().getLast();
+            var bounds = node.getLayoutBounds();
+            var crop = new SnapshotParameters();
+            crop.setViewport(new Rectangle2D(bounds.getMinX(), bounds.getMinY(), bounds.getWidth(), 130));
+            return node.snapshot(crop, null);
+        });
+        var picture = new BufferedImage((int) image.getWidth(), (int) image.getHeight(), BufferedImage.TYPE_INT_ARGB);
+        copyPixels(image, picture, 0);
+        var png = output.resolve("cut-mark.png");
+        assertTrue(ImageIO.write(picture, "png", png.toFile()));
+        System.out.println("PHASE26_SCREENSHOT " + png);
+    }
+
+    private static void shortcut(javafx.scene.Node owner, KeyCode key, boolean shift) {
+        Event.fireEvent(owner, new KeyEvent(KeyEvent.KEY_PRESSED, "", "", key, shift, true, false, false));
+    }
+
+    private void context(Path path, String id) throws Exception {
+        fx(() -> {
+            var clicked = browser.items().stream().filter(item -> path.equals(item.path())).findFirst().orElseThrow();
+            var build = FileManagerApp.class.getDeclaredMethod("contextMenu", BrowserItem.class);
+            build.setAccessible(true);
+            var items = ((ContextMenu) build.invoke(app, clicked)).getItems();
+            var command = items.stream().filter(item -> id.equals(item.getId())).findFirst().orElseThrow();
+            assertFalse(command.isDisable(), id);
+            command.fire();
+            return null;
+        });
+    }
+
     private FileOperationTask operation(FileOperationTask.Kind kind, List<FileChanges.Change> changes) {
+        Gate move = kind == FileOperationTask.Kind.MOVE ? heldMove.getAndSet(null) : null;
+        if (move != null) {
+            var original = changes.getFirst();
+            var blocked = new FileChanges.Change(original.path(), original.folders(), original.evidence(), original.copyBytes(), task -> {
+                move.hold();
+                return original.action().run(task);
+            });
+            return new FileOperationTask(kind, List.of(blocked));
+        }
         boolean loseReceipt = switch (kind) {
             case MOVE -> loseMoveReceipt.getAndSet(false);
             case UNDO -> loseUndoReceipt.getAndSet(false);
@@ -1027,7 +1272,8 @@ class JavaFxFileOperationsTest {
     }
 
     private boolean idle() throws Exception {
-        return field(app, "fileTask") == null && field(app, "browseRequest") == null;
+        return field(app, "fileTask") == null && field(app, "browseRequest") == null
+                && field(app, "clipboardCommand") == null;
     }
     private String status() { return ((Label) scene.lookup("#status")).getText(); }
 
