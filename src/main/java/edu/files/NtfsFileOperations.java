@@ -1,6 +1,7 @@
 package edu.files;
 
 import com.sun.jna.Native;
+import com.sun.jna.Platform;
 
 import java.io.IOException;
 import java.nio.file.AccessDeniedException;
@@ -10,7 +11,6 @@ import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
 import java.time.Instant;
 import java.util.LinkedHashMap;
-import java.util.Locale;
 import java.util.SequencedMap;
 
 import static edu.files.Win32FileHandles.*;
@@ -35,11 +35,9 @@ final class NtfsFileOperations {
         private static final boolean ENABLED = detect();
 
         private static boolean detect() {
-            if (!System.getProperty("os.name").toLowerCase(Locale.ROOT).startsWith("windows")) {
-                return false;
-            }
             try {
-                return Native.POINTER_SIZE == 8 && Win32FileHandles.available();
+                return Platform.isWindows() && Platform.isIntel() && Native.POINTER_SIZE == 8
+                        && Win32FileHandles.available();
             } catch (LinkageError unavailable) {
                 return false;
             }
@@ -87,6 +85,10 @@ final class NtfsFileOperations {
 
     static boolean sameVolume(Item source, Directory destination) {
         return destination != null && source.id().volume() == destination.id().volume();
+    }
+
+    static void verify(Directory expected) throws IOException {
+        if (!expected.equals(captureDirectory(expected.path()))) { throw changed(expected.path()); }
     }
 
     static void verify(Item selected) throws IOException {

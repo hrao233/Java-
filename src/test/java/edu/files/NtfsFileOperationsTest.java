@@ -5,13 +5,21 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.nio.file.AccessDeniedException;
 import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.attribute.AclEntry;
+import java.nio.file.attribute.AclEntryPermission;
+import java.nio.file.attribute.AclEntryType;
+import java.nio.file.attribute.AclFileAttributeView;
 import java.nio.file.attribute.BasicFileAttributeView;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import static edu.files.NtfsFileOperations.*;
@@ -140,6 +148,109 @@ class NtfsFileOperationsTest {
     }
 
     @Test
+    void directoryUndoPreservesDeepEditsAndNewEntries() throws IOException {
+        Path source = Files.createDirectory(root.resolve("资料😀"));
+        Path nested = Files.createDirectories(source.resolve("inner/deep"));
+        Files.writeString(nested.resolve("note.txt"), "before");
+        Path target = Files.createDirectory(root.resolve("target"));
+
+        var intent = FileChanges.capture(LocalFiles.describe(source));
+        var moved = FileChanges.execute(List.of(
+                FileChanges.transfer(intent, FileChanges.destination(target), true, false)));
+        assertEquals(FileChanges.State.APPLIED, moved.items().getFirst().state(), () -> String.valueOf(moved.error()));
+        Path published = moved.items().getFirst().receipt().target();
+        assertEquals(target.resolve(source.getFileName()), published);
+        Files.writeString(published.resolve("inner/deep/note.txt"), "latest edit");
+        Files.writeString(published.resolve("inner/new.txt"), "new data");
+
+        var undone = FileChanges.execute(moved.reversals());
+        assertEquals(FileChanges.State.APPLIED, undone.items().getFirst().state(), () -> String.valueOf(undone.error()));
+        assertEquals("latest edit", Files.readString(nested.resolve("note.txt")));
+        assertEquals("new data", Files.readString(source.resolve("inner/new.txt")));
+        assertFalse(Files.exists(published));
+    }
+
+    @Test
+    void undoDoesNotMoveASameNameSameContentReplacement() throws IOException {
+        Path source = Files.writeString(root.resolve("note.txt"), "same bytes");
+        Path target = Files.createDirectory(root.resolve("target"));
+        var selected = FileChanges.capture(LocalFiles.describe(source));
+        var moved = FileChanges.execute(List.of(
+                FileChanges.transfer(selected, FileChanges.destination(target), true, false)));
+        assertEquals(FileChanges.State.APPLIED, moved.items().getFirst().state());
+        Path published = moved.items().getFirst().receipt().target();
+        var recorded = LocalFiles.describe(published);
+        Path parked = Files.move(published, target.resolve("parked.txt"));
+        Files.writeString(published, "same bytes");
+        Files.getFileAttributeView(published, BasicFileAttributeView.class)
+                .setTimes(recorded.modified(), null, recorded.created());
+        assertTrue(recorded.sameMetadata(LocalFiles.describe(published)));
+
+        var undone = FileChanges.execute(moved.reversals());
+        assertEquals(FileChanges.State.FAILED, undone.items().getFirst().state());
+        assertFalse(Files.exists(source));
+        assertEquals("same bytes", Files.readString(parked));
+        assertEquals("same bytes", Files.readString(published));
+    }
+
+    @Test
+    void destinationAclDenialPreservesSourceAndAllowsRetryAfterRestoration() throws IOException {
+        Path source = Files.writeString(root.resolve("note.txt"), "original");
+        Path target = Files.createDirectory(root.resolve("target"));
+        var selected = FileChanges.capture(LocalFiles.describe(source));
+        var change = FileChanges.transfer(selected, FileChanges.destination(target), true, false);
+        var view = Files.getFileAttributeView(target, AclFileAttributeView.class);
+        var originalAcl = view.getAcl();
+        var restricted = new ArrayList<>(originalAcl);
+        restricted.addFirst(AclEntry.newBuilder().setType(AclEntryType.DENY).setPrincipal(view.getOwner())
+                .setPermissions(AclEntryPermission.ADD_FILE, AclEntryPermission.ADD_SUBDIRECTORY).build());
+
+        try {
+            view.setAcl(restricted);
+            var denied = FileChanges.execute(List.of(change));
+            assertEquals(FileChanges.State.FAILED, denied.items().getFirst().state());
+            assertInstanceOf(AccessDeniedException.class, denied.error());
+            assertTrue(denied.reversals().isEmpty());
+            assertEquals("original", Files.readString(source));
+            assertFalse(Files.exists(target.resolve("note.txt")));
+        } finally {
+            view.setAcl(originalAcl);
+        }
+
+        var applied = FileChanges.execute(List.of(change));
+        assertEquals(FileChanges.State.APPLIED, applied.items().getFirst().state());
+        assertEquals("original", Files.readString(target.resolve("note.txt")));
+        assertFalse(Files.exists(source));
+    }
+
+    @Test
+    void uncertainSecondMoveKeepsTheVerifiedPrefixAndRemainingCutItems() throws IOException {
+        Path first = Files.writeString(root.resolve("first.txt"), "first");
+        Path second = Files.writeString(root.resolve("second.txt"), "second");
+        Path third = Files.writeString(root.resolve("third.txt"), "third");
+        Path target = Files.createDirectory(root.resolve("target"));
+        var destination = FileChanges.destination(target);
+        var firstMove = FileChanges.transfer(FileChanges.capture(LocalFiles.describe(first)), destination, true, false);
+        var secondMove = new FileChanges.Change(second, List.of(root, target), () -> {
+            Path published = Files.move(second, target.resolve(second.getFileName()));
+            throw LocalFiles.uncertain("夹具模拟写入后结果未知", new IOException("结果丢失"), second, published);
+        });
+        var thirdMove = FileChanges.transfer(FileChanges.capture(LocalFiles.describe(third)), destination, true, false);
+
+        var result = FileChanges.execute(List.of(firstMove, secondMove, thirdMove));
+        assertEquals(List.of(FileChanges.State.APPLIED, FileChanges.State.UNKNOWN, FileChanges.State.NOT_RUN),
+                result.items().stream().map(FileChanges.Item::state).toList());
+        assertEquals(List.of(second, third), result.remainingCut(List.of(first, second, third)));
+        assertEquals(target.resolve("first.txt"), result.items().getFirst().receipt().target());
+        assertEquals(1, result.reversals().size());
+        assertEquals(FileChanges.State.APPLIED, FileChanges.execute(result.reversals()).items().getFirst().state());
+        assertEquals("first", Files.readString(first));
+        assertEquals("second", Files.readString(target.resolve("second.txt")));
+        assertEquals("third", Files.readString(third));
+        assertFalse(Files.exists(target.resolve("third.txt")));
+    }
+
+    @Test
     void applicationRestoresCaseOnlyRenameWithoutDeletingEdits() throws IOException {
         Path source = Files.writeString(root.resolve("name.txt"), "original");
         var selected = FileChanges.capture(LocalFiles.describe(source));
@@ -212,6 +323,23 @@ class NtfsFileOperationsTest {
         assertEquals(FileChanges.State.APPLIED, moved.items().getFirst().state());
         assertEquals(FileChanges.State.REFUSED, FileChanges.execute(moved.reversals()).items().getFirst().state());
         assertEquals("original", Files.readString(folder.resolve("note.txt")));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void pathFallbackStillRejectsAReplacedKnownDestination(boolean moving) throws IOException {
+        Path source = Files.writeString(root.resolve("note.txt"), "original");
+        Path target = Files.createDirectory(root.resolve("target"));
+        var destination = FileChanges.destination(target);
+        var selection = new FileChanges.Selection(LocalFiles.describe(source), null);
+        Path previousTarget = Files.move(target, root.resolve("previous-target"));
+        Files.createDirectory(target);
+
+        var result = FileChanges.execute(List.of(FileChanges.transfer(selection, destination, moving, true)));
+        assertEquals(FileChanges.State.FAILED, result.items().getFirst().state());
+        assertEquals("original", Files.readString(source));
+        assertFalse(Files.exists(target.resolve("note.txt")));
+        assertFalse(Files.exists(previousTarget.resolve("note.txt")));
     }
 
     @Test

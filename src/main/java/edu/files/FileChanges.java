@@ -34,7 +34,11 @@ final class FileChanges {
         }
     }
 
-    record Destination(Path path, NtfsFileOperations.Directory directory) { }
+    record Destination(Path path, NtfsFileOperations.Directory directory) {
+        void verifyIfKnown() throws IOException {
+            if (directory != null) { NtfsFileOperations.verify(directory); }
+        }
+    }
     record Receipt(Path source, Path target, NtfsFileOperations.Item identity) { }
 
     record Change(Path path, List<Path> folders, Action action) { }
@@ -130,6 +134,7 @@ final class FileChanges {
                     copied = NtfsFileOperations.copy(nativeItem, directory, destination.directory()).path();
                 } else {
                     LocalFiles.Entry selected = LocalFiles.verify(source.entry(), confirmedCurrentPath);
+                    destination.verifyIfKnown();
                     copied = LocalFiles.copy(selected.path(), directory).path();
                 }
                 return Effect.written(refuseUndo(copied, "为保护副本及其中的后续修改，复制暂不支持自动撤销"),
@@ -137,6 +142,7 @@ final class FileChanges {
             }
             LocalFiles.Entry selected = verifyPathSource(source, confirmedCurrentPath);
             LocalFiles.Entry parent = originalParent(selected);
+            destination.verifyIfKnown();
             Path target = LocalFiles.move(selected.path(), directory);
             return target == null ? Effect.UNCHANGED : Effect.written(reverseMove(selected, parent, target),
                     new Receipt(selected.path(), target, null));
