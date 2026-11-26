@@ -2,6 +2,7 @@ package edu.files;
 
 import com.sun.jna.Memory;
 import com.sun.jna.Native;
+import com.sun.jna.NativeLibrary;
 import com.sun.jna.Pointer;
 import com.sun.jna.WString;
 import com.sun.jna.win32.StdCallLibrary;
@@ -13,10 +14,13 @@ import static java.nio.charset.StandardCharsets.UTF_16LE;
 
 final class Win32FileHandles {
     static final int READ_ATTRIBUTES = 0x80;
+    static final int READ_DATA = 1;
     static final int TRAVERSE = 0x20;
     static final int DELETE_ACCESS = 0x10000;
     static final int SHARE_READ_WRITE = 3;
     static final int SHARE_ALL = 7;
+    static final int DIRECTORY_ATTRIBUTE = 0x10;
+    static final int REPARSE_POINT_ATTRIBUTE = 0x400;
     private static final int OPEN_EXISTING = 3;
     private static final int BACKUP_SEMANTICS = 0x02000000;
     private static final int OPEN_REPARSE_POINT = 0x00200000;
@@ -30,8 +34,6 @@ final class Win32FileHandles {
                                                Pointer maximumComponentLength, Pointer flags, char[] system, int systemLength);
         int GetDriveTypeW(WString root);
         boolean CloseHandle(Pointer handle);
-        Pointer GetCurrentProcess();
-        boolean GetProcessHandleCount(Pointer process, int[] count);
     }
 
     interface Nt extends StdCallLibrary {
@@ -47,8 +49,8 @@ final class Win32FileHandles {
     record Id(long volume, long low, long high, long creationTime) { }
 
     record Info(Id id, int attributes, long size, long modifiedTime, int links) {
-        boolean directory() { return (attributes & 0x10) != 0; }
-        boolean reparsePoint() { return (attributes & 0x400) != 0; }
+        boolean directory() { return (attributes & DIRECTORY_ATTRIBUTE) != 0; }
+        boolean reparsePoint() { return (attributes & REPARSE_POINT_ATTRIBUTE) != 0; }
     }
 
     static final class Failure extends IOException {
@@ -91,6 +93,15 @@ final class Win32FileHandles {
                 throw failure("无法读取文件系统类型", path);
             }
             return Native.toString(system);
+        }
+
+        int attributes() throws IOException {
+            try (Memory basic = new Memory(52)) {
+                if (!Library.KERNEL.GetFileInformationByHandle(pointer, basic)) {
+                    throw failure("无法读取目录属性", path);
+                }
+                return basic.getInt(0);
+            }
         }
 
         @Override
@@ -143,12 +154,10 @@ final class Win32FileHandles {
         }
     }
 
-    static int processHandleCount() throws IOException {
-        int[] count = new int[1];
-        if (!Library.KERNEL.GetProcessHandleCount(Library.KERNEL.GetCurrentProcess(), count)) {
-            throw failure("无法读取进程句柄数量", Path.of("."));
-        }
-        return count[0];
+    static boolean available() {
+        NativeLibrary.getInstance("ntdll").getFunction("NtSetInformationFile");
+        NativeLibrary.getInstance("kernel32").getFunction("GetFileInformationByHandleEx");
+        return true;
     }
 
     private static long fileTime(Memory buffer, int offset) {

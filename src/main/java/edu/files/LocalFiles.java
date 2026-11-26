@@ -437,7 +437,7 @@ final class LocalFiles {
         UncertainWrite(String message, Exception cause) { super(message, cause); }
     }
 
-    private static UncertainWrite uncertain(String message, Exception failure, Path... paths) {
+    static UncertainWrite uncertain(String message, Exception failure, Path... paths) {
         List<String> observations = new ArrayList<>();
         for (Path path : paths) {
             String state;

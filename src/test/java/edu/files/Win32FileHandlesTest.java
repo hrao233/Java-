@@ -1,5 +1,9 @@
 package edu.files;
 
+import com.sun.jna.Native;
+import com.sun.jna.Pointer;
+import com.sun.jna.win32.StdCallLibrary;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledOnOs;
@@ -98,7 +102,7 @@ class Win32FileHandlesTest {
     @Test
     void shareDenialMakesOpeningForRenameFailAndReleasedHandlesPermitASecondOpen() throws IOException {
         Path source = Files.writeString(root.resolve("source.txt"), "keep");
-        try (var editor = open(source, READ_ATTRIBUTES | 1, SHARE_READ_WRITE)) {
+        try (var editor = open(source, READ_ATTRIBUTES | READ_DATA, SHARE_READ_WRITE)) {
             assertThrows(Failure.class, () -> {
                 try (var ignored = open(source, READ_ATTRIBUTES | DELETE_ACCESS, SHARE_READ_WRITE)) {
                     fail("an existing handle which disallows DELETE sharing must block the rename open");
@@ -129,5 +133,19 @@ class Win32FileHandlesTest {
         try (var handle = open(path, READ_ATTRIBUTES, SHARE_ALL)) {
             return handle.info().id();
         }
+    }
+
+    interface ResourceCount extends StdCallLibrary {
+        Pointer GetCurrentProcess();
+        boolean GetProcessHandleCount(Pointer process, int[] count);
+    }
+
+    static int processHandleCount() throws IOException {
+        var kernel = Native.load("kernel32", ResourceCount.class);
+        int[] count = new int[1];
+        if (!kernel.GetProcessHandleCount(kernel.GetCurrentProcess(), count)) {
+            throw new IOException("无法读取进程句柄数量");
+        }
+        return count[0];
     }
 }
