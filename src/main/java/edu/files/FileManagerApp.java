@@ -112,6 +112,7 @@ public final class FileManagerApp extends Application {
     interface ReadObserver {
         void ready(Path path, boolean preview);
         default void started(Path path, String query, long queueNanos) { }
+        default void committed(Path path, long applyNanos) { }
     }
 
     private final ExecutorService writes = Executors.newSingleThreadExecutor(work -> new Thread(work, "file-manager-write"));
@@ -207,7 +208,7 @@ public final class FileManagerApp extends Application {
     @Override
     public void start(Stage window) {
         stage = window;
-        operationProgress = new FileOperationProgress(window, unknownResults);
+        operationProgress = new FileOperationProgress(window, unknownResults, this::locateReportedPath);
         icons = new SystemIcons(window::getOutputScaleX);
         views.put(Page.HOME, new View(Mode.DETAILS, Field.VISITED, true, null));
         views.put(Page.COMPUTER, new View(Mode.TILES, Field.NAME, false, null));
@@ -658,6 +659,7 @@ public final class FileManagerApp extends Application {
     }
 
     private void commitBrowse(BrowseRequest request, BrowseData data) {
+        long applyStarted = System.nanoTime();
         browseRequest = null;
         if (data.file() != null) {
             settleBrowse("");
@@ -684,6 +686,7 @@ public final class FileManagerApp extends Application {
         intent.committed().run();
         updateControls();
         updateListingStatus(replaced ? "目录身份已变化，已重新读取" : intent.message());
+        readObserver.committed(location.path(), System.nanoTime() - applyStarted);
     }
 
     private void browseFailed(BrowseRequest request, Throwable failure) {
@@ -2027,17 +2030,20 @@ public final class FileManagerApp extends Application {
             for (var operation : records) { observations.put(operation, LocalFiles.observe(operation.paths())); }
             return observations;
         }), observations -> UnknownResultsDialog.show(stage, observations)
-                .filter(path -> path.getParent() != null).ifPresent(path -> {
-                    Location target = Location.folder(path.getParent());
-                    Location previous = location;
-                    request(target, "", "请检查当前项目并重新发起操作", () -> {
-                        if (!target.equals(previous)) {
-                            past.addFirst(previous);
-                            future.clear();
-                        }
-                        browser.reveal(path);
-                    });
-                }), this::showError);
+                .ifPresent(this::locateReportedPath), this::showError);
+    }
+
+    private void locateReportedPath(Path path) {
+        if (path.getParent() == null || closing) { return; }
+        Location target = Location.folder(path.getParent());
+        Location previous = location;
+        request(target, "", "请在当前目录核查项目", () -> {
+            if (!target.equals(previous)) {
+                past.addFirst(previous);
+                future.clear();
+            }
+            browser.reveal(path);
+        });
     }
 
     private <T> void readDetail(Task<T> task, Consumer<T> success, Consumer<Throwable> failure) {

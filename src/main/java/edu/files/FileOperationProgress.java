@@ -7,6 +7,7 @@ import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Scene;
 import javafx.scene.control.Button;
+import javafx.scene.control.ChoiceDialog;
 import javafx.scene.control.Label;
 import javafx.scene.control.ProgressBar;
 import javafx.scene.control.ScrollPane;
@@ -21,6 +22,8 @@ import javafx.util.Duration;
 
 import java.util.ArrayList;
 import java.util.Locale;
+import java.nio.file.Path;
+import java.util.function.Consumer;
 
 import static edu.files.FileOperationTask.Kind.COPY;
 
@@ -37,6 +40,7 @@ final class FileOperationProgress implements AutoCloseable {
     private final ProgressBar progress = new ProgressBar();
     private final Button action = new Button("取消");
     private final Button reviewButton = new Button("核查结果");
+    private final Button issueLocation = new Button("打开问题位置");
     private final ScrollPane detailPane = new ScrollPane(details);
     private final PauseTransition delay = new PauseTransition(Duration.millis(350));
     private final Timeline refresh = new Timeline(new KeyFrame(Duration.millis(100), event -> render()));
@@ -44,7 +48,7 @@ final class FileOperationProgress implements AutoCloseable {
     private FileChanges.Outcome outcome;
     private String unexpected;
 
-    FileOperationProgress(Window owner, Button review) {
+    FileOperationProgress(Window owner, Button review, Consumer<Path> locate) {
         window.initOwner(owner);
         window.setTitle("文件任务");
         window.setMinWidth(460);
@@ -71,6 +75,19 @@ final class FileOperationProgress implements AutoCloseable {
         reviewButton.disableProperty().bind(review.disableProperty());
         reviewButton.setOnAction(event -> review.fire());
         reviewButton.managedProperty().bind(reviewButton.visibleProperty());
+        issueLocation.managedProperty().bind(issueLocation.visibleProperty());
+        issueLocation.setOnAction(event -> {
+            var locations = outcome.issues().stream().map(FileOperationTask.Issue::path).distinct().toList();
+            if (locations.size() == 1) {
+                locate.accept(locations.getFirst());
+            } else {
+                var choose = new ChoiceDialog<>(locations.getFirst(), locations);
+                choose.initOwner(window);
+                choose.setTitle("打开问题位置");
+                choose.setHeaderText(null);
+                choose.showAndWait().ifPresent(locate);
+            }
+        });
 
         current.setWrapText(true);
         details.setWrapText(true);
@@ -80,7 +97,7 @@ final class FileOperationProgress implements AutoCloseable {
         detailPane.getStyleClass().add("operation-detail-pane");
         detailPane.visibleProperty().bind(details.textProperty().isNotEmpty());
         detailPane.managedProperty().bind(detailPane.visibleProperty());
-        HBox operations = new HBox(9, reviewButton, action);
+        HBox operations = new HBox(9, reviewButton, issueLocation, action);
         operations.setAlignment(Pos.CENTER_RIGHT);
         Region spacer = new Region();
         VBox.setVgrow(spacer, Priority.ALWAYS);
@@ -165,6 +182,7 @@ final class FileOperationProgress implements AutoCloseable {
         action.setDisable(!finished && cancellation);
         if (finished) { launcher.setText("文件任务 · " + phase.getText()); }
         reviewButton.setVisible(result == FileOperationTask.Result.UNKNOWN);
+        issueLocation.setVisible(outcome != null && !outcome.issues().isEmpty());
         details.setText(describeOutcome());
     }
 

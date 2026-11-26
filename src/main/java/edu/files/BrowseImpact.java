@@ -15,6 +15,9 @@ record BrowseImpact(Set<Path> folders, Set<Path> entries) {
                 if (receipt != null) {
                     add(entries, receipt.target());
                     if (kind != FileOperationTask.Kind.COPY) { add(entries, receipt.source()); }
+                } else if (kind != FileOperationTask.Kind.COPY && item.change().evidence() != null) {
+                    add(entries, item.change().path());
+                    add(entries, item.change().evidence().target());
                 }
             } else if (item.state() == FileChanges.State.UNKNOWN) {
                 item.change().folders().forEach(path -> add(folders, path));

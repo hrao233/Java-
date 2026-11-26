@@ -3,7 +3,9 @@ package edu.files;
 import javafx.application.Platform;
 import javafx.event.ActionEvent;
 import javafx.event.Event;
+import javafx.geometry.Rectangle2D;
 import javafx.scene.Scene;
+import javafx.scene.SnapshotParameters;
 import javafx.scene.control.Button;
 import javafx.scene.control.ButtonType;
 import javafx.scene.control.ComboBox;
@@ -36,6 +38,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -128,6 +131,7 @@ class JavaFxFileOperationsTest {
             runReadRaces();
             runWriteAgainstNavigation(false);
             runWriteAgainstNavigation(true);
+            runShutdownDuringCommit();
         } finally {
             releaseCopy.countDown();
             if (heldRead.get() != null) { heldRead.get().gate().release.countDown(); }
@@ -233,6 +237,11 @@ class JavaFxFileOperationsTest {
             return null;
         });
         assertFalse(fx(() -> ((FileOperationTask) field(app, "activeFileOperation")).cancellationRequested()));
+        click("clear-search");
+        await(() -> browseAt(browse) && "".equals(field(app, "activeQuery")) && listed(readable),
+                "clear search during copy", 10);
+        select(readable);
+        await(() -> previewText().contains("写入期间可以读取"), "preview after leaving search", 10);
         captureBrowsing();
         capture("copying.png");
         assertFalse(Files.exists(to.resolve(file.getFileName())));
@@ -366,6 +375,36 @@ class JavaFxFileOperationsTest {
     }
 
     private record ReadGate(Path path, boolean preview, Gate gate) { }
+
+    private void runShutdownDuringCommit() throws Exception {
+        Path from = Files.createDirectory(root.resolve("exit-source"));
+        Path to = Files.createDirectory(root.resolve("exit-target"));
+        Path file = Files.writeString(from.resolve("closing.txt"), "accepted before closing");
+        go(from);
+        select(file);
+        click("copy");
+        await(() -> idle() && cutSources().equals(List.of(file)), "copy for shutdown", 8);
+        go(to);
+        var publication = new Gate();
+        heldPublish.set(publication);
+        try {
+            click("paste");
+            assertTrue(publication.entered.await(8, TimeUnit.SECONDS));
+            var writer = fx(() -> {
+                app.stop();
+                return (ExecutorService) field(app, "writes");
+            });
+            assertTrue(writer.isShutdown());
+            assertFalse(writer.isTerminated());
+            publication.release.countDown();
+            assertTrue(writer.awaitTermination(8, TimeUnit.SECONDS));
+            assertEquals("accepted before closing", Files.readString(to.resolve(file.getFileName())));
+            assertEquals("accepted before closing", Files.readString(file));
+            try (var children = Files.list(to)) { assertEquals(1, children.count()); }
+        } finally {
+            publication.release.countDown();
+        }
+    }
 
     private void readReady(Path path, boolean preview) {
         var pending = heldRead.get();
@@ -518,8 +557,12 @@ class JavaFxFileOperationsTest {
             // Capture the actual file list and preview, independent of machine-specific sidebar entries.
             var workspace = scene.lookup("#workspace-split");
             var main = (javafx.scene.control.SplitPane) workspace;
-            var files = main.getItems().getLast().snapshot(null, null);
             var progress = progressScene().snapshot(null);
+            var filePane = main.getItems().getLast();
+            var bounds = filePane.getLayoutBounds();
+            var capture = new SnapshotParameters();
+            capture.setViewport(new Rectangle2D(bounds.getMinX(), bounds.getMinY(), bounds.getWidth(), progress.getHeight()));
+            var files = filePane.snapshot(capture, null);
             int width = (int) (files.getWidth() + progress.getWidth());
             int height = (int) Math.max(files.getHeight(), progress.getHeight());
             var result = new BufferedImage(width, height, BufferedImage.TYPE_INT_ARGB);
@@ -686,7 +729,7 @@ class JavaFxFileOperationsTest {
         return method.invoke(value);
     }
 
-    private static final class MemoryPreferences extends AbstractPreferences {
+    static final class MemoryPreferences extends AbstractPreferences {
         private final Map<String, String> settings = new LinkedHashMap<>();
 
         MemoryPreferences(AbstractPreferences parent, String name) { super(parent, name); }
