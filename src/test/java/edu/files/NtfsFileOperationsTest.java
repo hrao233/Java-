@@ -56,6 +56,46 @@ class NtfsFileOperationsTest {
     }
 
     @Test
+    void lateHardLinkIsRefusedOrReportsDetectedLinkLossWithoutUndo() throws IOException {
+        Path source = Files.writeString(root.resolve("original.txt"), "same object");
+        Path targetDir = Files.createDirectory(root.resolve("target"));
+        Path target = targetDir.resolve("late.txt");
+        var selected = capture(LocalFiles.describe(source));
+        var destination = captureDirectory(targetDir);
+        var change = new FileChanges.Change(source, List.of(root, targetDir), () -> {
+            try (var directories = new PinnedDirectories();
+                 var handle = Win32FileHandles.open(source, Win32FileHandles.READ_ATTRIBUTES | Win32FileHandles.DELETE_ACCESS,
+                         Win32FileHandles.SHARE_READ_WRITE)) {
+                var parent = directories.verify(destination);
+                LocalFiles.requireAvailable(target);
+                Files.createLink(target, source);
+                var before = handle.info();
+                try {
+                    Win32FileHandles.rename(handle, parent, target.getFileName().toString());
+                } catch (Win32FileHandles.Failure occupied) {
+                    assertEquals(183, occupied.code());
+                    throw new FileAlreadyExistsException(target.toString());
+                }
+                moveReceipt(selected, destination, target.getFileName().toString(), before, handle);
+                return FileChanges.Effect.written(null);
+            }
+        });
+        var outcome = FileChanges.execute(List.of(change));
+        assertTrue(outcome.reversals().isEmpty());
+        if (Files.exists(source)) {
+            assertEquals(FileChanges.State.FAILED, outcome.items().getFirst().state());
+            assertTrue(Files.isSameFile(source, target));
+            System.out.println("PHASE30_LINK native name collision, source preserved");
+        } else {
+            assertEquals(FileChanges.State.UNKNOWN, outcome.items().getFirst().state());
+            assertEquals(List.of(source, target), outcome.error() instanceof LocalFiles.UncertainWrite failure
+                    ? failure.observations().stream().map(LocalFiles.Observation::path).toList() : List.of());
+            System.out.println("PHASE30_LINK native fold, detected link loss isolated from undo");
+        }
+        assertEquals("same object", Files.readString(target));
+    }
+
+    @Test
     void sameObjectInAReplacedParentIsNotTheSelectedEntry() throws IOException {
         Path parent = Files.createDirectory(root.resolve("selected-parent"));
         Path source = Files.writeString(parent.resolve("item.txt"), "original");

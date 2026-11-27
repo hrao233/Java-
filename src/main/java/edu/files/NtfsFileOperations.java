@@ -150,7 +150,7 @@ final class NtfsFileOperations {
             directories.verify(selected.parent());
             Handle parent = directories.verify(destination);
             try (var source = open(selected.path(), READ_ATTRIBUTES | DELETE_ACCESS, SHARE_READ_WRITE)) {
-                verifyItem(selected, source);
+                Info before = verifyItem(selected, source);
                 if (selected.parent().id().equals(destination.id()) && selected.name().equals(name)) {
                     return null;
                 }
@@ -158,6 +158,7 @@ final class NtfsFileOperations {
                     // NTFS may collapse two links to the same object even with replacement disabled.
                     LocalFiles.requireAvailable(target);
                 }
+                if (!selected.directory()) { before = source.info(); }
                 try {
                     rename(source, parent, name);
                     submitted = true;
@@ -170,13 +171,7 @@ final class NtfsFileOperations {
                     }
                     throw LocalFiles.uncertain("无法确认句柄改名结果", failure, selected.path(), target);
                 }
-                try {
-                    var result = new Item(destination, name, source.info().id(), selected.directory());
-                    return new Move(target, result);
-                } catch (IOException verificationFailure) {
-                    // The native call succeeded. If its receipt cannot be read, keep the write without undo.
-                    return new Move(target, null);
-                }
+                return moveReceipt(selected, destination, name, before, source);
             }
         } catch (Failure failure) {
             if (submitted) { throw LocalFiles.uncertain("改名后无法释放句柄", failure, selected.path(), target); }
@@ -184,11 +179,32 @@ final class NtfsFileOperations {
         }
     }
 
-    private static void verifyItem(Item selected, Handle item) throws IOException {
+    static Move moveReceipt(Item selected, Directory destination, String name, Info before, Handle source)
+            throws IOException {
+        Path target = destination.path().resolve(name);
+        Info current;
+        try {
+            current = source.info();
+        } catch (IOException verificationFailure) {
+            // The native call succeeded. If its receipt cannot be read, keep the write without undo.
+            return new Move(target, null);
+        }
+        if (!selected.directory() && Integer.compareUnsigned(current.links(), before.links()) < 0) {
+            // A folded hard link or a concurrent link deletion can both produce this observation.
+            throw LocalFiles.uncertain("改名后检测到硬链接数量减少，无法确认目录项是否已移动",
+                    new IOException("改名前 " + Integer.toUnsignedString(before.links())
+                            + "，改名后 " + Integer.toUnsignedString(current.links())),
+                    selected.path(), target);
+        }
+        return new Move(target, new Item(destination, name, current.id(), selected.directory()));
+    }
+
+    private static Info verifyItem(Item selected, Handle item) throws IOException {
         Info current = item.info();
         if (current.reparsePoint() || current.directory() != selected.directory() || !current.id().equals(selected.id())) {
             throw changed(selected.path());
         }
+        return current;
     }
 
     private static IOException changed(Path path) {
