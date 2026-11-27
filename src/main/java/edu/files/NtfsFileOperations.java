@@ -154,6 +154,10 @@ final class NtfsFileOperations {
                 if (selected.parent().id().equals(destination.id()) && selected.name().equals(name)) {
                     return null;
                 }
+                if (!changesCaseOfSameEntry(selected.path(), target)) {
+                    // NTFS may collapse two links to the same object even with replacement disabled.
+                    LocalFiles.requireAvailable(target);
+                }
                 try {
                     rename(source, parent, name);
                     submitted = true;

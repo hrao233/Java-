@@ -319,7 +319,7 @@ final class Win32FileHandles {
         try (Memory info = new Memory(size); Memory statusBlock = new Memory(2L * Native.POINTER_SIZE)) {
             info.clear();
             statusBlock.clear();
-            // Strict no-replacement also rejects an existing hard link. A verified case change uses the same entry.
+            // Extended no-replacement flags. A verified case change uses the same entry.
             info.setInt(0, changeCase ? 0 : FILE_RENAME_POSIX_SEMANTICS);
             info.setPointer(parentOffset, targetParent.pointer);
             info.setInt(lengthOffset, filename.length);
@@ -336,7 +336,7 @@ final class Win32FileHandles {
         }
     }
 
-    private static boolean changesCaseOfSameEntry(Path source, Path target) throws IOException {
+    static boolean changesCaseOfSameEntry(Path source, Path target) throws IOException {
         String from = source.getFileName().toString();
         String to = target.getFileName().toString();
         if (!source.getParent().equals(target.getParent()) || from.equals(to) || !from.equalsIgnoreCase(to)) {

@@ -495,7 +495,7 @@ final class LocalFiles {
         return List.copyOf(observations);
     }
 
-    private static void requireAvailable(Path path) throws FileAlreadyExistsException {
+    static void requireAvailable(Path path) throws FileAlreadyExistsException {
         if (Files.exists(path, NO_LINKS)) {
             throw new FileAlreadyExistsException(path.toString());
         }

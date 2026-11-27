@@ -207,6 +207,7 @@ final class StagedCopy {
                 var attrs = Files.readAttributes(staged.path(), BasicFileAttributes.class, NOFOLLOW_LINKS);
                 Path path = LocalFiles.publishCopy(target, item.directory, useCopyName, candidate -> {
                     task.beforeCommit(PUBLISHING);
+                    LocalFiles.requireAvailable(candidate);
                     try {
                         rename(staged, parent, candidate.getFileName().toString());
                     } catch (Failure failure) {
