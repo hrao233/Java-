@@ -8,6 +8,7 @@ import javafx.scene.Scene;
 import javafx.scene.SnapshotParameters;
 import javafx.scene.control.Button;
 import javafx.scene.control.ButtonType;
+import javafx.scene.control.CheckBox;
 import javafx.scene.control.CheckMenuItem;
 import javafx.scene.control.ComboBox;
 import javafx.scene.control.ContextMenu;
@@ -512,8 +513,15 @@ class JavaFxFileOperationsTest {
         assertEquals(version, clipboard.probe());
 
         click("paste");
-        acknowledgeFileError();
+        await(() -> conflictScene() != null, "repeated external paste conflicts", 10);
+        chooseConflict("conflict-skip");
+        // File/file and directory/directory are separate categories.
+        await(() -> conflictScene() != null && progressLabel("operation-file").equals(folder.getFileName().toString()),
+                "folder conflict", 10);
+        chooseConflict("conflict-skip");
+        await(() -> idle() && status().contains("已跳过 2 项"), "external paste summary", 10);
         assertEquals("external file", Files.readString(again.resolve(file.getFileName())));
+        assertEquals("external folder", Files.readString(again.resolve("资料夹/child.txt")));
         var cutVersion = clipboard.external(FileClipboard.Kind.FILES, List.of(file), true);
         goWatched(to);
         click("paste");
@@ -564,6 +572,154 @@ class JavaFxFileOperationsTest {
         assertEquals(1, clipboard.replaceAttempts());
         assertTrue(fx(() -> cutSources().isEmpty() && button("paste").isDisabled()));
         assertFalse(Files.exists(file));
+    }
+
+    @Test
+    void conflictChoicesAllowBrowsingAndApplyOnlyToMatchingLaterItems() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path from = Files.createDirectory(root.resolve("待归档"));
+        Path to = Files.createDirectory(root.resolve("项目归档"));
+        Path elsewhere = Files.createDirectory(root.resolve("旁边的目录"));
+        Path report = Files.writeString(from.resolve("01 工作报告.txt"), "工作报告的新内容");
+        Path budget = Files.writeString(from.resolve("02 费用清单.txt"), "费用明细");
+        Path list = Files.writeString(from.resolve("03 项目列表.txt"), "项目列表");
+        Path oldReport = Files.writeString(to.resolve(report.getFileName()), "工作报告的旧内容");
+        Path oldBudget = Files.writeString(to.resolve(budget.getFileName()), "费用清单的旧内容");
+        Path oldList = Files.createDirectory(to.resolve(list.getFileName()));
+        openWindow(true, new TestClipboard());
+        go(from);
+        fx(() -> { browser.selectAll(); return null; });
+        click("copy");
+        await(() -> idle() && cutSources().equals(List.of(report, budget, list)), "copy request captured", 8);
+        goWatched(to);
+        long started = System.nanoTime();
+        click("paste");
+        await(() -> conflictScene() != null && progressLabel("operation-stage").equals("正在等待冲突处理"),
+                "visible nonmodal decision", 10);
+        double dialogMs = (System.nanoTime() - started) / 1e6;
+        captureConflict("conflict-dialog.png", this::conflictScene);
+        fx(() -> {
+            assertEquals(javafx.stage.Modality.NONE, ((Stage) conflictScene().getWindow()).getModality());
+            assertFalse(button("edit-address").isDisabled());
+            progressScene().getWindow().hide();
+            button("file-operations").fire();
+            assertNotNull(conflictScene());
+            return null;
+        });
+
+        goWatched(elsewhere);
+        Path created = Files.writeString(elsewhere.resolve("外部新文件.txt"), "external change");
+        await(() -> listed(created) && conflictScene() != null, "watch refresh during conflict", 10);
+        goWatched(to);
+        Path newReport = to.resolve("01 工作报告 - 副本.txt");
+        Path newBudget = to.resolve("02 费用清单 - 副本.txt");
+        fx(() -> {
+            ((CheckBox) conflictScene().lookup("#conflict-apply")).setSelected(true);
+            ((Button) conflictScene().lookup("#conflict-keep")).fire();
+            return null;
+        });
+        await(() -> conflictScene() != null && progressLabel("operation-file").equals(list.getFileName().toString())
+                && Files.exists(newReport) && Files.exists(newBudget), "next conflict with different types", 10);
+        chooseConflict("conflict-skip");
+        await(() -> idle() && listed(newReport) && listed(newBudget) && status().contains("已复制 2 项 · 已跳过 1 项"),
+                "actual copies and skipped summary", 10);
+        captureConflict("conflict-result.png", this::progressScene);
+        assertTrue(fx(() -> conflictScene() == null && errorDialog() == null));
+        assertTrue(fx(() -> progressLabel("operation-details").contains(newBudget.toString())));
+        assertEquals(List.of(report, budget, list), fx(this::cutSources));
+        assertEquals(Files.readString(report), Files.readString(newReport));
+        assertEquals(Files.readString(budget), Files.readString(newBudget));
+        assertEquals("工作报告的旧内容", Files.readString(oldReport));
+        assertEquals("费用清单的旧内容", Files.readString(oldBudget));
+        assertTrue(Files.isDirectory(oldList));
+        assertFalse(Files.exists(to.resolve("03 项目列表 - 副本.txt")));
+        System.out.printf("PHASE27_GUI paste to conflict %.2f ms%n", dialogMs);
+    }
+
+    @Test
+    void closingConflictOrMainWindowCancelsTheWaitingOperation() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path source = Files.createDirectory(root.resolve("source"));
+        Path target = Files.createDirectory(root.resolve("target"));
+        Path file = Files.writeString(source.resolve("already.txt"), "source");
+        Path old = Files.writeString(target.resolve("already.txt"), "occupant");
+        Path later = Files.writeString(source.resolve("later.txt"), "later");
+        openWindow(false, new TestClipboard());
+        go(source);
+        fx(() -> { browser.selectAll(); return null; });
+        click("copy");
+        await(() -> idle() && cutSources().equals(List.of(file, later)), "copy request captured", 8);
+        go(target);
+        click("paste");
+        await(() -> conflictScene() != null, "conflict before closing dialog", 10);
+        long start = System.nanoTime();
+        fx(() -> {
+            Window window = conflictScene().getWindow();
+            Event.fireEvent(window, new WindowEvent(window, WindowEvent.WINDOW_CLOSE_REQUEST));
+            return null;
+        });
+        await(() -> idle() && conflictScene() == null && progressLabel("operation-stage").equals("已取消"),
+                "dialog close acknowledgement", 10);
+        System.out.printf("PHASE27_GUI conflict close to final result %.2f ms%n", (System.nanoTime() - start) / 1e6);
+        assertTrue(fx(() -> progressLabel("operation-details").contains("未执行 1 项 · 已取消 1 项")));
+
+        click("paste");
+        await(() -> conflictScene() != null, "conflict before closing main", 10);
+        fx(() -> {
+            Event.fireEvent(stage, new WindowEvent(stage, WindowEvent.WINDOW_CLOSE_REQUEST));
+            assertTrue(stage.isShowing(), "the window remains open until the writing task settles");
+            return null;
+        });
+        await(() -> idle() && conflictScene() == null && progressLabel("operation-stage").equals("已取消"),
+                "main close cancels pending decision", 10);
+
+        click("paste");
+        await(() -> conflictScene() != null, "conflict before application stop", 10);
+        var writer = fx(() -> {
+            app.stop();
+            stage.hide();
+            assertNull(conflictScene());
+            return (ExecutorService) field(app, "writes");
+        });
+        assertTrue(writer.awaitTermination(5, TimeUnit.SECONDS));
+        assertEquals("source", Files.readString(file));
+        assertEquals("occupant", Files.readString(old));
+        assertEquals("later", Files.readString(later));
+        try (var paths = Files.list(target)) { assertEquals(List.of(old), paths.toList()); }
+    }
+
+    @Test
+    void replacingTheClipboardDuringAConflictDoesNotRevokeTheRunningMoveOrNewOwner() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        var clipboard = new TestClipboard();
+        Path from = Files.createDirectory(root.resolve("source"));
+        Path to = Files.createDirectory(root.resolve("target"));
+        Path file = Files.writeString(from.resolve("moving.txt"), "move payload");
+        Path old = Files.writeString(to.resolve("moving.txt"), "original occupant");
+        Path published = to.resolve("moving - 副本.txt");
+        openWindow(false, clipboard);
+        go(from);
+        select(file);
+        click("cut");
+        await(() -> idle() && cutSources().equals(List.of(file)), "captured cut", 8);
+        go(to);
+        click("paste");
+        await(() -> conflictScene() != null, "move waiting", 10);
+        var newOwner = clipboard.text("new owner during conflict");
+        await(() -> newOwner.equals(field(app, "clipboardState")) && conflictScene() != null && cutSources().isEmpty(),
+                "new clipboard owner recognized while the accepted request waits", 10);
+        chooseConflict("conflict-keep");
+        await(() -> idle() && listed(published), "move published at chosen sibling", 10);
+        assertEquals(newOwner, clipboard.probe());
+        assertEquals("new owner during conflict", clipboard.textValue());
+        assertEquals(0, clipboard.replaceAttempts());
+        assertTrue(fx(() -> cutSources().isEmpty() && button("paste").isDisabled()));
+        assertFalse(Files.exists(file));
+        Files.writeString(published, "new edit after move");
+        menu("moreItems", "undo");
+        await(() -> idle() && !listed(published), "undo the actual move destination", 10);
+        assertEquals("new edit after move", Files.readString(file));
+        assertEquals("original occupant", Files.readString(old));
     }
 
     @Test
@@ -1032,6 +1188,33 @@ class JavaFxFileOperationsTest {
                 .findFirst().orElse(null);
     }
 
+    private Scene conflictScene() {
+        return Window.getWindows().stream().map(Window::getScene)
+                .filter(scene -> scene != null && "file-conflict".equals(scene.getRoot().getId()))
+                .findFirst().orElse(null);
+    }
+
+    private void chooseConflict(String id) throws Exception {
+        fx(() -> {
+            var button = (Button) conflictScene().lookup("#" + id);
+            assertFalse(button.isDisabled(), id);
+            button.fire();
+            return null;
+        });
+    }
+
+    private void captureConflict(String name, Callable<Scene> window) throws Exception {
+        if (!Boolean.getBoolean("javafx.captureConflicts")) { return; }
+        if (captures == null) { captures = Files.createTempDirectory("phase27-fx-"); }
+        var snapshot = fx(() -> window.call().snapshot(null));
+        var picture = new BufferedImage((int) snapshot.getWidth(), (int) snapshot.getHeight(),
+                BufferedImage.TYPE_INT_ARGB);
+        copyPixels(snapshot, picture, 0);
+        Path png = captures.resolve(name);
+        assertTrue(ImageIO.write(picture, "png", png.toFile()));
+        System.out.println("PHASE27_SCREENSHOT " + png);
+    }
+
     private String progressLabel(String id) {
         Scene progress = progressScene();
         return progress == null ? "" : ((Label) progress.lookup("#" + id)).getText();
@@ -1138,29 +1321,25 @@ class JavaFxFileOperationsTest {
 
         go(to);
         click("paste");
-        await(() -> errorDialog() != null, "conflict dialog", 12);
-        fx(() -> {
-            var pane = errorDialog();
-            assertTrue(pane.getContentText().contains("b.txt"));
-            ((Button) pane.lookupButton(ButtonType.OK)).fire();
-            return null;
-        });
+        await(() -> conflictScene() != null && progressLabel("operation-file").equals("b.txt"), "conflict dialog", 12);
+        chooseConflict("conflict-skip");
         Path published = to.resolve("a.txt");
-        await(() -> idle() && status().contains("已移动 1 项 · 失败 1 项 · 未执行 1 项"),
-                "partial write summary", 12);
-        assertEquals(List.of("a.txt", "b.txt"), fx(() -> browser.items().stream().map(BrowserItem::name).toList()));
-        assertEquals(List.of(second, third), fx(this::cutSources));
+        await(() -> idle() && status().contains("已移动 2 项 · 已跳过 1 项"), "partial write summary", 12);
+        assertEquals(List.of("a.txt", "b.txt", "c.txt"), fx(() -> browser.items().stream().map(BrowserItem::name).toList()));
+        assertEquals(List.of(second), fx(this::cutSources));
         assertFalse(Files.exists(first));
-        assertFalse(Files.exists(to.resolve("c.txt")));
+        assertFalse(Files.exists(third));
+        assertEquals("third", Files.readString(to.resolve("c.txt")));
         assertEquals("occupant", Files.readString(to.resolve("b.txt")));
 
         Files.writeString(published, "new bytes after moving");
         menu("moreItems", "undo");
-        await(() -> idle() && !listed(published) && status().contains("已撤消 1 项"), "partial batch undo", 10);
+        await(() -> idle() && !listed(published) && !listed(to.resolve("c.txt")) && status().contains("已撤消 2 项"),
+                "partial batch undo", 10);
         assertEquals("new bytes after moving", Files.readString(first));
         assertEquals("second", Files.readString(second));
         assertEquals("third", Files.readString(third));
-        assertEquals(List.of(second, third), fx(this::cutSources));
+        assertEquals(List.of(second), fx(this::cutSources));
         assertEquals("occupant", Files.readString(to.resolve("b.txt")));
     }
 

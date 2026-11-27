@@ -47,6 +47,8 @@ final class FileOperationProgress implements AutoCloseable {
     private FileOperationTask task;
     private FileChanges.Outcome outcome;
     private String unexpected;
+    private TransferConflict displayedConflict;
+    private FileConflictDialog conflictDialog;
 
     FileOperationProgress(Window owner, Button review, Consumer<Path> locate) {
         window.initOwner(owner);
@@ -93,6 +95,7 @@ final class FileOperationProgress implements AutoCloseable {
         details.setWrapText(true);
         details.setMaxWidth(Double.MAX_VALUE);
         detailPane.setFitToWidth(true);
+        detailPane.setPrefViewportHeight(130);
         detailPane.setMaxHeight(150);
         detailPane.getStyleClass().add("operation-detail-pane");
         detailPane.visibleProperty().bind(details.textProperty().isNotEmpty());
@@ -105,7 +108,7 @@ final class FileOperationProgress implements AutoCloseable {
         content.setPadding(new Insets(24));
         content.getStyleClass().add("operation-window");
         VBox.setVgrow(detailPane, Priority.SOMETIMES);
-        Scene scene = new Scene(content, 560, 395);
+        Scene scene = new Scene(content, 600, 438);
         scene.getStylesheets().add(getClass().getResource("file-manager.css").toExternalForm());
         window.setScene(scene);
 
@@ -165,7 +168,8 @@ final class FileOperationProgress implements AutoCloseable {
         } else {
             current.setTooltip(null);
         }
-        items.setText(sample.processed() + " / " + sample.itemCount() + " 项已处理");
+        items.setText(sample.processed() + " / " + sample.itemCount() + " 项已处理"
+                + (sample.skipped() == 0 ? "" : " · 已跳过 " + sample.skipped() + " 项"));
         data.setText(copying ? "已传输 " + bytes(sample.transferredBytes()) + "  /  "
                 + (sample.totalBytes() < 0 ? "总量待定" : bytes(sample.totalBytes()))
                 + "     已发布 " + bytes(sample.publishedBytes()) : "");
@@ -184,6 +188,20 @@ final class FileOperationProgress implements AutoCloseable {
         reviewButton.setVisible(result == FileOperationTask.Result.UNKNOWN);
         issueLocation.setVisible(outcome != null && !outcome.issues().isEmpty());
         details.setText(describeOutcome());
+        renderConflict(finished || cancellation ? null : task.pendingConflict());
+    }
+
+    private void renderConflict(TransferConflict requested) {
+        if (requested == displayedConflict) { return; }
+        if (conflictDialog != null) { conflictDialog.close(); }
+        displayedConflict = requested;
+        conflictDialog = null;
+        if (requested != null) {
+            delay.stop();
+            window.show();
+            conflictDialog = new FileConflictDialog(window.getOwner(), task, requested);
+            conflictDialog.show();
+        }
     }
 
     static String operationTitle(FileOperationTask.Kind kind) {
@@ -208,6 +226,7 @@ final class FileOperationProgress implements AutoCloseable {
         return switch (sample.phase()) {
             case WAITING -> "等待执行";
             case PREPARING -> "正在检查文件和准备暂存";
+            case WAITING_FOR_CONFLICT -> "正在等待冲突处理";
             case EXECUTING -> "正在提交文件操作";
             case COPYING -> "正在复制数据";
             case ATTRIBUTES -> "正在处理属性并检查暂存";
@@ -244,12 +263,22 @@ final class FileOperationProgress implements AutoCloseable {
             lines.add("取消请求生效于项目开始前。");
         }
         lines.add(outcome.summary("成功"));
-        if (outcome.error() != null) { lines.add(outcome.error().getMessage()); }
+        var kind = task.snapshot().kind();
+        for (var item : outcome.items()) {
+            if ((kind == COPY || kind == FileOperationTask.Kind.MOVE)
+                    && item.state() == FileChanges.State.APPLIED && item.receipt() != null) {
+                lines.add((kind == COPY ? "已复制到 · " : "已移动到 · ") + item.receipt().target());
+            } else if (item.state() == FileChanges.State.SKIPPED) {
+                lines.add("已跳过 · " + item.change().path());
+            } else if (item.error() != null) {
+                lines.add(item.change().path() + "\n" + item.error().getMessage());
+            }
+        }
         for (var issue : outcome.issues()) {
             lines.add(issue.detail() + "\n" + issue.path()
                     + (issue.cause() == null ? "" : "\n" + issue.cause().getMessage()));
         }
-        return String.join("\n\n", lines);
+        return String.join("\n", lines);
     }
 
     private void stopUpdates() {
@@ -260,6 +289,7 @@ final class FileOperationProgress implements AutoCloseable {
     @Override
     public void close() {
         stopUpdates();
+        renderConflict(null);
         window.hide();
     }
 

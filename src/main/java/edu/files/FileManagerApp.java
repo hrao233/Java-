@@ -332,7 +332,12 @@ public final class FileManagerApp extends Application {
         stage.setOnCloseRequest(event -> {
             if (writing) {
                 event.consume();
-                status.setText("正在处理文件，请等待操作结束");
+                if (activeFileOperation != null && activeFileOperation.pendingConflict() != null) {
+                    activeFileOperation.requestCancellation();
+                    status.setText("正在取消剩余项目，请在任务结束后关闭");
+                } else {
+                    status.setText("正在处理文件，请等待操作结束");
+                }
                 if (activeFileOperation != null) { operationProgress.show(); }
             }
         });
@@ -2520,6 +2525,7 @@ public final class FileManagerApp extends Application {
         if (fileTask != null || closing) { return; }
         var operation = operationFactory.apply(kind, changes);
         operation.observeStagingWith(staging);
+        operation.enableConflictResolution();
         activeFileOperation = operation;
         operationProgress.start(operation);
         Task<Outcome> worker = task(ignored -> operation.run());
