@@ -514,12 +514,22 @@ class JavaFxFileOperationsTest {
         click("paste");
         acknowledgeFileError();
         assertEquals("external file", Files.readString(again.resolve(file.getFileName())));
-        clipboard.external(FileClipboard.Kind.FILES, List.of(file), true);
+        var cutVersion = clipboard.external(FileClipboard.Kind.FILES, List.of(file), true);
         goWatched(to);
         click("paste");
-        await(() -> idle() && status().contains("重新选择复制") && button("paste").isDisabled(), "external cut refused", 10);
+        await(() -> idle() && button("paste").isDisabled() && dialog("无法粘贴外部剪切") != null,
+                "external cut shows a refusal dialog", 10);
+        fx(() -> {
+            var refusal = dialog("无法粘贴外部剪切");
+            assertTrue(refusal.getContentText().contains("「复制」"));
+            assertEquals("外部剪切请改用复制", ((Label) scene.lookup("#clipboard-status")).getText());
+            ((Button) refusal.lookupButton(ButtonType.OK)).fire();
+            return null;
+        });
         assertFalse(Files.exists(to.resolve(file.getFileName())));
         assertEquals("external file", Files.readString(file));
+        assertEquals(cutVersion, clipboard.probe());
+        assertEquals(0, clipboard.replaceAttempts());
 
         clipboard.external(FileClipboard.Kind.UNSUPPORTED, List.of(), false);
         await(() -> button("paste").isDisabled()
@@ -1250,8 +1260,12 @@ class JavaFxFileOperationsTest {
     }
 
     private DialogPane errorDialog() {
+        return dialog("文件操作");
+    }
+
+    private DialogPane dialog(String title) {
         for (Window window : List.copyOf(Window.getWindows())) {
-            if (window instanceof Stage dialog && "文件操作".equals(dialog.getTitle())
+            if (window instanceof Stage dialog && dialog.getOwner() == stage && title.equals(dialog.getTitle())
                     && dialog.getScene().getRoot() instanceof DialogPane pane) {
                 dialog.setOpacity(0);
                 return pane;

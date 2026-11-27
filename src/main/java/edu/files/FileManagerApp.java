@@ -2316,7 +2316,8 @@ public final class FileManagerApp extends Application {
         if (data.externalMove()) {
             unsupportedMove = data.state();
             describeTransfer();
-            updateListingStatus("资源管理器的剪切暂不可在此粘贴，请在来源重新选择复制");
+            updateListingStatus("未粘贴外部剪切项目");
+            info("无法粘贴外部剪切", "请回到来源窗口，选中这些项目并使用「复制」，然后再粘贴。");
         } else if (data.state().kind() == FileClipboard.Kind.CUT) {
             updateListingStatus("请返回发起剪切的窗口粘贴，跨窗口传输可使用复制");
         } else if (data.token() != null && data.token().equals(lastClipboardToken)) {
