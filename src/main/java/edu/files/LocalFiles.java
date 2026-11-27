@@ -381,18 +381,37 @@ final class LocalFiles {
     }
 
     static Entry copy(Path source, Path directory, FileOperationTask task) throws IOException {
+        return copy(source, directory, null, false, task);
+    }
+
+    static Entry copy(Path source, Path directory, Win32FileHandles.Handle pinnedTarget, boolean keepBoth,
+                      FileOperationTask task) throws IOException {
         Path destination = transferTarget(source, directory);
-        boolean sameFolder = Files.isSameFile(source.toAbsolutePath().getParent(), destination.getParent());
-        if (!sameFolder) { requireAvailable(destination); }
-        var result = StagedCopy.copy(source, destination, sameFolder, task);
+        boolean useCopyName = keepBoth || Files.isSameFile(source.toAbsolutePath().getParent(), destination.getParent());
+        if (!useCopyName) {
+            try {
+                requireAvailable(destination);
+            } catch (FileAlreadyExistsException occupied) {
+                throw new TransferConflict.Collision(destination, TransferConflict.Stage.COPY_CHECK, occupied);
+            }
+        }
+        var result = StagedCopy.copy(source, destination, useCopyName, pinnedTarget, task);
         return entry(result.path(), result.attributes());
     }
 
     @FunctionalInterface
-    interface Publisher { Path publish(Path target) throws IOException; }
+    interface Publisher<T> { T publish(Path target) throws IOException; }
 
-    static Path publishCopy(Path original, boolean directory, boolean sameFolder, Publisher publisher) throws IOException {
-        if (!sameFolder) { return publisher.publish(original); }
+    static Path publishCopy(Path original, boolean directory, boolean useCopyName, Publisher<Path> publisher) throws IOException {
+        if (useCopyName) { return publishSibling(original, directory, publisher); }
+        try {
+            return publisher.publish(original);
+        } catch (FileAlreadyExistsException occupied) {
+            throw new TransferConflict.Collision(original, TransferConflict.Stage.COPY_PUBLISH, occupied);
+        }
+    }
+
+    static <T> T publishSibling(Path original, boolean directory, Publisher<T> publisher) throws IOException {
         String name = original.getFileName().toString();
         int split = extensionStart(name, directory);
         String stem = name.substring(0, split);
@@ -402,8 +421,8 @@ final class LocalFiles {
             Path candidate = original.resolveSibling(stem + suffix + extension);
             try {
                 return publisher.publish(candidate);
-            } catch (FileAlreadyExistsException exception) {
-                // Another copy may have acquired this name while the data was staged.
+            } catch (FileAlreadyExistsException occupied) {
+                // The next candidate requires its own no-replacement commit.
             }
         }
     }

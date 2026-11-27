@@ -22,17 +22,17 @@ final class StagedCopy {
 
     private StagedCopy() { }
 
-    static Result copy(Path source, Path target, boolean sameFolder, FileOperationTask task) throws IOException {
+    static Result copy(Path source, Path target, boolean useCopyName, Handle pinnedTarget,
+                       FileOperationTask task) throws IOException {
         task.checkCancellation();
         // Check before creating staging so a missing source leaves the destination untouched.
         var sourceAttributes = Files.readAttributes(source, BasicFileAttributes.class, NOFOLLOW_LINKS);
+        if (pinnedTarget != null) { return nativeCopy(source, target, useCopyName, pinnedTarget, task); }
         Result result = null;
         try (var pins = new NtfsFileOperations.PinnedDirectories()) {
             Handle parent = NtfsFileOperations.copyTarget(pins, target.getParent());
-            if (parent == null) { return portableCopy(source, target, sameFolder, sourceAttributes, task); }
-            try (var stage = new Stage(parent, task)) {
-                result = stage.copy(source, target, sameFolder);
-            }
+            if (parent == null) { return portableCopy(source, target, useCopyName, sourceAttributes, task); }
+            result = nativeCopy(source, target, useCopyName, parent, task);
         } catch (IOException failure) {
             if (result == null) { throw failure; }
             task.issue(result.path(), "无法关闭复制目标使用的句柄", failure);
@@ -40,7 +40,14 @@ final class StagedCopy {
         return result;
     }
 
-    private static Result portableCopy(Path source, Path target, boolean sameFolder,
+    private static Result nativeCopy(Path source, Path target, boolean useCopyName, Handle parent,
+                                     FileOperationTask task) throws IOException {
+        try (var stage = new Stage(parent, task)) {
+            return stage.copy(source, target, useCopyName);
+        }
+    }
+
+    private static Result portableCopy(Path source, Path target, boolean useCopyName,
                                        BasicFileAttributes sourceAttributes, FileOperationTask task) throws IOException {
         task.unknownSize();
         Path staged;
@@ -75,7 +82,7 @@ final class StagedCopy {
             });
             task.phase(ATTRIBUTES);
             var attrs = Files.readAttributes(staged, BasicFileAttributes.class, NOFOLLOW_LINKS);
-            Path result = LocalFiles.publishCopy(target, attrs.isDirectory(), sameFolder, path -> {
+            Path result = LocalFiles.publishCopy(target, attrs.isDirectory(), useCopyName, path -> {
                 task.beforeCommit(PUBLISHING);
                 return LocalFiles.moveWithoutReplacing(staged, path);
             });
@@ -154,7 +161,7 @@ final class StagedCopy {
             opened.addLast(new OpenDirectory(root, entries, null));
         }
 
-        Result copy(Path source, Path target, boolean sameFolder) throws IOException {
+        Result copy(Path source, Path target, boolean useCopyName) throws IOException {
             Files.walkFileTree(source, new SimpleFileVisitor<>() {
                 @Override
                 public FileVisitResult preVisitDirectory(Path directory, BasicFileAttributes attrs) throws IOException {
@@ -198,7 +205,7 @@ final class StagedCopy {
                     CopyDiagnostics.end(CopyDiagnostics.Part.TREE_CHECK, checking);
                 }
                 var attrs = Files.readAttributes(staged.path(), BasicFileAttributes.class, NOFOLLOW_LINKS);
-                Path path = LocalFiles.publishCopy(target, item.directory, sameFolder, candidate -> {
+                Path path = LocalFiles.publishCopy(target, item.directory, useCopyName, candidate -> {
                     task.beforeCommit(PUBLISHING);
                     try {
                         rename(staged, parent, candidate.getFileName().toString());

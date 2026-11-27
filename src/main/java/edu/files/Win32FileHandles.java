@@ -10,10 +10,12 @@ import com.sun.jna.ptr.PointerByReference;
 import com.sun.jna.win32.StdCallLibrary;
 
 import java.io.IOException;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 
 import static edu.files.CopyDiagnostics.Part.*;
 import static java.nio.charset.StandardCharsets.UTF_16LE;
+import static java.nio.file.LinkOption.NOFOLLOW_LINKS;
 
 final class Win32FileHandles {
     static final int READ_ATTRIBUTES = 0x80;
@@ -30,6 +32,12 @@ final class Win32FileHandles {
     private static final int OPEN_REPARSE_POINT = 0x00200000;
     private static final int FILE_ID_INFO = 18;
     private static final int FILE_DISPOSITION_INFO_EX = 21;
+    private static final int FILE_RENAME_INFORMATION = 10;
+    private static final int FILE_RENAME_INFORMATION_EX = 65;
+    private static final int FILE_RENAME_POSIX_SEMANTICS = 2;
+    private static final int STATUS_INVALID_INFO_CLASS = 0xc0000003;
+    private static final int STATUS_NOT_IMPLEMENTED = 0xc0000002;
+    private static final int STATUS_NOT_SUPPORTED = 0xc00000bb;
     private static final int COPY_FILE_FAIL_IF_EXISTS = 1;
     private static final int COPY_FILE_COPY_SYMLINK = 0x800;
     private static final int COPY_FILE_NO_BUFFERING = 0x1000;
@@ -302,6 +310,7 @@ final class Win32FileHandles {
 
     static void rename(Handle source, Handle targetParent, String name) throws IOException {
         Path target = targetParent.path.resolve(name);
+        boolean changeCase = changesCaseOfSameEntry(source.path, target);
         byte[] filename = name.getBytes(UTF_16LE);
         int parentOffset = Native.POINTER_SIZE;
         int lengthOffset = 2 * Native.POINTER_SIZE;
@@ -310,15 +319,34 @@ final class Win32FileHandles {
         try (Memory info = new Memory(size); Memory statusBlock = new Memory(2L * Native.POINTER_SIZE)) {
             info.clear();
             statusBlock.clear();
-            // ReplaceIfExists stays false. The name is resolved relative to the open directory.
+            // Strict no-replacement also rejects an existing hard link. A verified case change uses the same entry.
+            info.setInt(0, changeCase ? 0 : FILE_RENAME_POSIX_SEMANTICS);
             info.setPointer(parentOffset, targetParent.pointer);
             info.setInt(lengthOffset, filename.length);
             info.write(nameOffset, filename, 0, filename.length);
-            int status = Library.NTDLL.NtSetInformationFile(source.pointer, statusBlock, info, size, 10);
+            int status = Library.NTDLL.NtSetInformationFile(source.pointer, statusBlock, info, size,
+                    changeCase ? FILE_RENAME_INFORMATION : FILE_RENAME_INFORMATION_EX);
             if (status != 0) {
+                if (status == STATUS_INVALID_INFO_CLASS || status == STATUS_NOT_IMPLEMENTED || status == STATUS_NOT_SUPPORTED) {
+                    throw new IOException("此位置不支持严格的无覆盖改名：" + target);
+                }
                 throw new Failure("无法按句柄重命名 (NTSTATUS 0x" + Integer.toHexString(status) + ")",
                         target, Library.NTDLL.RtlNtStatusToDosError(status));
             }
+        }
+    }
+
+    private static boolean changesCaseOfSameEntry(Path source, Path target) throws IOException {
+        String from = source.getFileName().toString();
+        String to = target.getFileName().toString();
+        if (!source.getParent().equals(target.getParent()) || from.equals(to) || !from.equalsIgnoreCase(to)) {
+            return false;
+        }
+        try {
+            // Compare the stored names, including case, to distinguish two hard links to the same ID.
+            return source.toRealPath(NOFOLLOW_LINKS).toString().equals(target.toRealPath(NOFOLLOW_LINKS).toString());
+        } catch (NoSuchFileException absent) {
+            return false;
         }
     }
 

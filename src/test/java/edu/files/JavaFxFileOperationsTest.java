@@ -677,7 +677,7 @@ class JavaFxFileOperationsTest {
             var change = changes.getFirst();
             var uncertain = new FileChanges.Change(change.path(), change.folders(), change.evidence(), change.copyBytes(), task -> {
                 var effect = change.action().run(task);
-                assertTrue(effect.changed());
+                assertEquals(FileChanges.State.APPLIED, effect.state());
                 injectedWrites.incrementAndGet();
                 throw LocalFiles.uncertain("夹具已执行写入并丢失回执", new IOException("test receipt"),
                         change.path(), effect.receipt().target());

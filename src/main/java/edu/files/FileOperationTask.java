@@ -5,7 +5,9 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.function.Consumer;
 
@@ -13,14 +15,14 @@ import static edu.files.FileChanges.State.*;
 
 final class FileOperationTask {
     enum Kind { COPY, MOVE, RENAME, RECYCLE, UNDO, OTHER }
-    enum Phase { WAITING, PREPARING, EXECUTING, COPYING, ATTRIBUTES, PUBLISHING, CLEANUP, FINISHED }
+    enum Phase { WAITING, PREPARING, WAITING_FOR_CONFLICT, EXECUTING, COPYING, ATTRIBUTES, PUBLISHING, CLEANUP, FINISHED }
     enum Result { COMPLETED, PARTIAL, CANCELLED, FAILED, UNKNOWN }
 
     record Issue(Path path, String detail, IOException cause) { }
 
     record Snapshot(UUID id, Kind kind, Phase phase, Result result, Instant started, Duration elapsed,
                     Path currentPath, Path target, int itemCount, int processed, int applied, int failed,
-                    int unknown, int cancelled, long totalBytes, long transferredBytes, long publishedBytes,
+                    int unknown, int skipped, int cancelled, long totalBytes, long transferredBytes, long publishedBytes,
                     double bytesPerSecond, Duration remaining) { }
 
     static final class Cancelled extends IOException {
@@ -35,9 +37,14 @@ final class FileOperationTask {
     private final List<FileChanges.Change> changes;
     private final Consumer<Snapshot> observer;
     private final List<Issue> issues = new ArrayList<>();
+    private final Map<TransferConflict.Category, TransferConflict.Strategy> conflictPolicies = new HashMap<>();
     private ActiveStaging staging = new ActiveStaging();
+    private boolean resolvesConflicts;
     private volatile Snapshot snapshot;
     private volatile boolean cancellationRequested;
+    private volatile TransferConflict pendingConflict;
+    private record Decision(TransferConflict.Strategy strategy, boolean applyToSimilar) { }
+    private Decision decision;
     // The disk worker owns the fields below once run() starts.
     private Instant started;
     private long startNanos;
@@ -48,6 +55,7 @@ final class FileOperationTask {
     private int applied;
     private int failed;
     private int unknown;
+    private int skipped;
     private int cancelled;
     private long totalBytes;
     private long transferred;
@@ -87,6 +95,10 @@ final class FileOperationTask {
 
     void observeStagingWith(ActiveStaging visibleToReaders) { staging = visibleToReaders; }
 
+    void enableConflictResolution() { resolvesConflicts = true; }
+    boolean resolvesConflicts() { return resolvesConflicts; }
+    TransferConflict pendingConflict() { return pendingConflict; }
+
     ActiveStaging staging() { return staging; }
     Duration elapsed() {
         Snapshot current = snapshot;
@@ -97,11 +109,71 @@ final class FileOperationTask {
     boolean cancellationRequested() { return cancellationRequested; }
 
     synchronized void requestCancellation() {
-        if (snapshot.result() == null) { cancellationRequested = true; }
+        if (snapshot.result() == null) {
+            cancellationRequested = true;
+            notifyAll();
+        }
     }
 
     void checkCancellation() throws Cancelled {
         if (cancellationRequested) { throw new Cancelled(); }
+    }
+
+    synchronized boolean decideConflict(TransferConflict conflict, TransferConflict.Strategy strategy,
+                                        boolean applyToSimilar) {
+        if (pendingConflict != conflict || decision != null || cancellationRequested || !conflict.allows(strategy)) {
+            return false;
+        }
+        if (strategy == TransferConflict.Strategy.CANCEL) {
+            requestCancellation();
+        } else {
+            decision = new Decision(strategy, applyToSimilar);
+            notifyAll();
+        }
+        return true;
+    }
+
+    TransferConflict.Strategy resolveConflict(TransferConflict conflict) throws Cancelled {
+        checkCancellation();
+        var category = conflict.category();
+        var policy = conflictPolicies.get(category);
+        if (policy != null && conflict.allows(policy)) { return policy; }
+        synchronized (this) {
+            checkCancellation();
+            pendingConflict = conflict;
+        }
+        try {
+            currentPath = conflict.source().path();
+            target = conflict.target();
+            phase(Phase.WAITING_FOR_CONFLICT);
+            Decision choice;
+            synchronized (this) {
+                while (decision == null && !cancellationRequested) { wait(); }
+                checkCancellation();
+                choice = decision;
+            }
+            if (choice.applyToSimilar() && category != null) { conflictPolicies.put(category, choice.strategy()); }
+            return choice.strategy();
+        } catch (InterruptedException interrupted) {
+            requestCancellation();
+            Thread.currentThread().interrupt();
+            throw new Cancelled();
+        } finally {
+            synchronized (this) {
+                pendingConflict = null;
+                decision = null;
+            }
+            phase(Phase.PREPARING);
+        }
+    }
+
+    void retryItem() {
+        long discarded = transferred - itemStartBytes;
+        if (totalBytes >= 0) {
+            totalBytes = Long.MAX_VALUE - totalBytes < discarded ? -1 : totalBytes + discarded;
+        }
+        itemStartBytes = transferred;
+        phase(Phase.PREPARING);
     }
 
     void beforeCommit(Phase committing) throws Cancelled {
@@ -179,6 +251,12 @@ final class FileOperationTask {
             }
             case FAILED, REFUSED -> failed++;
             case UNKNOWN -> unknown++;
+            case SKIPPED -> {
+                skipped++;
+                if (totalBytes >= 0) {
+                    totalBytes -= Math.max(0, plannedItemBytes - (transferred - itemStartBytes));
+                }
+            }
             case CANCELLED -> cancelled++;
             default -> { }
         }
@@ -215,7 +293,7 @@ final class FileOperationTask {
         Duration remaining = totalBytes >= transferred && rate >= 1024
                 ? Duration.ofSeconds((long) Math.ceil((totalBytes - transferred) / rate)) : null;
         return new Snapshot(id, kind, phase, result, started, elapsed, currentPath, target, changes.size(),
-                processed, applied, failed, unknown, cancelled, totalBytes, transferred, published, rate, remaining);
+                processed, applied, failed, unknown, skipped, cancelled, totalBytes, transferred, published, rate, remaining);
     }
 
     private static long totalBytes(Kind kind, List<FileChanges.Change> changes) {

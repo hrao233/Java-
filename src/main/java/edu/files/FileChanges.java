@@ -1,6 +1,7 @@
 package edu.files;
 
 import java.io.IOException;
+import java.nio.file.FileAlreadyExistsException;
 import java.nio.file.Path;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -11,10 +12,10 @@ import static edu.files.FileChanges.State.*;
 
 final class FileChanges {
     enum State {
-        APPLIED, UNCHANGED, FAILED, UNKNOWN, NOT_RUN, CANCELLED, REFUSED;
+        APPLIED, UNCHANGED, SKIPPED, FAILED, UNKNOWN, NOT_RUN, CANCELLED, REFUSED;
 
         boolean pending() {
-            return this == FAILED || this == NOT_RUN || this == CANCELLED;
+            return this == SKIPPED || this == FAILED || this == NOT_RUN || this == CANCELLED;
         }
     }
 
@@ -72,10 +73,11 @@ final class FileChanges {
         public String toString() { return operation + " · " + path.getFileName(); }
     }
 
-    record Effect(boolean changed, Change reversal, Receipt receipt) {
-        static final Effect UNCHANGED = new Effect(false, null, null);
+    record Effect(State state, Change reversal, Receipt receipt) {
+        static final Effect UNCHANGED = new Effect(State.UNCHANGED, null, null);
+        static final Effect SKIPPED = new Effect(State.SKIPPED, null, null);
         static Effect written(Change reversal) { return written(reversal, null); }
-        static Effect written(Change reversal, Receipt receipt) { return new Effect(true, reversal, receipt); }
+        static Effect written(Change reversal, Receipt receipt) { return new Effect(APPLIED, reversal, receipt); }
     }
 
     record Item(Change change, State state, Change reversal, Receipt receipt, IOException error) { }
@@ -135,6 +137,7 @@ final class FileChanges {
             List<String> parts = new ArrayList<>();
             addCount(parts, APPLIED, completed);
             addCount(parts, UNCHANGED, "无需更改");
+            addCount(parts, SKIPPED, "已跳过");
             addCount(parts, FAILED, "失败");
             addCount(parts, UNKNOWN, "结果未知");
             addCount(parts, NOT_RUN, "未执行");
@@ -172,38 +175,65 @@ final class FileChanges {
     static Change transfer(Selection source, Destination destination, boolean move, boolean confirmedCurrentPath) {
         Path directory = destination.path();
         List<Path> folders = move ? List.of(source.path().getParent(), directory) : List.of(directory);
-        var evidence = evidence(source, directory.resolve(source.path().getFileName()), destination.directory());
+        Path target = directory.resolve(source.path().getFileName());
+        var evidence = evidence(source, target, destination.directory());
         LocalFiles.Entry entry = source.entry();
         long size = move || entry.directory() || entry.link() || entry.other() ? -1 : entry.size();
         return new Change(source.path(), folders, evidence, size, task -> {
-            if (source.needsPathConfirmation(destination, move) && !confirmedCurrentPath) {
-                throw new IOException("无法确认身份，请刷新后重新选择：" + source.path());
+            try {
+                return transferOnce(source, destination, target, move, confirmedCurrentPath, false, task);
+            } catch (TransferConflict.Collision collision) {
+                if (!task.resolvesConflicts()) { throw collision; }
+                var conflict = TransferConflict.observe(source, destination, move, collision);
+                if (task.resolveConflict(conflict) == TransferConflict.Strategy.SKIP) { return Effect.SKIPPED; }
+                task.retryItem();
+                return transferOnce(source, destination, target, move, confirmedCurrentPath, true, task);
             }
-            var nativeItem = source.nativeItem();
-            if (move && nativeItem != null && NtfsFileOperations.sameVolume(nativeItem, destination.directory())) {
+        });
+    }
+
+    private static Effect transferOnce(Selection source, Destination destination, Path target, boolean move,
+                                       boolean confirmedCurrentPath, boolean keepBoth, FileOperationTask task)
+            throws IOException {
+        task.checkCancellation();
+        if (source.needsPathConfirmation(destination, move) && !confirmedCurrentPath) {
+            throw new IOException("无法确认身份，请刷新后重新选择：" + source.path());
+        }
+        var nativeItem = source.nativeItem();
+        var nativeDirectory = destination.directory();
+        if (!move) {
+            Path copied;
+            if (nativeItem != null) {
+                copied = NtfsFileOperations.copy(nativeItem, destination.path(), nativeDirectory, keepBoth, task).path();
+            } else {
+                LocalFiles.Entry selected = LocalFiles.verify(source.entry(), confirmedCurrentPath);
+                destination.verifyIfKnown();
+                copied = LocalFiles.copy(selected.path(), destination.path(), task).path();
+            }
+            return Effect.written(refuseUndo(copied, "为保护副本及其中的后续修改，复制暂不支持自动撤销"),
+                    new Receipt(source.path(), copied, null));
+        }
+        if (keepBoth) {
+            return LocalFiles.publishSibling(target, nativeItem.directory(), candidate -> {
                 task.beforeCommit(FileOperationTask.Phase.EXECUTING);
-                return moveByHandle(nativeItem, destination.directory(), nativeItem.name(), true);
-            }
-            if (!move) {
-                Path copied;
-                if (nativeItem != null) {
-                    copied = NtfsFileOperations.copy(nativeItem, directory, destination.directory(), task).path();
-                } else {
-                    LocalFiles.Entry selected = LocalFiles.verify(source.entry(), confirmedCurrentPath);
-                    destination.verifyIfKnown();
-                    copied = LocalFiles.copy(selected.path(), directory, task).path();
-                }
-                return Effect.written(refuseUndo(copied, "为保护副本及其中的后续修改，复制暂不支持自动撤销"),
-                        new Receipt(source.path(), copied, null));
+                return moveByHandle(nativeItem, nativeDirectory, candidate.getFileName().toString(), true);
+            });
+        }
+        try {
+            if (nativeItem != null && NtfsFileOperations.sameVolume(nativeItem, nativeDirectory)) {
+                task.beforeCommit(FileOperationTask.Phase.EXECUTING);
+                return moveByHandle(nativeItem, nativeDirectory, nativeItem.name(), true);
             }
             LocalFiles.Entry selected = verifyPathSource(source, confirmedCurrentPath);
             LocalFiles.Entry parent = originalParent(selected);
             destination.verifyIfKnown();
             task.beforeCommit(FileOperationTask.Phase.EXECUTING);
-            Path target = LocalFiles.move(selected.path(), directory);
-            return target == null ? Effect.UNCHANGED : Effect.written(reverseMove(selected, parent, target),
-                    new Receipt(selected.path(), target, null));
-        });
+            Path moved = LocalFiles.move(selected.path(), destination.path());
+            return moved == null ? Effect.UNCHANGED : Effect.written(reverseMove(selected, parent, moved),
+                    new Receipt(selected.path(), moved, null));
+        } catch (FileAlreadyExistsException occupied) {
+            throw new TransferConflict.Collision(target, TransferConflict.Stage.MOVE, occupied);
+        }
     }
 
     static Change rename(LocalFiles.Entry source, Path target, boolean confirmedCurrentPath) {
@@ -320,7 +350,7 @@ final class FileChanges {
             try {
                 task.startItem(change);
                 Effect effect = change.action().run(task);
-                item = new Item(change, effect.changed() ? APPLIED : UNCHANGED, effect.reversal(), effect.receipt(), null);
+                item = new Item(change, effect.state(), effect.reversal(), effect.receipt(), null);
             } catch (FileOperationTask.Cancelled cancel) {
                 item = new Item(change, CANCELLED, null, null, null);
                 stopped = true;

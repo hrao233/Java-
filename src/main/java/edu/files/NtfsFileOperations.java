@@ -107,13 +107,18 @@ final class NtfsFileOperations {
     }
 
     static LocalFiles.Entry copy(Item selected, Path directory, Directory target, FileOperationTask task) throws IOException {
+        return copy(selected, directory, target, false, task);
+    }
+
+    static LocalFiles.Entry copy(Item selected, Path directory, Directory target, boolean keepBoth,
+                                 FileOperationTask task) throws IOException {
         LocalFiles.Entry result = null;
         try (var directories = new PinnedDirectories()) {
             directories.verify(selected.parent());
-            if (target != null) { directories.verify(target); }
+            Handle pinnedTarget = target == null ? null : directories.verify(target);
             try (var source = open(selected.path(), READ_ATTRIBUTES | READ_DATA, SHARE_READ_WRITE)) {
                 verifyItem(selected, source);
-                result = LocalFiles.copy(selected.path(), directory, task);
+                result = LocalFiles.copy(selected.path(), directory, pinnedTarget, keepBoth, task);
                 return result;
             }
         } catch (Failure failure) {
