@@ -148,7 +148,7 @@ final class Phase24FxBenchmark {
         Path large = Files.write(source.resolve("copy.bin"), new byte[64 * 1024 * 1024]);
         go(source);
         fx(() -> {
-            require(((BrowserView) field(app, "browser")).reveal(large));
+            require(((BrowserView) paneField("browser")).reveal(large));
             button("copy").fire();
             return null;
         });
@@ -237,18 +237,18 @@ final class Phase24FxBenchmark {
             editor.fireEvent(new ActionEvent());
             return null;
         });
-        waitState(() -> (baseline ? idle() : field(field(app, "context"), "browseRequest") == null)
+        waitState(() -> (baseline ? idle() : field(paneField("context"), "browseRequest") == null)
                 && path.equals(pathOfLocation()));
     }
 
     private Path pathOfLocation() throws ReflectiveOperationException {
-        var location = (baseline ? field(app, "location") : field(field(app, "context"), "location"));
+        var location = (baseline ? field(app, "location") : field(paneField("context"), "location"));
         return (Path) field(location, "path");
     }
 
     private boolean idle() throws ReflectiveOperationException {
         return baseline ? field(app, "activeTask") == null
-                : field(app, "fileTask") == null && field(field(app, "context"), "browseRequest") == null;
+                : field(app, "fileTask") == null && field(paneField("context"), "browseRequest") == null;
     }
 
     private Button button(String id) { return (Button) scene.lookup("#" + id); }
@@ -258,6 +258,11 @@ final class Phase24FxBenchmark {
             fx(() -> { app.stop(); stage.hide(); return null; });
         }
         Platform.exit();
+    }
+
+    private Object paneField(String name) throws ReflectiveOperationException {
+        try { return field(field(app, "activePane"), name); }
+        catch (NoSuchFieldException beforeDualPane) { return field(app, name); }
     }
 
     private static Object field(Object object, String name) throws ReflectiveOperationException {

@@ -45,6 +45,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -82,6 +83,7 @@ class JavaFxFileOperationsTest {
     private final AtomicReference<Gate> heldMove = new AtomicReference<>();
     private final AtomicInteger browseCommits = new AtomicInteger();
     private final AtomicReference<CompletableFuture<Long>> timedCommit = new AtomicReference<>();
+    private Map<Path, CompletableFuture<Long>> timedPanes = Map.of();
     private Path captures;
 
     @BeforeAll
@@ -112,9 +114,13 @@ class JavaFxFileOperationsTest {
             return null;
         });
         if (app != null) {
-            var watcher = (DirectoryWatcher) field(app, "watcher");
-            assertTrue(watcher.awaitClosed(Duration.ofSeconds(4)));
-            assertEquals(0, watcher.registrationCount());
+            for (boolean right : new boolean[]{false, true}) {
+                Object pane = pane(right);
+                if (pane == null) { continue; }
+                var watcher = (DirectoryWatcher) field(pane, "watcher");
+                assertTrue(watcher.awaitClosed(Duration.ofSeconds(4)));
+                assertEquals(0, watcher.registrationCount());
+            }
             var reader = (ExecutorService) field(app, "clipboardWorker");
             assertTrue(reader.awaitTermination(4, TimeUnit.SECONDS));
         }
@@ -128,7 +134,9 @@ class JavaFxFileOperationsTest {
         fx(() -> {
             var preferences = new MemoryPreferences(null, "");
             if (!automaticRefresh) { preferences.putBoolean("automaticRefresh", false); }
-            if (Boolean.getBoolean("javafx.captureTabs")) { preferences.putBoolean("navigation", false); }
+            if (Boolean.getBoolean("javafx.captureTabs") || Boolean.getBoolean("javafx.capturePanes")) {
+                preferences.putBoolean("navigation", false);
+            }
             app = new FileManagerApp(preferences, this::operation, new FileManagerApp.ReadObserver() {
                 @Override
                 public void ready(Path path, boolean preview) { readReady(path, preview); }
@@ -138,16 +146,566 @@ class JavaFxFileOperationsTest {
                     browseCommits.incrementAndGet();
                     var sample = timedCommit.getAndSet(null);
                     if (sample != null) { sample.complete(System.nanoTime()); }
+                    if (path != null && !timedPanes.isEmpty()) {
+                        var paneSample = timedPanes.get(path);
+                        if (paneSample != null) { paneSample.complete(System.nanoTime()); }
+                    }
                 }
             }, clipboard);
             stage = new Stage();
             stage.setOpacity(0);
             app.start(stage);
             scene = stage.getScene();
-            browser = (BrowserView) field(app, "browser");
+            browser = (BrowserView) field(pane(false), "browser");
             return null;
         });
         await(() -> idle() && field(app, "places") != null, "home page", 35);
+    }
+
+    @Test
+    void dualPaneKeepsIndependentNavigationPresentationAndCommandFocus() throws Exception {
+        Path left = Files.createDirectory(root.resolve("项目资料"));
+        Path child = Files.createDirectory(left.resolve("子目录"));
+        Path right = Files.createDirectory(root.resolve("交付目录"));
+        Path text = Files.writeString(left.resolve("设计说明.txt"), "left");
+        Path log = Files.writeString(left.resolve("notes.log"), "filter this file");
+        Path target = Files.writeString(right.resolve("交付清单.txt"), "right");
+        openWindow(false);
+        go(left);
+        click("dual-pane");
+        await(() -> paneAt(true, left), "right pane starts at the left directory", 12);
+        select(text);
+        assertTrue(fx(() -> button("copy-across").isDisabled()));
+        goPane(true, right);
+        focusPane(true);
+        menu("sortItems", "sort-size");
+        assertEquals(BrowserView.Field.SIZE, fx(() -> paneContext(true).view().sort()));
+        assertEquals(BrowserView.Field.NAME, fx(() -> paneContext(false).view().sort()));
+        clickOnPane(true, "back");
+        await(() -> paneAt(true, left) && paneAt(false, left), "right history is independent", 10);
+        clickOnPane(true, "forward");
+        await(() -> paneAt(true, right), "right forward history", 10);
+        goPane(false, child);
+        clickOnPane(false, "up");
+        await(() -> paneAt(false, left) && paneAt(true, right), "left up preserves right location", 10);
+        fx(() -> {
+            var filters = (ColumnFilters) field(browser, "filters");
+            filters.select(BrowserView.Field.TYPE, new ColumnFilters.Bucket(0, "TXT 文件"), true);
+            call(browser, "applyFilters");
+            assertFalse(listed(log));
+            assertFalse(paneBrowser(true).filtersActive());
+            var search = (TextField) paneControl(true, "search-field");
+            search.requestFocus();
+            search.setText("交付");
+            search.fireEvent(new ActionEvent());
+            return null;
+        });
+        await(() -> activePane() == pane(true) && paneAt(true, right) && paneContext(true).activeQuery.equals("交付")
+                && paneListed(true, target), "right search takes the window command focus", 12);
+        assertTrue(fx(() -> browser.filtersActive() && paneContext(false).activeQuery.isEmpty()));
+        focusPane(false);
+        select(text);
+        assertTrue(fx(() -> button("copy-across").isDisabled()), "search cannot serve as a direct destination");
+        capturePanes("dual-pane.png");
+        fx(() -> {
+            var split = (javafx.scene.control.SplitPane) scene.lookup("#browser-split");
+            split.setDividerPositions(0.58);
+            button("details-pane").fire();
+            stage.setWidth(stage.getMinWidth());
+            return null;
+        });
+        await(() -> {
+            var split = (javafx.scene.control.SplitPane) scene.lookup("#browser-split");
+            return split.getItems().size() == 2 && split.getItems().get(0).getBoundsInParent().getWidth() >= 258
+                    && split.getItems().get(1).getBoundsInParent().getWidth() >= 258
+                    && paneControl(true, "search-field").getBoundsInParent().getWidth() >= 54
+                    && paneControl(true, "address-bar").getBoundsInParent().getMaxX()
+                        <= paneControl(true, "address-bar").getParent().getLayoutBounds().getWidth() + 1;
+        }, "panes remain usable at minimum size", 8);
+        click("new-tab");
+        await(() -> paneAt(false, left) && tabs().getTabs().size() == 2 && paneAt(true, right), "left tabs still work", 10);
+        click("dual-pane");
+        assertTrue(fx(() -> scene.lookup("#right-pane") == null && paneAt(false, left)));
+        click("dual-pane");
+        await(() -> paneAt(true, right) && paneContext(true).activeQuery.equals("交付"), "right state is restored after reopening", 10);
+    }
+
+    @Test
+    void bothReadRequestsOwnTheirPaneAndClosingDiscardsTheLateResult() throws Exception {
+        Path first = Files.createDirectory(root.resolve("first"));
+        Path second = Files.createDirectory(root.resolve("second"));
+        Path leftNext = Files.createDirectory(root.resolve("left-next"));
+        Path rightNext = Files.createDirectory(root.resolve("right-next"));
+        Path leftFile = Files.writeString(leftNext.resolve("left.txt"), "first request");
+        Path rightFile = Files.writeString(rightNext.resolve("right.txt"), "second request");
+        openWindow(false);
+        go(first);
+        click("dual-pane");
+        goPane(true, second);
+        var leftGate = new Gate();
+        var rightGate = new Gate();
+        heldRead.set(new ReadGate(leftNext, false, leftGate));
+        try {
+            enterPane(false, leftNext);
+            assertTrue(leftGate.entered.await(8, TimeUnit.SECONDS));
+            heldRead.set(new ReadGate(rightNext, false, rightGate));
+            enterPane(true, rightNext);
+            assertTrue(rightGate.entered.await(8, TimeUnit.SECONDS));
+            var pendingRight = fx(() -> paneContext(true).browseRequest);
+            focusPane(true);
+            leftGate.release.countDown();
+            await(() -> paneAt(false, leftNext) && paneListed(false, leftFile), "inactive left pane commits its own read", 10);
+            assertSame(pendingRight, fx(() -> paneContext(true).browseRequest));
+            assertSame(fx(() -> pane(true)), fx(this::activePane));
+            click("dual-pane");
+            assertNull(fx(() -> paneContext(true).browseRequest));
+            assertTrue(fx(() -> paneContext(true).listing.items().isEmpty()));
+        } finally {
+            leftGate.release.countDown();
+            rightGate.release.countDown();
+        }
+        assertTrue(rightGate.returned.await(8, TimeUnit.SECONDS));
+        click("dual-pane");
+        await(() -> paneAt(false, leftNext) && paneAt(true, second) && !paneListed(true, rightFile),
+                "reopening reads the last committed right directory", 12);
+    }
+
+    @Test
+    void twoWatchersRefreshDifferentAndSharedDirectoriesAndKeepAnUnrelatedEdit() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("left"));
+        Path right = Files.createDirectory(root.resolve("right"));
+        Path file = Files.writeString(left.resolve("edit.txt"), "original");
+        openWindow(true, new TestClipboard());
+        goWatched(left);
+        click("dual-pane");
+        goPane(true, right);
+        await(() -> paneWatching(false) && paneWatching(true), "both local watchers", 12);
+        focusPane(false);
+        select(file);
+        click("rename");
+        await(() -> scene.lookup("#left-pane").lookup("#new-name-editor") != null, "inline editor", 10);
+        var editor = fx(() -> (TextField) scene.lookup("#left-pane").lookup("#new-name-editor"));
+        fx(() -> { editor.setText("discard-this.txt"); return null; });
+        Path outside = Files.writeString(right.resolve("outside.txt"), "new right file");
+        await(() -> paneListed(true, outside), "inactive right watcher updates", 12);
+        assertSame(editor, fx(() -> scene.lookup("#left-pane").lookup("#new-name-editor")));
+        focusPane(true);
+        assertEquals("original", Files.readString(file));
+        assertFalse(Files.exists(left.resolve("discard-this.txt")));
+        goPane(true, left);
+        await(() -> paneWatching(true) && paneWatching(false), "separate registrations for one directory", 12);
+        Path shared = Files.writeString(left.resolve("shared.txt"), "seen from both");
+        await(() -> paneListed(false, shared) && paneListed(true, shared), "external change in both panes", 12);
+        assertTrue(watcher(false).registrationCount() + watcher(true).registrationCount() <= 4);
+
+        toggleAutoRefresh(false);
+        focusPane(false);
+        select(shared);
+        click("copy");
+        await(() -> idle() && cutSources().equals(List.of(shared)), "shared source selected", 10);
+        focusPane(true);
+        click("paste");
+        Path copy = left.resolve("shared - 副本.txt");
+        await(() -> paneListed(false, copy) && paneListed(true, copy), "write receipt refreshes both with watching disabled", 12);
+        assertEquals("seen from both", Files.readString(copy));
+        toggleAutoRefresh(true);
+        await(() -> paneWatching(false) && paneWatching(true), "re-enable both watches", 12);
+        click("dual-pane");
+        await(() -> watcher(true).registrationCount() == 0 && watcher(false).registrationCount() > 0,
+                "closing right releases its registrations", 8);
+        Path later = Files.writeString(left.resolve("later.txt"), "left still watches");
+        await(() -> paneListed(false, later), "left retains its watcher", 10);
+    }
+
+    @Test
+    void closingTheRightPaneDiscardsItsPreviewAndReopeningRechecksDirectoryIdentity() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("left"));
+        Path right = Files.createDirectory(root.resolve("right"));
+        Path first = Files.writeString(left.resolve("excerpt.txt"), "left preview");
+        Path second = Files.writeString(right.resolve("excerpt.txt"), "right preview");
+        openWindow(true);
+        goWatched(left);
+        click("dual-pane");
+        goPane(true, right);
+        await(() -> paneWatching(true) && paneAt(true, right), "right directory watched", 12);
+        focusPane(false);
+        select(first);
+        menu("viewItems", "show-preview");
+        await(() -> previewText().equals("left preview"), "left preview", 10);
+        focusPane(true);
+        fx(() -> { assertTrue(paneBrowser(true).reveal(second)); return null; });
+        await(() -> !paneContext(true).selectionProof.isEmpty(), "right selection verified", 10);
+        var oldIdentity = fx(() -> paneContext(true).directoryIdentity);
+        var preview = new Gate();
+        heldRead.set(new ReadGate(second, true, preview));
+        try {
+            menu("viewItems", "show-preview");
+            assertTrue(preview.entered.await(8, TimeUnit.SECONDS));
+            focusPane(false);
+            assertEquals("left preview", fx(this::previewText));
+            click("dual-pane");
+            assertNull(fx(() -> paneContext(true).previewTask));
+            assertEquals("left preview", fx(this::previewText));
+        } finally {
+            preview.release.countDown();
+        }
+        assertTrue(preview.returned.await(8, TimeUnit.SECONDS));
+        await(() -> watcher(true).registrationCount() == 0, "closed right watcher released", 8);
+        Path saved = Files.move(right, root.resolve("saved"));
+        Files.createDirectory(right);
+        Files.writeString(second, "replacement preview");
+        click("dual-pane");
+        await(() -> paneAt(true, right) && paneListed(true, second) && paneWatching(true)
+                && !oldIdentity.equals(paneContext(true).directoryIdentity), "reopened right directory verified", 12);
+        focusPane(true);
+        assertTrue(fx(() -> paneBrowser(true).selection().isEmpty() && previewText().isEmpty()));
+        assertEquals("right preview", Files.readString(saved.resolve("excerpt.txt")));
+        fx(() -> { assertTrue(paneBrowser(true).reveal(second)); return null; });
+        await(() -> previewText().equals("replacement preview"), "new deliberate selection", 10);
+        focusPane(false);
+        assertEquals("left preview", fx(this::previewText));
+    }
+
+    @Test
+    void clipboardWorksInBothDirectionsAndDirectTransferKeepsItsVersion() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("left"));
+        Path right = Files.createDirectory(root.resolve("right"));
+        Path copyLeft = Files.writeString(left.resolve("left-copy.txt"), "left copy");
+        Path cutLeft = Files.writeString(left.resolve("left-move.txt"), "left move");
+        Path copyRight = Files.writeString(right.resolve("right-copy.txt"), "right copy");
+        Path cutRight = Files.writeString(right.resolve("right-move.txt"), "right move");
+        Path directCopy = Files.writeString(left.resolve("direct-copy.txt"), "direct copy");
+        Path directMove = Files.writeString(right.resolve("direct-move.txt"), "direct move");
+        var clipboard = new TestClipboard();
+        openWindow(false, clipboard);
+        go(left);
+        click("dual-pane");
+        goPane(true, right);
+        clipboardAcross(false, copyLeft, false, right);
+        clipboardAcross(true, copyRight, false, left);
+        clipboardAcross(false, cutLeft, true, right);
+        clipboardAcross(true, cutRight, true, left);
+        var state = clipboard.text("clipboard before direct transfer");
+        await(() -> state.equals(field(app, "clipboardState")), "window observes clipboard fixture", 10);
+        focusPane(false);
+        select(directCopy);
+        fx(() -> { shortcut(browser, KeyCode.F5, true); return null; });
+        Path copyResult = right.resolve(directCopy.getFileName());
+        await(() -> idle() && paneListed(true, copyResult), "direct copy into inactive pane", 12);
+        assertEquals(Files.readString(directCopy), Files.readString(copyResult));
+        focusPane(true);
+        fx(() -> { assertTrue(paneBrowser(true).reveal(directMove)); return null; });
+        click("move-across");
+        Path moveResult = left.resolve(directMove.getFileName());
+        await(() -> idle() && paneListed(false, moveResult) && !paneListed(true, directMove), "direct move", 12);
+        assertEquals(state, clipboard.probe());
+        assertEquals("clipboard before direct transfer", clipboard.textValue());
+        focusPane(false);
+        menu("moreItems", "undo");
+        await(() -> idle() && paneListed(true, directMove) && !paneListed(false, moveResult), "shared undo", 12);
+        assertEquals("direct move", Files.readString(directMove));
+        assertEquals(state, clipboard.probe());
+    }
+
+    @Test
+    void transferKeepsFrozenTargetDuringPastePreparationAndClosingTheDestination() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("左侧资料"));
+        Path right = Files.createDirectory(root.resolve("右侧目标"));
+        Path elsewhere = Files.createDirectory(root.resolve("观察"));
+        Path old = Files.writeString(left.resolve("准备.txt"), "paste payload");
+        Path write = Files.writeString(left.resolve("后台复制.txt"), "direct payload");
+        var clipboard = new TestClipboard();
+        openWindow(false, clipboard);
+        go(left);
+        click("dual-pane");
+        goPane(true, right);
+        focusPane(false);
+        select(old);
+        click("copy");
+        await(() -> cutSources().equals(List.of(old)) && idle(), "copy entries recorded", 10);
+        focusPane(true);
+        var reading = new Gate();
+        clipboard.nextRead.set(() -> { reading.hold(); return clipboard.snapshot(); });
+        try {
+            click("paste");
+            assertTrue(reading.entered.await(8, TimeUnit.SECONDS));
+            focusPane(false);
+        } finally {
+            reading.release.countDown();
+        }
+        await(() -> idle() && paneListed(true, right.resolve(old.getFileName())), "paste retains right target from request", 12);
+        select(write);
+        var commit = new Gate();
+        var preparation = new Gate();
+        heldPublish.set(commit);
+        try {
+            ((ExecutorService) fx(() -> field(app, "writes"))).execute(preparation::hold);
+            assertTrue(preparation.entered.await(8, TimeUnit.SECONDS));
+            click("copy-across");
+            goPane(true, elsewhere);
+            focusPane(true);
+            preparation.release.countDown();
+            assertTrue(commit.entered.await(8, TimeUnit.SECONDS));
+            assertTrue(fx(() -> paneAt(true, elsewhere)));
+            goPane(true, right);
+            capturePanes("dual-transfer.png");
+            click("dual-pane");
+            assertTrue(fx(() -> scene.lookup("#right-pane") == null));
+        } finally {
+            preparation.release.countDown();
+            commit.release.countDown();
+        }
+        Path published = right.resolve(write.getFileName());
+        await(() -> idle() && Files.exists(published), "task commits after target pane closes", 12);
+        assertEquals("direct payload", Files.readString(published));
+        assertEquals("paste payload", Files.readString(right.resolve(old.getFileName())));
+        assertFalse(Files.exists(elsewhere.resolve(write.getFileName())));
+        assertTrue(fx(() -> published.getParent().equals(right) && paneAt(false, left)));
+        assertEquals(List.of(old), fx(this::cutSources));
+    }
+
+    @Test
+    void crossPaneConflictRetainsPartialResultsAndRejectsDescendantTargets() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("left"));
+        Path right = Files.createDirectory(root.resolve("right"));
+        Path one = Files.writeString(left.resolve("a.txt"), "already succeeds");
+        Path two = Files.writeString(left.resolve("b.txt"), "copy source");
+        Path original = Files.writeString(right.resolve("b.txt"), "old target");
+        Path descendant = Files.createDirectories(left.resolve("structure/child"));
+        openWindow(false, new TestClipboard());
+        go(left);
+        click("dual-pane");
+        goPane(true, right);
+        focusPane(false);
+        fx(() -> { browser.selectAll(); return null; });
+        click("copy-across");
+        await(() -> conflictScene() != null && Files.exists(right.resolve(one.getFileName())), "some files written before conflict", 12);
+        focusPane(true);
+        goPane(true, descendant);
+        focusPane(false);
+        chooseConflict("conflict-skip");
+        await(() -> idle() && paneAt(true, descendant) && progressLabel("operation-details").contains("已跳过 1 项"),
+                "navigation survives conflict resolution", 12);
+        assertEquals("old target", Files.readString(original));
+        assertEquals("copy source", Files.readString(two));
+        assertTrue(Files.isDirectory(right.resolve("structure/child")));
+        select(left.resolve("structure"));
+        click("copy-across");
+        acknowledgeFileError();
+        assertFalse(Files.exists(descendant.resolve("structure")));
+        assertTrue(fx(() -> paneAt(false, left) && paneAt(true, descendant)));
+    }
+
+    @Test
+    void rightPaneCanCloseDuringDirectMoveAndWindowKeepsUndoAndUnknownResults() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("left"));
+        Path right = Files.createDirectory(root.resolve("right"));
+        Path source = Files.writeString(right.resolve("move.txt"), "source payload");
+        Path target = left.resolve(source.getFileName());
+        var clipboard = new TestClipboard();
+        var originalClipboard = clipboard.text("from another application");
+        openWindow(false, clipboard);
+        go(left);
+        click("dual-pane");
+        goPane(true, right);
+        focusPane(true);
+        fx(() -> { assertTrue(paneBrowser(true).reveal(source)); return null; });
+        var move = new Gate();
+        heldMove.set(move);
+        try {
+            fx(() -> { shortcut(paneBrowser(true), KeyCode.F6, true); return null; });
+            assertTrue(move.entered.await(8, TimeUnit.SECONDS));
+            click("dual-pane");
+        } finally {
+            move.release.countDown();
+        }
+        await(() -> idle() && paneListed(false, target), "move survives closing the source pane", 12);
+        assertFalse(Files.exists(source));
+        assertEquals("source payload", Files.readString(target));
+        Files.writeString(target, "latest payload");
+        menu("moreItems", "undo");
+        await(() -> idle() && !paneListed(false, target) && Files.exists(source), "undo moves the latest bytes back", 12);
+        assertEquals("latest payload", Files.readString(source));
+        click("dual-pane");
+        await(() -> paneAt(true, right) && paneListed(true, source), "right rebuilds from disk after undo", 12);
+        focusPane(true);
+        fx(() -> { assertTrue(paneBrowser(true).reveal(source)); return null; });
+        loseMoveReceipt.set(true);
+        click("move-across");
+        acknowledgeFileError();
+        await(() -> idle() && paneListed(false, target) && !paneListed(true, source), "both panes reread uncertain move", 12);
+        assertEquals("latest payload", Files.readString(target));
+        assertFalse(Files.exists(source));
+        assertEquals(1, injectedWrites.get());
+        assertTrue(fx(() -> ((List<?>) field(app, "undo")).isEmpty()
+                && ((List<?>) field(app, "unknownOperations")).size() == 1
+                && activePane() == pane(true)));
+        assertEquals(originalClipboard, clipboard.probe());
+    }
+
+    @Test
+    void directCopyRefusesAReplacedTargetAndCanCancelActiveStaging() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("left"));
+        Path right = Files.createDirectory(root.resolve("right"));
+        Path payload = Files.write(left.resolve("sample.bin"), new byte[12 * 1024 * 1024]);
+        openWindow(false);
+        go(left);
+        click("dual-pane");
+        goPane(true, right);
+        focusPane(false);
+        select(payload);
+        var preparation = new Gate();
+        try {
+            ((ExecutorService) fx(() -> field(app, "writes"))).execute(preparation::hold);
+            assertTrue(preparation.entered.await(8, TimeUnit.SECONDS));
+            click("copy-across");
+            Files.move(right, root.resolve("original-target"));
+            Files.createDirectory(right);
+        } finally {
+            preparation.release.countDown();
+        }
+        acknowledgeFileError();
+        assertFalse(Files.exists(right.resolve(payload.getFileName())));
+        assertFalse(Files.exists(root.resolve("original-target").resolve(payload.getFileName())));
+
+        Path foreign = Files.writeString(right.resolve(".file-manager-neighbor.txt"), "outside the copy task");
+        goPane(true, right);
+        focusPane(false);
+        pauseNativeCopy.set(true);
+        try {
+            click("copy-across");
+            assertTrue(copyHasBytes.await(10, TimeUnit.SECONDS));
+            clickOnPane(true, "refresh");
+            await(() -> paneAt(true, right) && paneListed(true, foreign) && progressScene() != null,
+                    "target can be browsed during the staged copy", 10);
+            assertEquals(List.of(foreign), fx(() -> paneBrowser(true).items().stream().map(BrowserItem::path).toList()));
+            fx(() -> {
+                ((Button) progressScene().lookup("#operation-action")).fire();
+                assertTrue(((FileOperationTask) field(app, "activeFileOperation")).cancellationRequested());
+                return null;
+            });
+        } finally {
+            releaseCopy.countDown();
+        }
+        await(() -> idle() && "已取消".equals(progressLabel("operation-stage")), "cancelled direct copy", 10);
+        try (var paths = Files.list(right)) { assertEquals(List.of(foreign), paths.toList()); }
+        assertEquals("outside the copy task", Files.readString(foreign));
+        assertEquals(12L * 1024 * 1024, Files.size(payload));
+    }
+
+    @Test
+    void directMoveRefusesADifferentNtfsVolume() throws Exception {
+        String fixtureParent = System.getProperty("javafx.secondaryNtfsParent");
+        assumeTrue(fixtureParent != null, "requires -Djavafx.secondaryNtfsParent on a different NTFS volume");
+        var local = NtfsFileOperations.captureDirectory(root);
+        Path secondary = Path.of(fixtureParent);
+        var other = NtfsFileOperations.captureDirectory(secondary);
+        assumeTrue(local != null && other != null && local.id().volume() != other.id().volume(),
+                "requires two local NTFS volumes");
+        Path source = Files.writeString(root.resolve("cross-volume.txt"), "kept on the source volume");
+        Path target = Files.createTempDirectory(secondary, "phase31-cross-volume-");
+        Path unexpected = target.resolve(source.getFileName());
+        try {
+            openWindow(false);
+            go(root);
+            click("dual-pane");
+            goPane(true, target);
+            focusPane(false);
+            select(source);
+            click("move-across");
+            acknowledgeFileError();
+            assertEquals("kept on the source volume", Files.readString(source));
+            assertFalse(Files.exists(unexpected));
+            assertNull(fx(() -> field(app, "activeFileOperation")));
+        } finally {
+            Files.deleteIfExists(unexpected);
+            Files.delete(target);
+        }
+    }
+
+    private BrowseContext paneContext(boolean right) throws Exception { return (BrowseContext) field(pane(right), "context"); }
+    private BrowserView paneBrowser(boolean right) throws Exception { return (BrowserView) field(pane(right), "browser"); }
+    private DirectoryWatcher watcher(boolean right) throws Exception { return (DirectoryWatcher) field(pane(right), "watcher"); }
+
+    private boolean paneAt(boolean right, Path directory) throws Exception {
+        var context = paneContext(right);
+        return context.browseRequest == null && !context.needsReload && directory.equals(context.location.path());
+    }
+
+    private boolean paneListed(boolean right, Path path) throws Exception {
+        return paneBrowser(right).items().stream().anyMatch(item -> path.equals(item.path()));
+    }
+
+    private boolean paneWatching(boolean right) throws Exception {
+        return "自动刷新已开启".equals(field(pane(right), "watchText"));
+    }
+
+    private javafx.scene.Node paneControl(boolean right, String id) throws Exception {
+        return ((javafx.scene.Parent) field(pane(right), "navigation")).lookup("#" + id);
+    }
+
+    private void clickOnPane(boolean right, String id) throws Exception {
+        fx(() -> { ((Button) paneControl(right, id)).fire(); return null; });
+    }
+
+    private void enterPane(boolean right, Path directory) throws Exception {
+        fx(() -> { enterPaneAddress(right, directory); return null; });
+    }
+
+    private void enterPaneAddress(boolean right, Path directory) throws Exception {
+        var bar = (AddressBar) field(pane(right), "address");
+        bar.beginEdit();
+        var editor = (TextField) bar.lookup("#address");
+        editor.setText(directory.toString());
+        editor.fireEvent(new ActionEvent());
+    }
+
+    private void goPane(boolean right, Path directory) throws Exception {
+        enterPane(right, directory);
+        await(() -> paneAt(right, directory), "pane reads " + directory, 12);
+    }
+
+    private void focusPane(boolean right) throws Exception {
+        fx(() -> {
+            if (activePane() != pane(right)) {
+                Event.fireEvent(scene.getRoot(), new KeyEvent(KeyEvent.KEY_PRESSED, "", "", KeyCode.F6,
+                        false, false, false, false));
+            }
+            assertSame(pane(right), activePane());
+            return null;
+        });
+    }
+
+    private void clipboardAcross(boolean right, Path file, boolean move, Path target) throws Exception {
+        String payload = Files.readString(file);
+        focusPane(right);
+        fx(() -> { assertTrue(paneBrowser(right).reveal(file)); return null; });
+        click(move ? "cut" : "copy");
+        await(() -> idle() && cutSources().equals(List.of(file)), "clipboard intent inherited by the other pane", 10);
+        focusPane(!right);
+        click("paste");
+        Path result = target.resolve(file.getFileName());
+        await(() -> idle() && paneListed(!right, result), "cross-pane clipboard result", 12);
+        assertEquals(!move, Files.exists(file));
+        assertEquals(payload, Files.readString(result));
+    }
+
+    private void capturePanes(String name) throws Exception {
+        if (!Boolean.getBoolean("javafx.capturePanes")) { return; }
+        if (captures == null) { captures = Files.createTempDirectory("phase31-fx-"); }
+        var snapshot = fx(() -> scene.snapshot(null));
+        var picture = new BufferedImage((int) snapshot.getWidth(), (int) snapshot.getHeight(), BufferedImage.TYPE_INT_ARGB);
+        copyPixels(snapshot, picture, 0);
+        Path file = captures.resolve(name);
+        assertTrue(ImageIO.write(picture, "png", file.toFile()));
+        System.out.println("PHASE31_SCREENSHOT " + file);
     }
 
     @Test
@@ -378,7 +936,7 @@ class JavaFxFileOperationsTest {
                 "directory identity replaced while dormant", 15);
         assertEquals("new identity", Files.readString(selected));
         assertEquals("old", Files.readString(root.resolve("prior/original.txt")));
-        var watcher = (DirectoryWatcher) field(app, "watcher");
+        var watcher = (DirectoryWatcher) field(pane(false), "watcher");
         assertTrue(watcher.registrationCount() <= 2);
     }
 
@@ -492,6 +1050,129 @@ class JavaFxFileOperationsTest {
         assertFalse(Files.exists(second));
         assertEquals("source", Files.readString(root.resolve("review/b.txt")));
         assertTrue(fx(() -> scene.lookup("#unknown-results").isVisible()));
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "javafx.paneBenchmark", matches = "true")
+    void measureDualPaneLatencyAndRetainedResources() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path leftSmall = Files.createDirectory(root.resolve("left-small"));
+        Path rightSmall = Files.createDirectory(root.resolve("right-small"));
+        Path leftLarge = Files.createDirectory(root.resolve("left-large"));
+        Path rightLarge = Files.createDirectory(root.resolve("right-large"));
+        for (int i = 0; i < 10_000; i++) {
+            String name = "item-%05d.txt".formatted(i);
+            Files.createFile(leftLarge.resolve(name));
+            Files.createFile(rightLarge.resolve(name));
+            if (i < 100) {
+                Files.createFile(leftSmall.resolve(name));
+                Files.createFile(rightSmall.resolve(name));
+            }
+        }
+        Path payload = Files.write(leftSmall.resolve("sample.bin"), new byte[24 * 1024 * 1024]);
+        openWindow(true, new TestClipboard());
+        goWatched(leftLarge);
+        long singleHeap = usedHeap();
+        int singleWorkers = workerThreads();
+        int singleWatches = watcher(false).registrationCount();
+        click("dual-pane");
+        goPane(true, rightSmall);
+        for (int i = 0; i < 3; i++) {
+            timePaneReads(leftSmall, rightSmall);
+            timePaneReads(leftLarge, rightLarge);
+        }
+        var smallLeft = new ArrayList<Long>();
+        var smallRight = new ArrayList<Long>();
+        var largeLeft = new ArrayList<Long>();
+        var largeRight = new ArrayList<Long>();
+        for (int i = 0; i < 5; i++) {
+            var small = timePaneReads(leftSmall, rightSmall);
+            var large = timePaneReads(leftLarge, rightLarge);
+            smallLeft.add(small.get(0));
+            smallRight.add(small.get(1));
+            largeLeft.add(large.get(0));
+            largeRight.add(large.get(1));
+        }
+        await(() -> paneWatching(false) && paneWatching(true), "two large directories watched", 12);
+        assertEquals(10_000, fx(() -> paneBrowser(false).items().size()));
+        assertEquals(10_000, fx(() -> paneBrowser(true).items().size()));
+        long dualHeap = usedHeap();
+        int dualWorkers = workerThreads();
+        int dualWatches = watcher(false).registrationCount() + watcher(true).registrationCount();
+        var openSamples = new ArrayList<Long>();
+        var closeSamples = new ArrayList<Long>();
+        for (int i = 0; i < 10; i++) {
+            closeSamples.add(timePaneToggle(false));
+            await(() -> watcher(true).registrationCount() == 0, "right releases keys after closing", 10);
+            assertTrue(fx(() -> paneContext(true).listing.items().isEmpty()));
+            openSamples.add(timePaneToggle(true));
+            await(() -> paneAt(true, rightLarge) && paneWatching(true), "right reopens with the current listing", 12);
+        }
+        int repeatedWorkers = workerThreads();
+        int repeatedWatches = watcher(false).registrationCount() + watcher(true).registrationCount();
+        assertEquals(dualWorkers, repeatedWorkers);
+        assertEquals(dualWatches, repeatedWatches);
+        assertEquals(1, fx(() -> java.util.Collections.frequency(
+                ((javafx.scene.Node) field(pane(true), "navigation")).getStyleClass(), "split-navigation")));
+        click("dual-pane");
+        await(() -> watcher(true).registrationCount() == 0, "single pane registrations restored", 10);
+        long closedHeap = usedHeap();
+        int closedWatches = watcher(false).registrationCount() + watcher(true).registrationCount();
+        assertEquals(singleWatches, closedWatches);
+        click("dual-pane");
+        goPane(false, leftSmall);
+        goPane(true, rightSmall);
+        focusPane(false);
+        select(payload);
+        var copy = new Gate();
+        heldPublish.set(copy);
+        List<Long> copying;
+        try {
+            click("copy-across");
+            assertTrue(copy.entered.await(10, TimeUnit.SECONDS));
+            copying = timePaneReads(leftLarge, rightLarge);
+        } finally {
+            copy.release.countDown();
+        }
+        Path copied = rightSmall.resolve(payload.getFileName());
+        await(() -> idle() && Files.exists(copied), "copy completes in the original target", 12);
+        assertEquals(-1, Files.mismatch(payload, copied));
+        System.out.printf(java.util.Locale.ROOT,
+                "PHASE31_BENCH open=%s close=%s smallLeft=%s smallRight=%s largeLeft=%s largeRight=%s copyBrowse=%s "
+                        + "heapMiB=%.2f,%.2f,%.2f workers=%d,%d,%d registrations=%d,%d,%d,%d%n",
+                milliseconds(openSamples), milliseconds(closeSamples), milliseconds(smallLeft), milliseconds(smallRight),
+                milliseconds(largeLeft), milliseconds(largeRight), milliseconds(copying),
+                singleHeap / 1048576.0, dualHeap / 1048576.0, closedHeap / 1048576.0,
+                singleWorkers, dualWorkers, repeatedWorkers, singleWatches, dualWatches, repeatedWatches, closedWatches);
+    }
+
+    private List<Long> timePaneReads(Path left, Path right) throws Exception {
+        var leftDone = new CompletableFuture<Long>();
+        var rightDone = new CompletableFuture<Long>();
+        long start = fx(() -> {
+            timedPanes = Map.of(left, leftDone, right, rightDone);
+            long now = System.nanoTime();
+            enterPaneAddress(false, left);
+            enterPaneAddress(true, right);
+            return now;
+        });
+        try {
+            return List.of(leftDone.get(20, TimeUnit.SECONDS) - start, rightDone.get(20, TimeUnit.SECONDS) - start);
+        } finally {
+            fx(() -> { timedPanes = Map.of(); return null; });
+        }
+    }
+
+    private long timePaneToggle(boolean open) throws Exception {
+        return fx(() -> {
+            long start = System.nanoTime();
+            button("dual-pane").fire();
+            scene.getRoot().applyCss();
+            scene.getRoot().layout();
+            long elapsed = System.nanoTime() - start;
+            assertEquals(open, scene.lookup("#right-pane") != null);
+            return elapsed;
+        });
     }
 
     @Test
@@ -741,12 +1422,13 @@ class JavaFxFileOperationsTest {
             var filters = (ColumnFilters) field(browser, "filters");
             filters.select(BrowserView.Field.TYPE, new ColumnFilters.Bucket(0, "TXT 文件"), true);
             call(browser, "applyFilters");
-            var sort = FileManagerApp.class.getDeclaredMethod("sort", BrowserView.Field.class, boolean.class);
+            var pane = activePane();
+            var sort = pane.getClass().getDeclaredMethod("sort", BrowserView.Field.class, boolean.class);
             sort.setAccessible(true);
-            sort.invoke(app, BrowserView.Field.NAME, true);
-            var group = FileManagerApp.class.getDeclaredMethod("group", BrowserView.Field.class);
+            sort.invoke(pane, BrowserView.Field.NAME, true);
+            var group = pane.getClass().getDeclaredMethod("group", BrowserView.Field.class);
             group.setAccessible(true);
-            group.invoke(app, BrowserView.Field.TYPE);
+            group.invoke(pane, BrowserView.Field.TYPE);
             scene.getRoot().applyCss();
             scene.getRoot().layout();
             entriesFlow().scrollToTop(55);
@@ -827,7 +1509,7 @@ class JavaFxFileOperationsTest {
         await(() -> browseAt(second) && watching() && status().contains("0 个项目"), "directory restored", 10);
 
         var current = fx(() -> (DirectoryWatcher.Target) field(currentBrowse(), "watchTarget"));
-        var watcher = (DirectoryWatcher) field(app, "watcher");
+        var watcher = (DirectoryWatcher) field(pane(false), "watcher");
         watcher.pause();
         await(() -> watcher.registrationCount() == 0, "pause native delivery for injected overflow", 8);
         Path missed = Files.writeString(second.resolve("lost-event.txt"), "only visible after a full reread");
@@ -1292,9 +1974,10 @@ class JavaFxFileOperationsTest {
     private void context(Path path, String id) throws Exception {
         fx(() -> {
             var clicked = browser.items().stream().filter(item -> path.equals(item.path())).findFirst().orElseThrow();
-            var build = FileManagerApp.class.getDeclaredMethod("contextMenu", BrowserItem.class);
+            Object pane = activePane();
+            var build = FileManagerApp.class.getDeclaredMethod("contextMenu", pane.getClass(), BrowserItem.class);
             build.setAccessible(true);
-            var items = ((ContextMenu) build.invoke(app, clicked)).getItems();
+            var items = ((ContextMenu) build.invoke(app, pane, clicked)).getItems();
             var command = items.stream().filter(item -> id.equals(item.getId())).findFirst().orElseThrow();
             assertFalse(command.isDisable(), id);
             command.fire();
@@ -1866,7 +2549,7 @@ class JavaFxFileOperationsTest {
 
     private void toggleAutoRefresh(boolean enabled) throws Exception {
         fx(() -> {
-            for (Object item : (List<?>) call(app, "viewItems")) {
+            for (Object item : (List<?>) call(activePane(), "viewItems")) {
                 if (item instanceof CheckMenuItem entry && "auto-refresh".equals(entry.getId())) {
                     entry.setSelected(enabled);
                     entry.fire();
@@ -1915,7 +2598,8 @@ class JavaFxFileOperationsTest {
 
     private void menu(String getter, String command) throws Exception {
         fx(() -> {
-            for (Object item : (List<?>) call(app, getter)) {
+            Object owner = List.of("viewItems", "sortItems").contains(getter) ? activePane() : app;
+            for (Object item : (List<?>) call(owner, getter)) {
                 if (item instanceof MenuItem entry && command.equals(entry.getId())) {
                     assertFalse(entry.isDisable());
                     entry.fire();
@@ -1973,7 +2657,11 @@ class JavaFxFileOperationsTest {
         return future.get(12, TimeUnit.SECONDS);
     }
 
-    private BrowseContext currentBrowse() throws Exception { return (BrowseContext) field(app, "context"); }
+    private BrowseContext currentBrowse() throws Exception { return (BrowseContext) field(activePane(), "context"); }
+
+    private Object activePane() throws Exception { return field(app, "activePane"); }
+
+    private Object pane(boolean right) throws Exception { return field(app, right ? "rightPane" : "leftPane"); }
 
     private static Object field(Object value, String name) throws Exception {
         Field field = value.getClass().getDeclaredField(name);

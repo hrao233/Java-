@@ -184,7 +184,7 @@ final class BrowserView extends StackPane {
     private static final PseudoClass CUT_FILE = PseudoClass.getPseudoClass("cut-file");
     private final Set<BrowserItem> selected = new LinkedHashSet<>();
     private Set<BrowserItem> cutItems = Set.of();
-    private final Map<String, Image> thumbnails = new LinkedHashMap<>(64, 0.75f, true);
+    private final Map<String, Image> thumbnails;
     private final SystemIcons icons;
     private final Runnable onSelection;
     private final Consumer<BrowserItem> onOpen;
@@ -209,10 +209,11 @@ final class BrowserView extends StackPane {
     private ScrollBar tileScrollBar;
     private boolean homeFilesExpanded = true;
 
-    BrowserView(SystemIcons icons, Runnable onSelection, Consumer<BrowserItem> onOpen, BiConsumer<Field, Boolean> onSort,
+    BrowserView(SystemIcons icons, Map<String, Image> thumbnails, Runnable onSelection, Consumer<BrowserItem> onOpen, BiConsumer<Field, Boolean> onSort,
                 Function<BrowserItem, ContextMenu> onContext, Runnable onFiltersChanged, Supplier<Region> homeHeader,
                 Runnable onEditFinished) {
         this.icons = icons;
+        this.thumbnails = thumbnails;
         this.onSelection = onSelection;
         this.onOpen = onOpen;
         this.onSort = onSort;
@@ -433,7 +434,11 @@ final class BrowserView extends StackPane {
             }
         });
         field.focusedProperty().addListener((observable, focused, nowFocused) -> {
-            if (focused && !nowFocused && field.getScene() != null) { finishName(edit, field.getText(), true); }
+            if (focused && !nowFocused && field.getScene() != null) {
+                String text = field.getText();
+                // Process the focus transition first so a pane switch can cancel this edit.
+                Platform.runLater(() -> finishName(edit, text, true));
+            }
         });
         Platform.runLater(() -> {
             if (nameEdit == edit && field.getScene() != null) {

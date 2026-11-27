@@ -57,6 +57,47 @@
     -fx-border-color: transparent transparent #dfe8ea transparent;
 }
 
+.browser-split {
+    -fx-padding: 0;
+    -fx-background-insets: 0;
+}
+
+.browser-split > .split-pane-divider {
+    -fx-padding: 0 3;
+    -fx-background-color: #ccd6d7;
+    -fx-background-insets: 0 2 0 3;
+    -fx-cursor: h-resize;
+}
+
+.browser-split > .split-pane-divider:hover {
+    -fx-background-color: #58a297;
+}
+
+.split-navigation {
+    -fx-padding: 6 8 8;
+    -fx-spacing: 6;
+    -fx-border-width: 2 0 1;
+    -fx-border-color: #dce6e8 transparent #dfe8ea;
+}
+
+.split-navigation .nav-button {
+    -fx-pref-width: 28;
+}
+
+.browser-heading {
+    -fx-text-fill: #486167;
+    -fx-font-weight: bold;
+}
+
+.browser-pane:active-browser .split-navigation {
+    -fx-border-color: #31897b transparent #d5e4e4;
+    -fx-background-color: #f1f8f6;
+}
+
+.browser-pane:active-browser .browser-heading {
+    -fx-text-fill: #176653;
+}
+
 .command-bar {
     -fx-padding: 6 16;
     -fx-background-color: #f1f7f6;

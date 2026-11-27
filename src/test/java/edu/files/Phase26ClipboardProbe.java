@@ -126,7 +126,7 @@ public final class Phase26ClipboardProbe {
     private void copy(Path from, boolean cut) throws Exception {
         go(from);
         fx(() -> {
-            var browser = (BrowserView) field(app, "browser");
+            var browser = (BrowserView) field(field(app, "activePane"), "browser");
             browser.selectAll();
             require(!button(cut ? "cut" : "copy").isDisabled(), "copy command unavailable");
             button(cut ? "cut" : "copy").fire();
@@ -150,7 +150,7 @@ public final class Phase26ClipboardProbe {
         go(target);
         await(() -> !button("paste").isDisabled() && idle());
         fx(() -> { button("paste").fire(); return null; });
-        await(() -> idle() && ((BrowserView) field(app, "browser")).items().size() > 0);
+        await(() -> idle() && ((BrowserView) field(field(app, "activePane"), "browser")).items().size() > 0);
         try (var files = Files.walk(expectedSource)) {
             for (Path item : files.toList()) {
                 Path copy = target.resolve(expectedSource.relativize(item));
@@ -299,7 +299,7 @@ public final class Phase26ClipboardProbe {
 
     private Button button(String name) { return (Button) scene.lookup("#" + name); }
     private boolean idle() throws Exception {
-        return field(field(app, "context"), "browseRequest") == null && field(app, "fileTask") == null && field(app, "clipboardCommand") == null;
+        return field(field(field(app, "activePane"), "context"), "browseRequest") == null && field(app, "fileTask") == null && field(app, "clipboardCommand") == null;
     }
 
     private static Object field(Object target, String name) throws Exception {

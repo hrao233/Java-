@@ -125,7 +125,7 @@ final class Phase25WatchBenchmark {
             stage.setOpacity(0);
             app.start(stage);
             scene = stage.getScene();
-            browser = (BrowserView) field(app, "browser");
+            browser = (BrowserView) paneField("browser");
             return null;
         });
         await(() -> field(app, "places") != null && idle());
@@ -286,7 +286,7 @@ final class Phase25WatchBenchmark {
     }
 
     private void stop() throws Exception {
-        var watcher = automatic ? (DirectoryWatcher) field(app, "watcher") : null;
+        var watcher = automatic ? (DirectoryWatcher) paneField("watcher") : null;
         fx(() -> { app.stop(); stage.hide(); return null; });
         app = null;
         if (watcher != null) {
@@ -319,7 +319,7 @@ final class Phase25WatchBenchmark {
     }
 
     private int keys() throws Exception {
-        return automatic ? ((DirectoryWatcher) field(app, "watcher")).registrationCount() : 0;
+        return automatic ? ((DirectoryWatcher) paneField("watcher")).registrationCount() : 0;
     }
 
     private int handles() {
@@ -329,11 +329,16 @@ final class Phase25WatchBenchmark {
     }
 
     private boolean listed(Path path) { return browser.items().stream().anyMatch(item -> path.equals(item.path())); }
-    private boolean idle() throws Exception { return ((BrowseContext) field(app, "context")).browseRequest == null; }
+    private boolean idle() throws Exception { return ((BrowseContext) paneField("context")).browseRequest == null; }
     private void refresh() throws Exception { fx(() -> { button("refresh").fire(); return null; }); }
     private Button button(String name) { return (Button) scene.lookup("#" + name); }
-    private static Object field(FileManagerApp app, String name) throws Exception {
-        var field = FileManagerApp.class.getDeclaredField(name);
+    private Object paneField(String name) throws Exception {
+        try { return field(field(app, "activePane"), name); }
+        catch (NoSuchFieldException beforeDualPane) { return field(app, name); }
+    }
+
+    private static Object field(Object app, String name) throws Exception {
+        var field = app.getClass().getDeclaredField(name);
         field.setAccessible(true);
         return field.get(app);
     }
