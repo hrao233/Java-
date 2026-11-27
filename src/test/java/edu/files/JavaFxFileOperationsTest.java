@@ -15,6 +15,8 @@ import javafx.scene.control.ContextMenu;
 import javafx.scene.control.DialogPane;
 import javafx.scene.control.Label;
 import javafx.scene.control.MenuItem;
+import javafx.scene.control.Tab;
+import javafx.scene.control.TabPane;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
 import javafx.scene.control.skin.VirtualFlow;
@@ -48,6 +50,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.FutureTask;
@@ -78,6 +81,7 @@ class JavaFxFileOperationsTest {
     private final AtomicReference<Gate> heldPublish = new AtomicReference<>();
     private final AtomicReference<Gate> heldMove = new AtomicReference<>();
     private final AtomicInteger browseCommits = new AtomicInteger();
+    private final AtomicReference<CompletableFuture<Long>> timedCommit = new AtomicReference<>();
     private Path captures;
 
     @BeforeAll
@@ -124,12 +128,17 @@ class JavaFxFileOperationsTest {
         fx(() -> {
             var preferences = new MemoryPreferences(null, "");
             if (!automaticRefresh) { preferences.putBoolean("automaticRefresh", false); }
+            if (Boolean.getBoolean("javafx.captureTabs")) { preferences.putBoolean("navigation", false); }
             app = new FileManagerApp(preferences, this::operation, new FileManagerApp.ReadObserver() {
                 @Override
                 public void ready(Path path, boolean preview) { readReady(path, preview); }
 
                 @Override
-                public void committed(Path path, long applyNanos) { browseCommits.incrementAndGet(); }
+                public void committed(Path path, long applyNanos) {
+                    browseCommits.incrementAndGet();
+                    var sample = timedCommit.getAndSet(null);
+                    if (sample != null) { sample.complete(System.nanoTime()); }
+                }
             }, clipboard);
             stage = new Stage();
             stage.setOpacity(0);
@@ -139,6 +148,485 @@ class JavaFxFileOperationsTest {
             return null;
         });
         await(() -> idle() && field(app, "places") != null, "home page", 35);
+    }
+
+    @Test
+    void tabCommandsKeepNavigationSearchAndTextInputSeparate() throws Exception {
+        Path first = Files.createDirectory(root.resolve("工作目录"));
+        Path child = Files.createDirectory(first.resolve("项目资料"));
+        Path match = Files.writeString(child.resolve("needle.txt"), "a search match");
+        Files.writeString(child.resolve("other.txt"), "excluded");
+        openWindow(false);
+        go(first);
+        Tab original = fx(() -> tabs().getSelectionModel().getSelectedItem());
+        context(child, "context-open-tab");
+        await(() -> browseAt(child) && listed(match), "folder opened in a new tab", 10);
+        Tab searched = fx(() -> tabs().getSelectionModel().getSelectedItem());
+        assertTrue(owner(searched).past.isEmpty());
+        fx(() -> {
+            var search = (TextField) scene.lookup("#search-field");
+            search.setText("needle");
+            search.fireEvent(new ActionEvent());
+            return null;
+        });
+        await(() -> "needle".equals(currentBrowse().activeQuery) && browser.items().size() == 1,
+                "first committed search", 8);
+        fx(() -> {
+            var search = (TextField) scene.lookup("#search-field");
+            var textShortcut = new AtomicInteger();
+            search.addEventFilter(KeyEvent.KEY_PRESSED, event -> {
+                if (event.getCode() == KeyCode.V && event.isShortcutDown()) {
+                    textShortcut.incrementAndGet();
+                    event.consume(); // Exercise routing without opening the real system clipboard.
+                }
+            });
+            shortcut(search, KeyCode.V, false);
+            assertEquals(1, textShortcut.get());
+            shortcut(search, KeyCode.T, false);
+            return null;
+        });
+        await(() -> browseAt(child) && currentBrowse().activeQuery.isEmpty() && browser.items().size() == 2,
+                "new tab from a search starts at its directory", 10);
+        Tab unfiltered = fx(() -> tabs().getSelectionModel().getSelectedItem());
+        fx(() -> {
+            shortcut(browser, KeyCode.TAB, true);
+            assertSame(searched, tabs().getSelectionModel().getSelectedItem());
+            return null;
+        });
+        await(() -> browseAt(child) && browser.items().size() == 1, "search restored", 10);
+        assertTrue(fx(() -> searched.getText().contains("needle") && searched.getGraphic() != null));
+        captureTabs("independent-tabs.png");
+        fx(() -> {
+            searched.getContextMenu().getItems().getFirst().fire();
+            return null;
+        });
+        await(() -> browseAt(child) && currentBrowse() != owner(searched) && "needle".equals(currentBrowse().activeQuery),
+                "duplicate preserves current search", 10);
+        Tab duplicate = fx(() -> tabs().getSelectionModel().getSelectedItem());
+        fx(() -> {
+            for (int i = 0; i < 20; i++) {
+                tabs().getSelectionModel().select(original);
+                tabs().getSelectionModel().select(unfiltered);
+            }
+            tabs().getSelectionModel().select(duplicate);
+            return null;
+        });
+        await(() -> browseAt(child) && owner(duplicate) == currentBrowse()
+                        && ((TextField) scene.lookup("#search-field")).getText().equals("needle") && browser.items().size() == 1,
+                "rapid tab churn retains the active tab's search and listing", 12);
+        go(first);
+        assertEquals(child, fx(() -> currentBrowse().past.getFirst().path()));
+        assertTrue(owner(searched).past.isEmpty());
+        click("back");
+        await(() -> browseAt(child) && !button("forward").isDisabled(), "duplicate follows its own history", 10);
+        enter(root.resolve("missing"));
+        acknowledgeFileError();
+        assertTrue(fx(() -> browseAt(child) && !button("forward").isDisabled()));
+        fx(() -> {
+            shortcut(browser, KeyCode.TAB, false);
+            assertSame(original, tabs().getSelectionModel().getSelectedItem());
+            close(duplicate);
+            close(unfiltered);
+            close(searched);
+            return null;
+        });
+        await(() -> browseAt(first) && tabs().getTabs().size() == 1, "the original tab keeps its history", 10);
+        assertFalse(fx(() -> button("back").isDisabled()));
+        fx(() -> { shortcut(browser, KeyCode.W, false); return null; });
+        await(() -> idle() && currentBrowse().location.page() == BrowseContext.Page.HOME
+                && owner(original).closed && tabs().getTabs().size() == 1, "last tab is replaced by Home", 10);
+    }
+
+    @Test
+    void restoresPresentationAndVerifiedSelectionAndCancelsOldInlineEdit() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path directory = Files.createDirectory(root.resolve("资料库"));
+        for (int i = 0; i < 160; i++) {
+            Files.writeString(directory.resolve("row-%03d.txt".formatted(i)), "content " + i);
+        }
+        Path selected = directory.resolve("row-090.txt");
+        Path filtered = Files.writeString(directory.resolve("excluded.dat"), "foreign type");
+        openWindow(false);
+        go(directory);
+        Tab original = fx(() -> tabs().getSelectionModel().getSelectedItem());
+        select(selected);
+        menu("viewItems", "show-preview");
+        await(() -> hasSelectionProof() && previewText().equals("content 90"), "NTFS selection and preview", 10);
+        fx(() -> {
+            var filters = (ColumnFilters) field(browser, "filters");
+            filters.select(BrowserView.Field.TYPE, new ColumnFilters.Bucket(0, "TXT 文件"), true);
+            call(browser, "applyFilters");
+            entriesFlow().scrollToTop(75);
+            return null;
+        });
+        await(() -> entriesFlow().getFirstVisibleCell().getIndex() >= 70, "scrolled before switching", 10);
+        int row = fx(() -> entriesFlow().getFirstVisibleCell().getIndex());
+        click("new-tab");
+        await(() -> browseAt(directory) && listed(filtered) && !browser.filtersActive(), "same directory with another view", 10);
+        Tab other = fx(() -> tabs().getSelectionModel().getSelectedItem());
+        menu("viewItems", "mode-list");
+        menu("sortItems", "sort-size");
+        assertEquals(BrowserView.Mode.LIST, owner(other).view().mode());
+        assertEquals(BrowserView.Field.SIZE, owner(other).view().sort());
+        activate(original);
+        await(() -> browseAt(directory) && selectedPaths().equals(List.of(selected)) && previewText().equals("content 90"),
+                "selection and preview rebuilt from verified entry", 12);
+        assertTrue(fx(() -> browser.filtersActive() && !listed(filtered)));
+        assertEquals(BrowserView.Mode.DETAILS, owner(original).view().mode());
+        assertEquals(BrowserView.Field.NAME, owner(original).view().sort());
+        assertTrue(Math.abs(row - fx(() -> entriesFlow().getFirstVisibleCell().getIndex())) <= 2);
+
+        click("rename");
+        await(() -> scene.lookup("#new-name-editor") != null, "inline editor", 10);
+        var editor = fx(() -> (TextField) scene.lookup("#new-name-editor"));
+        fx(() -> {
+            editor.setText("must-not-commit.txt");
+            shortcut(editor, KeyCode.TAB, false);
+            return null;
+        });
+        await(() -> browseAt(directory) && currentBrowse() == owner(other), "switch while editing", 10);
+        assertTrue(Files.exists(selected));
+        assertFalse(Files.exists(directory.resolve("must-not-commit.txt")));
+        Path saved = Files.move(selected, root.resolve("saved.txt"));
+        Files.writeString(selected, "replacement");
+        activate(original);
+        await(() -> browseAt(directory) && listed(selected) && selectedPaths().isEmpty() && previewText().isEmpty(),
+                "replacement cannot inherit selection", 12);
+        assertEquals("content 90", Files.readString(saved));
+        assertEquals("replacement", Files.readString(selected));
+        assertNull(fx(() -> scene.lookup("#new-name-editor")));
+    }
+
+    @Test
+    void closedTabsDiscardLateListingsAndPreviews() throws Exception {
+        Path first = Files.createDirectory(root.resolve("first"));
+        Path later = Files.createDirectory(root.resolve("late"));
+        Path second = Files.createDirectory(root.resolve("second"));
+        Path late = Files.writeString(later.resolve("late.txt"), "old listing");
+        Path oldPreview = Files.writeString(second.resolve("old.txt"), "old preview");
+        Path third = Files.createDirectory(root.resolve("third"));
+        Path fresh = Files.writeString(third.resolve("fresh.txt"), "current preview");
+        openWindow(false);
+        go(first);
+        Tab a = fx(() -> tabs().getSelectionModel().getSelectedItem());
+        Tab b = openAt(second);
+        activate(a);
+        await(() -> browseAt(first), "return before blocked read", 10);
+        var listingGate = new Gate();
+        heldRead.set(new ReadGate(later, false, listingGate));
+        try {
+            enter(later);
+            assertTrue(listingGate.entered.await(8, TimeUnit.SECONDS));
+            activate(b);
+            await(() -> browseAt(second) && listed(oldPreview), "foreground reads while old request is returning", 10);
+            fx(() -> { close(a); return null; });
+            assertTrue(fx(() -> owner(a).closed && owner(a).browseRequest == null && owner(a).listing.items().isEmpty()));
+        } finally {
+            listingGate.release.countDown();
+        }
+        assertTrue(listingGate.returned.await(8, TimeUnit.SECONDS));
+        assertTrue(fx(() -> browseAt(second) && !listed(late)));
+        select(oldPreview);
+        var previewGate = new Gate();
+        heldRead.set(new ReadGate(oldPreview, true, previewGate));
+        try {
+            menu("viewItems", "show-preview");
+            assertTrue(previewGate.entered.await(8, TimeUnit.SECONDS));
+            openAt(third);
+            fx(() -> { close(b); return null; });
+            select(fresh);
+            menu("viewItems", "show-preview");
+            await(() -> previewText().equals("current preview"), "new preview while old tab is closed", 10);
+        } finally {
+            previewGate.release.countDown();
+        }
+        assertTrue(previewGate.returned.await(8, TimeUnit.SECONDS));
+        assertTrue(fx(() -> previewText().equals("current preview") && owner(b).previewTask == null));
+    }
+
+    @Test
+    void reactivationChecksDirectoryReplacementAndSameFolderWatchOwnership() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path directory = Files.createDirectory(root.resolve("watched"));
+        Path other = Files.createDirectory(root.resolve("elsewhere"));
+        Path selected = Files.writeString(directory.resolve("original.txt"), "old");
+        openWindow(true);
+        goWatched(directory);
+        Tab first = fx(() -> tabs().getSelectionModel().getSelectedItem());
+        select(selected);
+        await(this::hasSelectionProof, "selected before deactivation", 8);
+        var oldTarget = fx(() -> owner(first).watchTarget);
+        click("new-tab");
+        await(() -> browseAt(directory) && watching() && currentBrowse().watchTarget != oldTarget,
+                "independent tab with a new watcher token for the same path", 12);
+        assertNull(fx(() -> owner(first).watchTarget));
+        signal(oldTarget, DirectoryWatcher.Status.WAITING, true);
+        assertTrue(fx(this::watching));
+        Path fresh = Files.writeString(directory.resolve("fresh.txt"), "watch event");
+        await(() -> listed(fresh), "external update on the visible tab", 10);
+        activate(first);
+        await(() -> browseAt(directory) && listed(fresh) && selectedPaths().equals(List.of(selected)),
+                "dormant same-directory tab reads the new entry", 12);
+        Tab second = fx(() -> tabs().getTabs().get(1));
+        activate(second);
+        goWatched(other);
+        Files.move(directory, root.resolve("prior"));
+        Files.createDirectory(directory);
+        Files.writeString(selected, "new identity");
+        activate(first);
+        await(() -> browseAt(directory) && watching() && selectedPaths().isEmpty() && !listed(fresh),
+                "directory identity replaced while dormant", 15);
+        assertEquals("new identity", Files.readString(selected));
+        assertEquals("old", Files.readString(root.resolve("prior/original.txt")));
+        var watcher = (DirectoryWatcher) field(app, "watcher");
+        assertTrue(watcher.registrationCount() <= 2);
+    }
+
+    @Test
+    void pasteKeepsItsDestinationThroughTabChangesAndUndoIsWindowWide() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path source = Files.createDirectory(root.resolve("source"));
+        Path target = Files.createDirectory(root.resolve("target"));
+        Path other = Files.createDirectory(root.resolve("other"));
+        Path copied = Files.writeString(source.resolve("copied.txt"), "copy");
+        Path moved = Files.writeString(source.resolve("moved.txt"), "move");
+        var clipboard = new TestClipboard();
+        openWindow(false, clipboard);
+        go(source);
+        Tab a = fx(() -> tabs().getSelectionModel().getSelectedItem());
+        select(copied);
+        click("copy");
+        await(() -> idle() && cutSources().equals(List.of(copied)), "window copy", 10);
+        Tab b = openAt(target);
+        Tab c = openAt(other);
+        activate(b);
+        await(() -> browseAt(target), "paste destination ready", 10);
+        var clipboardGate = new Gate();
+        var publish = new Gate();
+        clipboard.nextRead.set(() -> { clipboardGate.hold(); return clipboard.snapshot(); });
+        heldPublish.set(publish);
+        try {
+            click("paste");
+            assertTrue(clipboardGate.entered.await(8, TimeUnit.SECONDS));
+            activate(c);
+            clipboardGate.release.countDown();
+            assertTrue(publish.entered.await(8, TimeUnit.SECONDS));
+            fx(() -> { close(b); return null; });
+            await(() -> browseAt(other) && currentBrowse() == owner(c), "active view stays in its own directory", 10);
+        } finally {
+            clipboardGate.release.countDown();
+            publish.release.countDown();
+        }
+        await(() -> idle() && Files.exists(target.resolve(copied.getFileName())), "copy to original destination", 12);
+        assertFalse(Files.exists(other.resolve(copied.getFileName())));
+        assertEquals("copy", Files.readString(target.resolve(copied.getFileName())));
+        activate(a);
+        await(() -> browseAt(source), "back to cut source", 10);
+        select(moved);
+        click("cut");
+        await(() -> idle() && cutSources().equals(List.of(moved)), "window cut", 10);
+        Tab destination = openAt(target);
+        fx(() -> { close(a); return null; });
+        click("paste");
+        await(() -> idle() && listed(target.resolve(moved.getFileName())), "closed source still moves by original identity", 12);
+        assertFalse(Files.exists(moved));
+        activate(c);
+        await(() -> browseAt(other), "undo from a different tab", 10);
+        menu("moreItems", "undo");
+        await(() -> idle() && browseAt(other) && Files.exists(moved), "window undo", 10);
+        assertFalse(Files.exists(target.resolve(moved.getFileName())));
+        assertEquals("move", Files.readString(moved));
+        activate(destination);
+        await(() -> browseAt(target) && !listed(target.resolve(moved.getFileName())), "inactive destination refreshes after undo", 10);
+    }
+
+    @Test
+    void conflictAndPartialResultOutliveTheirTabAndRefreshOtherDestinations() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path source = Files.createDirectory(root.resolve("source"));
+        Path target = Files.createDirectory(root.resolve("target"));
+        Path other = Files.createDirectory(root.resolve("other"));
+        Path first = Files.writeString(source.resolve("a.txt"), "first");
+        Path second = Files.writeString(source.resolve("b.txt"), "source");
+        Path occupant = Files.writeString(target.resolve("b.txt"), "existing");
+        var clipboard = new TestClipboard();
+        openWindow(false, clipboard);
+        go(source);
+        Tab sourceTab = fx(() -> tabs().getSelectionModel().getSelectedItem());
+        fx(() -> { browser.selectAll(); return null; });
+        click("copy");
+        await(() -> idle() && cutSources().size() == 2, "batch captured", 10);
+        Tab observer = openAt(target);
+        Tab c = openAt(other);
+        Tab origin = openAt(target);
+        click("paste");
+        await(() -> conflictScene() != null && Files.exists(target.resolve(first.getFileName())),
+                "confirmed batch prefix and visible conflict", 12);
+        activate(c);
+        fx(() -> { close(origin); return null; });
+        await(() -> browseAt(other) && conflictScene() != null, "conflict remains available in another tab", 10);
+        var newer = clipboard.text("new clipboard owner");
+        chooseConflict("conflict-skip");
+        await(() -> idle() && browseAt(other) && progressLabel("operation-details").contains("成功 1 项 · 已跳过 1 项"),
+                "partial task ends with real results", 10);
+        assertEquals("existing", Files.readString(occupant));
+        assertEquals(newer, clipboard.probe());
+        assertEquals("new clipboard owner", clipboard.textValue());
+        activate(observer);
+        await(() -> browseAt(target) && listed(target.resolve(first.getFileName())), "second destination context reads the write", 10);
+        assertEquals("first", Files.readString(target.resolve(first.getFileName())));
+
+        activate(sourceTab);
+        await(() -> browseAt(source), "return to source for next transfer", 10);
+        select(second);
+        click("cut");
+        await(() -> idle() && cutSources().equals(List.of(second)), "new cut", 10);
+        Tab reviewTarget = openAt(Files.createDirectory(root.resolve("review")));
+        loseMoveReceipt.set(true);
+        click("paste");
+        activate(observer);
+        acknowledgeFileError();
+        await(() -> !((List<?>) field(app, "unknownOperations")).isEmpty() && cutSources().isEmpty()
+                && currentBrowse() == owner(observer), "unknown outcome is kept by the window", 12);
+        fx(() -> { close(reviewTarget); return null; });
+        assertFalse(Files.exists(second));
+        assertEquals("source", Files.readString(root.resolve("review/b.txt")));
+        assertTrue(fx(() -> scene.lookup("#unknown-results").isVisible()));
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "javafx.tabBenchmark", matches = "true")
+    void measureTabSwitchingAndRetainedResources() throws Exception {
+        Path small = Files.createDirectory(root.resolve("测试文档"));
+        Path sample = Files.writeString(small.resolve("样本.txt"), "copy while browsing");
+        Path large = Files.createDirectory(root.resolve("一万项夹具"));
+        for (int i = 0; i < 10_000; i++) {
+            Files.createFile(large.resolve("item-%05d.txt".formatted(i)));
+        }
+        openWindow(false, new TestClipboard());
+        go(small);
+        Tab smallTab = fx(() -> tabs().getSelectionModel().getSelectedItem());
+        Tab largeTab = openAt(large);
+        activate(smallTab);
+        await(() -> browseAt(small), "small directory ready", 15);
+        for (int i = 0; i < 3; i++) {
+            timeTabCommit(() -> tabs().getSelectionModel().select(largeTab));
+            timeTabCommit(() -> tabs().getSelectionModel().select(smallTab));
+        }
+        var largeSamples = new java.util.ArrayList<Long>();
+        var smallSamples = new java.util.ArrayList<Long>();
+        for (int i = 0; i < 6; i++) {
+            largeSamples.add(timeTabCommit(() -> tabs().getSelectionModel().select(largeTab)));
+            assertEquals(10_000, fx(() -> browser.items().size()));
+            smallSamples.add(timeTabCommit(() -> tabs().getSelectionModel().select(smallTab)));
+        }
+        long initialHeap = usedHeap();
+        int initialThreads = workerThreads();
+        var createSamples = new java.util.ArrayList<Long>();
+        for (int i = 0; i < 20; i++) {
+            createSamples.add(timeTabCommit(() -> button("new-tab").fire()));
+        }
+        assertEquals(22, fx(() -> tabs().getTabs().size()));
+        assertTrue(fx(() -> {
+            BrowseContext visible = currentBrowse();
+            return tabs().getTabs().stream().map(JavaFxFileOperationsTest::owner)
+                    .filter(owner -> owner != visible).allMatch(owner -> owner.listing.items().isEmpty()
+                            && owner.browseRequest == null && owner.previewTask == null && owner.watchTarget == null);
+        }));
+        long manyHeap = usedHeap();
+        int manyThreads = workerThreads();
+        var manySamples = new java.util.ArrayList<Long>();
+        for (int i = 0; i < 6; i++) {
+            manySamples.add(timeTabCommit(() -> tabs().getSelectionModel().select(largeTab)));
+            timeTabCommit(() -> tabs().getSelectionModel().select(smallTab));
+        }
+        fx(() -> {
+            for (Tab tab : List.copyOf(tabs().getTabs())) {
+                if (tab != smallTab && tab != largeTab) { close(tab); }
+            }
+            return null;
+        });
+        long finalHeap = usedHeap();
+        int finalThreads = workerThreads();
+        assertEquals(2, fx(() -> tabs().getTabs().size()));
+        assertEquals(initialThreads, finalThreads);
+        assertEquals(initialThreads, manyThreads);
+
+        select(sample);
+        click("copy");
+        await(() -> idle() && cutSources().equals(List.of(sample)), "benchmark copy ready", 10);
+        activate(largeTab);
+        await(() -> browseAt(large), "benchmark target ready", 15);
+        var publish = new Gate();
+        heldPublish.set(publish);
+        long switchingDuringCopy;
+        try {
+            click("paste");
+            assertTrue(publish.entered.await(8, TimeUnit.SECONDS));
+            switchingDuringCopy = timeTabCommit(() -> tabs().getSelectionModel().select(smallTab));
+            assertTrue(fx(() -> browseAt(small)));
+            captureTabs("tabs-during-copy.png");
+        } finally {
+            publish.release.countDown();
+        }
+        await(() -> idle() && Files.exists(large.resolve(sample.getFileName())), "benchmark copy committed", 12);
+        System.out.printf(java.util.Locale.ROOT,
+                "PHASE30_BENCH create=%s small=%s large=%s largeWith22=%s copySwitch=%.2f heapMiB=%.2f,%.2f,%.2f workers=%d,%d,%d%n",
+                milliseconds(createSamples), milliseconds(smallSamples), milliseconds(largeSamples), milliseconds(manySamples),
+                switchingDuringCopy / 1e6, initialHeap / 1048576.0, manyHeap / 1048576.0, finalHeap / 1048576.0,
+                initialThreads, manyThreads, finalThreads);
+    }
+
+    private long timeTabCommit(Runnable action) throws Exception {
+        var completed = new CompletableFuture<Long>();
+        long start = fx(() -> {
+            assertTrue(timedCommit.compareAndSet(null, completed));
+            long now = System.nanoTime();
+            action.run();
+            return now;
+        });
+        return completed.get(20, TimeUnit.SECONDS) - start;
+    }
+
+    private static List<String> milliseconds(List<Long> samples) {
+        return samples.stream().map(value -> String.format(java.util.Locale.ROOT, "%.2f", value / 1e6)).toList();
+    }
+
+    private static long usedHeap() {
+        System.gc();
+        return java.lang.management.ManagementFactory.getMemoryMXBean().getHeapMemoryUsage().getUsed();
+    }
+
+    private static int workerThreads() {
+        return Math.toIntExact(Thread.getAllStackTraces().keySet().stream()
+                .filter(thread -> thread.getName().startsWith("file-manager-")).count());
+    }
+
+    private void captureTabs(String name) throws Exception {
+        if (!Boolean.getBoolean("javafx.captureTabs")) { return; }
+        if (captures == null) { captures = Files.createTempDirectory("phase30-fx-"); }
+        var snapshot = fx(() -> scene.snapshot(null));
+        var picture = new BufferedImage((int) snapshot.getWidth(), (int) snapshot.getHeight(), BufferedImage.TYPE_INT_ARGB);
+        copyPixels(snapshot, picture, 0);
+        Path png = captures.resolve(name);
+        assertTrue(ImageIO.write(picture, "png", png.toFile()));
+        System.out.println("PHASE30_SCREENSHOT " + png);
+    }
+
+    private TabPane tabs() { return (TabPane) scene.lookup("#browse-tabs"); }
+
+    private static BrowseContext owner(Tab tab) { return (BrowseContext) tab.getUserData(); }
+
+    private void activate(Tab tab) throws Exception {
+        fx(() -> { tabs().getSelectionModel().select(tab); return null; });
+    }
+
+    private static void close(Tab tab) { Event.fireEvent(tab, new Event(Tab.TAB_CLOSE_REQUEST_EVENT)); }
+
+    private Tab openAt(Path path) throws Exception {
+        click("new-tab");
+        go(path);
+        return fx(() -> tabs().getSelectionModel().getSelectedItem());
     }
 
     @Test
@@ -222,7 +710,7 @@ class JavaFxFileOperationsTest {
             return null;
         });
         Path unrelated = Files.writeString(folder.resolve("c-unrelated.txt"), "new during editing");
-        await(() -> field(app, "pendingChanges") != null, "unrelated change held during edit", 10);
+        await(() -> field(currentBrowse(), "pendingChanges") != null, "unrelated change held during edit", 10);
         assertSame(editor, fx(() -> scene.lookup("#new-name-editor")));
         assertFalse(fx(() -> listed(unrelated)));
         Path old = Files.move(file, folder.resolve("old-object.txt"));
@@ -298,16 +786,16 @@ class JavaFxFileOperationsTest {
         try {
             Files.writeString(first.resolve("first-event.txt"), "before the automatic read");
             assertTrue(reading.entered.await(8, TimeUnit.SECONDS));
-            var inFlight = fx(() -> field(app, "browseRequest"));
+            var inFlight = fx(() -> field(currentBrowse(), "browseRequest"));
             additional = Files.writeString(first.resolve("another-event.txt"), "during the automatic read");
-            await(() -> field(app, "pendingChanges") != null, "new invalidation queued during read", 8);
-            assertSame(inFlight, fx(() -> field(app, "browseRequest")));
+            await(() -> field(currentBrowse(), "pendingChanges") != null, "new invalidation queued during read", 8);
+            assertSame(inFlight, fx(() -> field(currentBrowse(), "browseRequest")));
         } finally {
             reading.release.countDown();
         }
         await(() -> browseAt(first) && listed(additional), "second read observes later change", 10);
 
-        var staleWatch = fx(() -> (DirectoryWatcher.Target) field(app, "watchTarget"));
+        var staleWatch = fx(() -> (DirectoryWatcher.Target) field(currentBrowse(), "watchTarget"));
         var obsolete = new Gate();
         heldRead.set(new ReadGate(first, false, obsolete));
         try {
@@ -338,7 +826,7 @@ class JavaFxFileOperationsTest {
         Files.move(moved, second);
         await(() -> browseAt(second) && watching() && status().contains("0 个项目"), "directory restored", 10);
 
-        var current = fx(() -> (DirectoryWatcher.Target) field(app, "watchTarget"));
+        var current = fx(() -> (DirectoryWatcher.Target) field(currentBrowse(), "watchTarget"));
         var watcher = (DirectoryWatcher) field(app, "watcher");
         watcher.pause();
         await(() -> watcher.registrationCount() == 0, "pause native delivery for injected overflow", 8);
@@ -384,10 +872,10 @@ class JavaFxFileOperationsTest {
         Object undo = fx(() -> field(app, "undo"));
         fx(() -> {
             int priorCommits = browseCommits.get();
-            var target = (DirectoryWatcher.Target) field(app, "watchTarget");
-            long read = (Long) field(app, "listingQueuedAt");
+            var target = (DirectoryWatcher.Target) field(currentBrowse(), "watchTarget");
+            long read = (Long) field(currentBrowse(), "listingQueuedAt");
             deliver(target, DirectoryWatcher.Status.ACTIVE, new DirectoryEvents.Batch(Set.of(renamed), false, read - 1));
-            assertNull(field(app, "browseRequest"));
+            assertNull(field(currentBrowse(), "browseRequest"));
             assertEquals(priorCommits, browseCommits.get());
             return null;
         });
@@ -884,7 +1372,7 @@ class JavaFxFileOperationsTest {
                     .filter(path -> !path.equals(foreign)).findFirst().orElseThrow();
         }
         click("refresh");
-        await(() -> field(app, "browseRequest") == null && listed(foreign), "foreign staging prefix remains visible", 10);
+        await(() -> field(currentBrowse(), "browseRequest") == null && listed(foreign), "foreign staging prefix remains visible", 10);
         assertFalse(fx(() -> listed(stageFile)));
         go(browse);
         click("back");
@@ -896,7 +1384,7 @@ class JavaFxFileOperationsTest {
             button("search").fire();
             return null;
         });
-        await(() -> browseAt(browse) && "阶段验证".equals(field(app, "activeQuery")) && listed(readable),
+        await(() -> browseAt(browse) && "阶段验证".equals(field(currentBrowse(), "activeQuery")) && listed(readable),
                 "search during copy", 10);
         select(readable);
         await(() -> previewText().contains("写入期间可以读取"), "preview during copy", 10);
@@ -913,7 +1401,7 @@ class JavaFxFileOperationsTest {
         });
         assertFalse(fx(() -> ((FileOperationTask) field(app, "activeFileOperation")).cancellationRequested()));
         click("clear-search");
-        await(() -> browseAt(browse) && "".equals(field(app, "activeQuery")) && listed(readable),
+        await(() -> browseAt(browse) && "".equals(field(currentBrowse(), "activeQuery")) && listed(readable),
                 "clear search during copy", 10);
         select(readable);
         await(() -> previewText().contains("写入期间可以读取"), "preview after leaving search", 10);
@@ -955,7 +1443,7 @@ class JavaFxFileOperationsTest {
             enter(slow);
             assertTrue(listing.entered.await(8, TimeUnit.SECONDS));
             go(next);
-            assertEquals(origin, fx(() -> call(((java.util.Deque<?>) field(app, "past")).peek(), "path")));
+            assertEquals(origin, fx(() -> call(((java.util.Deque<?>) field(currentBrowse(), "past")).peek(), "path")));
             listing.release.countDown();
             assertTrue(listing.returned.await(8, TimeUnit.SECONDS));
             assertTrue(fx(() -> browseAt(next)));
@@ -977,11 +1465,11 @@ class JavaFxFileOperationsTest {
             preview.release.countDown();
         }
 
-        int history = fx(() -> ((java.util.Deque<?>) field(app, "past")).size());
+        int history = fx(() -> ((java.util.Deque<?>) field(currentBrowse(), "past")).size());
         enter(root.resolve("absent-directory"));
         acknowledgeFileError();
         assertTrue(fx(() -> browseAt(next) && listed(second)));
-        assertEquals(history, fx(() -> ((java.util.Deque<?>) field(app, "past")).size()));
+        assertEquals(history, fx(() -> ((java.util.Deque<?>) field(currentBrowse(), "past")).size()));
 
         Path replaced = Files.createDirectory(root.resolve("replaced-directory"));
         Files.writeString(replaced.resolve("old.txt"), "old object");
@@ -1036,7 +1524,7 @@ class JavaFxFileOperationsTest {
             if (affected) {
                 await(() -> idle() && browseAt(to) && listed(published), "fresh read supersedes affected result", 10);
             } else {
-                await(() -> field(app, "fileTask") == null && field(app, "browseRequest") != null,
+                await(() -> field(app, "fileTask") == null && field(currentBrowse(), "browseRequest") != null,
                         "unrelated navigation still owns its request", 10);
             }
             pending.release.countDown();
@@ -1357,7 +1845,7 @@ class JavaFxFileOperationsTest {
 
     private String watchText() { return ((Label) scene.lookup("#watch-status")).getText(); }
     private boolean watching() { return watchText().equals("自动刷新已开启"); }
-    private boolean hasSelectionProof() throws Exception { return !((Map<?, ?>) field(app, "selectionProof")).isEmpty(); }
+    private boolean hasSelectionProof() throws Exception { return !((Map<?, ?>) field(currentBrowse(), "selectionProof")).isEmpty(); }
     private List<Path> selectedPaths() { return browser.selection().stream().map(BrowserItem::path).toList(); }
     private VirtualFlow<?> entriesFlow() { return (VirtualFlow<?>) scene.lookup("#entries").lookup(".virtual-flow"); }
 
@@ -1390,7 +1878,7 @@ class JavaFxFileOperationsTest {
     }
 
     private boolean browseAt(Path directory) throws Exception {
-        return field(app, "browseRequest") == null && directory.equals(call(field(app, "location"), "path"));
+        return field(currentBrowse(), "browseRequest") == null && directory.equals(call(field(currentBrowse(), "location"), "path"));
     }
 
     private void enter(Path directory) throws Exception {
@@ -1465,7 +1953,7 @@ class JavaFxFileOperationsTest {
     }
 
     private boolean idle() throws Exception {
-        return field(app, "fileTask") == null && field(app, "browseRequest") == null
+        return field(app, "fileTask") == null && field(currentBrowse(), "browseRequest") == null
                 && field(app, "clipboardCommand") == null;
     }
     private String status() { return ((Label) scene.lookup("#status")).getText(); }
@@ -1484,6 +1972,8 @@ class JavaFxFileOperationsTest {
         Platform.runLater(future);
         return future.get(12, TimeUnit.SECONDS);
     }
+
+    private BrowseContext currentBrowse() throws Exception { return (BrowseContext) field(app, "context"); }
 
     private static Object field(Object value, String name) throws Exception {
         Field field = value.getClass().getDeclaredField(name);

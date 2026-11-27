@@ -299,7 +299,7 @@ public final class Phase26ClipboardProbe {
 
     private Button button(String name) { return (Button) scene.lookup("#" + name); }
     private boolean idle() throws Exception {
-        return field(app, "browseRequest") == null && field(app, "fileTask") == null && field(app, "clipboardCommand") == null;
+        return field(field(app, "context"), "browseRequest") == null && field(app, "fileTask") == null && field(app, "clipboardCommand") == null;
     }
 
     private static Object field(Object target, String name) throws Exception {

@@ -237,18 +237,18 @@ final class Phase24FxBenchmark {
             editor.fireEvent(new ActionEvent());
             return null;
         });
-        waitState(() -> (baseline ? idle() : field(app, "browseRequest") == null)
+        waitState(() -> (baseline ? idle() : field(field(app, "context"), "browseRequest") == null)
                 && path.equals(pathOfLocation()));
     }
 
     private Path pathOfLocation() throws ReflectiveOperationException {
-        var location = field(app, "location");
+        var location = (baseline ? field(app, "location") : field(field(app, "context"), "location"));
         return (Path) field(location, "path");
     }
 
     private boolean idle() throws ReflectiveOperationException {
         return baseline ? field(app, "activeTask") == null
-                : field(app, "fileTask") == null && field(app, "browseRequest") == null;
+                : field(app, "fileTask") == null && field(field(app, "context"), "browseRequest") == null;
     }
 
     private Button button(String id) { return (Button) scene.lookup("#" + id); }

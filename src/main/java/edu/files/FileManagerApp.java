@@ -1,5 +1,16 @@
 package edu.files;
 
+import edu.files.BrowseContext.BrowseData;
+import edu.files.BrowseContext.BrowseIntent;
+import edu.files.BrowseContext.BrowseRequest;
+import edu.files.BrowseContext.FileRefresh;
+import edu.files.BrowseContext.HomeTab;
+import edu.files.BrowseContext.Listing;
+import edu.files.BrowseContext.Location;
+import edu.files.BrowseContext.Page;
+import edu.files.BrowseContext.Pane;
+import edu.files.BrowseContext.SelectedItem;
+import edu.files.BrowseContext.View;
 import edu.files.BrowserView.Field;
 import edu.files.BrowserView.Mode;
 import edu.files.FileChanges.Change;
@@ -67,63 +78,17 @@ public final class FileManagerApp extends Application {
     private static final double MAX_NAV_WIDTH = 480;
     private static final int MAX_RETAINED_SELECTION = 64;
 
-    private enum Page {
-        HOME("主文件夹", SystemIcons.Namespace.HOME), GALLERY("图库", SystemIcons.Namespace.GALLERY),
-        COMPUTER("此电脑", SystemIcons.Namespace.COMPUTER), NETWORK("网络", SystemIcons.Namespace.NETWORK),
-        LINUX("Linux", SystemIcons.Namespace.LINUX), DIRECTORY("", null);
-        final String title;
-        final SystemIcons.Namespace namespace;
-
-        Page(String title, SystemIcons.Namespace namespace) {
-            this.title = title;
-            this.namespace = namespace;
-        }
-    }
-
-    private enum HomeTab { RECENT, FAVORITES, SHARED }
-    private enum Pane { NONE, DETAILS, PREVIEW }
-
-    private record Location(Page page, Path path) {
-        static Location page(Page page) { return new Location(page, null); }
-        static Location folder(Path path) { return new Location(Page.DIRECTORY, path.toAbsolutePath().normalize()); }
-
-        String label() {
-            if (path == null) { return page.title; }
-            return path.getFileName() == null ? path.toString() : path.getFileName().toString();
-        }
-    }
-
-    private record View(Mode mode, Field sort, boolean descending, Field group) { }
     private record SideNode(String label, Location location, BrowserItem item) {
         boolean divider() { return label.isEmpty(); }
-    }
-    private record Listing(List<BrowserItem> items, int unreadable, boolean limited, Map<Path, Double> imageRatios) {
-        Listing(List<BrowserItem> items, int unreadable, boolean limited) {
-            this(items, unreadable, limited, Map.of());
-        }
     }
     private record SystemCatalog(WindowsPlaces.Places places, List<NewItems.Type> newTypes) { }
     private record PasteRequest(Snapshot snapshot, Transfer local, List<Path> external) {
         boolean move() { return local != null && local.move(); }
     }
-    private record PasteTarget(Path path, Location origin, DirectoryIdentity knownDirectory, BrowserItem folder,
+    private record PasteTarget(Path path, DirectoryIdentity knownDirectory, BrowserItem folder,
                                Selection knownFolder) { }
     private record PreparedPaste(FileChanges.Destination destination, List<Selection> sources) { }
     private record ExternalExclusion(FileClipboard.State state, Set<Path> paths) { }
-    private record BrowseIntent(Location location, String query, HomeTab tab, String message,
-                                boolean openAddressFile, Runnable committed, DirectoryEvents.Batch changes) {
-        BrowseIntent(Location location, String query, HomeTab tab, String message,
-                     boolean openAddressFile, Runnable committed) {
-            this(location, query, tab, message, openAddressFile, committed, null);
-        }
-
-        boolean automatic() { return changes != null; }
-    }
-    private record BrowseData(Listing listing, DirectoryIdentity identity, Path file,
-                              Map<BrowserItem, SelectedItem> verified) { }
-    private record BrowseRequest(BrowseIntent intent, Task<BrowseData> task, long queuedAt) { }
-    private record FileRefresh(String message, Runnable committed) { }
-    private record SelectedItem(BrowserItem item, Selection proof) { }
     private record CreatedItem(NewItems.Created created, Selection proof) { }
     private record PreviewData(Image image, String text) { }
 
@@ -156,9 +121,10 @@ public final class FileManagerApp extends Application {
     private final Preferences preferences;
     private final BiFunction<Kind, List<Change>, FileOperationTask> operationFactory;
     private final ReadObserver readObserver;
-    private final Map<Page, View> views = new EnumMap<>(Page.class);
-    private final Deque<Location> past = new ArrayDeque<>();
-    private final Deque<Location> future = new ArrayDeque<>();
+    private long nextTabId;
+    private BrowseContext context = new BrowseContext(++nextTabId);
+    private final TabPane tabs = new TabPane();
+    private final Map<BrowseContext, Tab> tabHeaders = new LinkedHashMap<>();
     private final Map<Path, FileTime> folderHistory = new LinkedHashMap<>();
     private final Map<Path, FileTime> recentFiles = new LinkedHashMap<>();
     private final Map<Path, FileTime> folderEdits = new LinkedHashMap<>();
@@ -191,11 +157,6 @@ public final class FileManagerApp extends Application {
     private TreeItem<SideNode> quickAccessStart;
     private TreeItem<SideNode> quickAccessEnd;
     private double navigationWidth;
-    private Location location = Location.page(Page.HOME);
-    private HomeTab homeTab = HomeTab.RECENT;
-    private boolean quickAccessExpanded = true;
-    private Pane pane = Pane.NONE;
-    private Listing listing = new Listing(List.of(), 0, false);
     private List<Change> undo = List.of();
     private Transfer transfer;
     private UUID lastClipboardToken;
@@ -204,7 +165,6 @@ public final class FileManagerApp extends Application {
     private ExternalExclusion externalExclusion;
     private Task<FileClipboard.State> clipboardProbe;
     private Task<?> clipboardCommand;
-    private Task<Set<BrowserItem>> cutMarkRead;
     private boolean clipboardUnavailable;
     private boolean clipboardExpired;
     private FileOperationProgress operationProgress;
@@ -212,28 +172,13 @@ public final class FileManagerApp extends Application {
     private LocalFiles.Visibility visibility;
     private Task<?> fileTask;
     private Task<SystemCatalog> catalogTask;
-    private BrowseRequest browseRequest;
-    private DirectoryIdentity directoryIdentity;
-    private boolean directoryUnavailable;
     private boolean closing;
-    private long listingVersion;
-    private long listingQueuedAt;
-    private String deferredRefresh;
     private boolean automaticRefresh;
-    private DirectoryWatcher.Target watchTarget;
-    private DirectoryEvents.Batch pendingChanges;
-    private FileRefresh pendingFileRefresh;
-    private Task<?> previewTask;
-    private boolean previewLoaded;
-    private boolean keepPreview;
-    private Task<Map<BrowserItem, Selection>> selectionRead;
-    private Map<BrowserItem, Selection> selectionProof = Map.of();
     private final Map<TreeItem<SideNode>, Task<?>> treeReads = new HashMap<>();
     private long sidebarVersion;
     private Task<List<Path>> modifiedFoldersTask;
     private List<Path> modifiedFolders = List.of();
     private boolean modifiedFoldersRefreshQueued;
-    private String activeQuery = "";
     private boolean writing;
     private boolean extensions = true;
     private boolean navigationPane = true;
@@ -272,9 +217,6 @@ public final class FileManagerApp extends Application {
         automaticRefresh = preferences.getBoolean("automaticRefresh", true);
         operationProgress = new FileOperationProgress(window, unknownResults, this::locateReportedPath);
         icons = new SystemIcons(window::getOutputScaleX);
-        views.put(Page.HOME, new View(Mode.DETAILS, Field.VISITED, true, null));
-        views.put(Page.COMPUTER, new View(Mode.TILES, Field.NAME, false, null));
-        views.put(Page.GALLERY, new View(Mode.LARGE, Field.MODIFIED, true, Field.MODIFIED));
         browser = new BrowserView(icons, this::selectionChanged, this::open, this::sort, this::contextMenu,
                 () -> updateListingStatus(""), this::homeHeader, this::flushWatchRefresh);
         browser.addEventFilter(KeyEvent.KEY_PRESSED, event -> {
@@ -308,10 +250,11 @@ public final class FileManagerApp extends Application {
         });
 
         BorderPane layout = new BorderPane();
-        layout.setTop(new VBox(navigation(), commandBar()));
+        layout.setTop(new VBox(tabBar(), navigation(), commandBar()));
         layout.setCenter(workspace);
         layout.setBottom(statusBar());
         Scene scene = new Scene(layout, 1200, 760);
+        scene.addEventFilter(KeyEvent.KEY_PRESSED, this::tabKey);
         scene.addEventFilter(KeyEvent.KEY_PRESSED, this::fileClipboardKey);
         scene.getStylesheets().add(getClass().getResource("file-manager.css").toExternalForm());
         scene.getAccelerators().put(new KeyCodeCombination(KeyCode.L, KeyCombination.SHORTCUT_DOWN), address::beginEdit);
@@ -355,16 +298,17 @@ public final class FileManagerApp extends Application {
         clipboardDeadline.stop();
         if (clipboardCommand != null) { clipboardCommand.cancel(true); }
         clipboardWorker.shutdownNow();
-        if (cutMarkRead != null) { reads.cancel(cutMarkRead); }
-        watchTarget = null;
+        if (browser != null) { browser.dismissTransientControls(); }
+        tabHeaders.keySet().forEach(tab -> {
+            releaseBrowse(tab);
+            tab.closed = true;
+            tab.selectionProof = Map.of();
+        });
+        tabHeaders.clear();
         watcher.close();
         rememberNavigationWidth();
         preferences.putDouble("navigationWidth", navigationWidth);
-        if (browser != null) { browser.cancelNewName(); }
-        cancelBrowse();
         if (fileTask != null && !writing) { fileTask.cancel(); }
-        if (previewTask != null) { reads.cancel(previewTask); }
-        if (selectionRead != null) { reads.cancel(selectionRead); }
         if (modifiedFoldersTask != null) { reads.cancel(modifiedFoldersTask); }
         reads.close();
         if (activeFileOperation != null) {
@@ -379,13 +323,167 @@ public final class FileManagerApp extends Application {
         if (icons != null) { icons.close(); }
     }
 
+    private HBox tabBar() {
+        tabs.setId("browse-tabs");
+        tabs.getStyleClass().add("browse-tabs");
+        tabs.setMinWidth(0);
+        tabs.setTabClosingPolicy(TabPane.TabClosingPolicy.ALL_TABS);
+        tabs.setTabDragPolicy(TabPane.TabDragPolicy.FIXED);
+        HBox.setHgrow(tabs, Priority.ALWAYS);
+        addTabHeader(context);
+        tabs.getSelectionModel().selectedItemProperty().addListener((observable, previous, selected) -> {
+            if (!closing && selected != null) { activateTab((BrowseContext) selected.getUserData()); }
+        });
+        Button add = new Button("+");
+        add.setId("new-tab");
+        add.setAccessibleText("新建标签页");
+        add.setTooltip(new Tooltip("新建标签页 (Ctrl+T)"));
+        add.setOnAction(event -> newTab());
+        HBox bar = new HBox(6, tabs, add);
+        bar.setAlignment(Pos.CENTER_LEFT);
+        bar.getStyleClass().add("browse-tab-bar");
+        // Cancel an inline edit before a header can take keyboard focus.
+        bar.addEventFilter(MouseEvent.MOUSE_PRESSED, event -> {
+            if (browser.editingName()) {
+                browser.cancelNewName();
+                Platform.runLater(this::flushWatchRefresh);
+            }
+        });
+        return bar;
+    }
+
+    private Tab addTabHeader(BrowseContext owner) {
+        Tab tab = new Tab();
+        tab.setId("browse-tab-" + owner.id);
+        tab.setUserData(owner);
+        tab.setOnCloseRequest(event -> {
+            event.consume();
+            closeTab(owner);
+        });
+        tab.setContextMenu(new ContextMenu(
+                menuItem("复制标签页", "duplicate-tab", () -> duplicateTab(owner)),
+                menuItem("关闭标签页", "close-tab", () -> closeTab(owner))));
+        tabHeaders.put(owner, tab);
+        updateTabHeader(owner);
+        tabs.getTabs().add(tab);
+        return tab;
+    }
+
+    private void updateTabHeader(BrowseContext owner) {
+        Tab tab = tabHeaders.get(owner);
+        Location location = owner.location;
+        String title = location.label();
+        String tooltip = location.path() == null ? location.label() : location.path().toString();
+        if (!owner.activeQuery.isEmpty()) {
+            title = "搜索 · " + owner.activeQuery;
+            tooltip = title + "\n" + tooltip;
+        }
+        tab.setText(title);
+        tab.setTooltip(new Tooltip(tooltip));
+        tab.setGraphic(location.path() == null
+                ? icons.namespaceGraphic(location.page().namespace, 16)
+                : icons.graphic(BrowserItem.folder(location.path(), location.label()), 16));
+    }
+
+    private void newTab() {
+        openTab(context.location.path() == null ? Location.page(Page.HOME) : context.location);
+    }
+
+    private void openTab(Location location) {
+        var owner = new BrowseContext(++nextTabId);
+        if (location.page() != Page.HOME) { owner.opening = location; }
+        tabs.getSelectionModel().select(addTabHeader(owner));
+    }
+
+    private void duplicateTab(BrowseContext original) {
+        if (original.closed) { return; }
+        if (original == context) { savePresentation(); }
+        var duplicate = new BrowseContext(++nextTabId);
+        duplicate.copyFrom(original);
+        tabs.getSelectionModel().select(addTabHeader(duplicate));
+    }
+
+    private void closeTab(BrowseContext owner) {
+        Tab tab = tabHeaders.get(owner);
+        if (closing || tab == null) { return; }
+        var headers = tabs.getTabs();
+        if (headers.size() == 1) {
+            openTab(Location.page(Page.HOME));
+        } else if (owner == context) {
+            int index = headers.indexOf(tab);
+            tabs.getSelectionModel().select(index == 0 ? 1 : index - 1);
+        }
+        owner.closed = true;
+        owner.selectionProof = Map.of();
+        owner.presentation = BrowserView.Presentation.DEFAULT;
+        owner.past.clear();
+        owner.future.clear();
+        tabHeaders.remove(owner);
+        headers.remove(tab);
+    }
+
+    private void tabKey(KeyEvent event) {
+        if (closing || !event.isShortcutDown() || event.isAltDown()) { return; }
+        switch (event.getCode()) {
+            case T -> { if (event.isShiftDown()) { return; } newTab(); }
+            case W -> { if (event.isShiftDown()) { return; } closeTab(context); }
+            case TAB -> {
+                int index = tabs.getSelectionModel().getSelectedIndex();
+                tabs.getSelectionModel().select(Math.floorMod(index + (event.isShiftDown() ? -1 : 1), tabs.getTabs().size()));
+            }
+            default -> { return; }
+        }
+        event.consume();
+    }
+
+    private void savePresentation() {
+        if (!context.needsReload) { context.presentation = browser.presentation(); }
+    }
+
+    private void activateTab(BrowseContext owner) {
+        if (owner == context || owner.closed) { return; }
+        browser.dismissTransientControls();
+        savePresentation();
+        releaseBrowse(context);
+        watcher.pause();
+        context = owner;
+        browser.usePresentation(owner.presentation);
+        browser.cutItems(Set.of());
+        inspector.setVisible(owner.pane != Pane.NONE);
+        updateWatchStatus(automaticRefresh ? "手动刷新" : "自动刷新已关闭");
+        if (places != null) {
+            updateLocation();
+            render(false);
+            reloadContext(owner.refreshOnReturn);
+        }
+    }
+
+    private void releaseBrowse(BrowseContext owner) {
+        cancelBrowse(owner);
+        for (Task<?> task : new Task<?>[]{owner.addressRead, owner.previewTask, owner.selectionRead, owner.cutMarkRead}) {
+            if (task != null) { reads.cancel(task); }
+        }
+        owner.addressRead = null;
+        owner.previewTask = null;
+        owner.selectionRead = null;
+        owner.cutMarkRead = null;
+        owner.previewLoaded = false;
+        owner.watchTarget = null;
+        owner.pendingChanges = null;
+        owner.pendingFileRefresh = null;
+        owner.deferredRefresh = null;
+        owner.listing = Listing.EMPTY;
+        owner.needsReload = true;
+        owner.listingVersion++;
+    }
+
     private HBox navigation() {
         HBox arrows = new HBox(4,
-                navButton("‹", "后退", "back", () -> history(past, future)),
-                navButton("›", "前进", "forward", () -> history(future, past)),
+                navButton("‹", "后退", "back", () -> history(context.past, context.future)),
+                navButton("›", "前进", "forward", () -> history(context.future, context.past)),
                 navButton("↑", "上一级", "up", () -> navigate(parentLocation())),
                 navButton("⟳", "刷新", "refresh", () -> {
-                    if (location.page() == Page.COMPUTER) { loadPlaces(false); }
+                    if (context.location.page() == Page.COMPUTER) { loadPlaces(false); }
                     else {
                         refreshModifiedFolders();
                         refresh("");
@@ -401,7 +499,7 @@ public final class FileManagerApp extends Application {
             if (isSearching()) { cancelBrowse(); settleBrowse(""); }
         });
         stop.managedProperty().bind(stop.visibleProperty());
-        Button clear = button("退出搜索", "clear-search", () -> request(location, "", "", () -> {}));
+        Button clear = button("退出搜索", "clear-search", () -> request(context.location, "", "", () -> {}));
         clear.managedProperty().bind(clear.visibleProperty());
         HBox row = new HBox(10, arrows, address, searchField, search, stop, clear);
         row.setAlignment(Pos.CENTER_LEFT);
@@ -521,7 +619,7 @@ public final class FileManagerApp extends Application {
             }
             rebuildSidebar();
             refreshModifiedFolders();
-            if (initial || location.path() == null || browseRequest != null) { refresh(""); }
+            if (initial || context.location.path() == null || context.browseRequest != null) { refresh(""); }
             else { updateLocation(); updateControls(); }
         }, failure -> {
             catalogTask = null;
@@ -555,7 +653,7 @@ public final class FileManagerApp extends Application {
             }
             if (WindowsPlaces.WINDOWS && text.matches("(?i)[a-z]:")) { text += "\\"; }
             Path target = Path.of(text);
-            Path relativeTo = location.path() == null ? WindowsPlaces.USER_HOME : location.path();
+            Path relativeTo = context.location.path() == null ? WindowsPlaces.USER_HOME : context.location.path();
             Path path = relativeTo.resolve(target).normalize();
             navigate(Location.folder(path), true);
         } catch (InvalidPathException exception) {
@@ -573,8 +671,8 @@ public final class FileManagerApp extends Application {
     }
 
     private List<AddressBar.Crumb> breadcrumbs() {
-        Path path = location.path();
-        if (path == null) { return List.of(pageCrumb(location.page())); }
+        Path path = context.location.path();
+        if (path == null) { return List.of(pageCrumb(context.location.page())); }
         List<AddressBar.Crumb> crumbs = new ArrayList<>();
         crumbs.add(pageCrumb(containerPage(path)));
         Path current = path.getRoot();
@@ -613,16 +711,23 @@ public final class FileManagerApp extends Application {
                 .findFirst().orElse(target.label());
         return new AddressBar.Crumb(label, null, () -> navigate(target), complete -> {
             LocalFiles.Visibility filter = visibility;
-            long version = listingVersion;
+            BrowseContext owner = context;
+            long version = owner.listingVersion;
+            if (owner.addressRead != null) { reads.cancel(owner.addressRead); }
             var read = task(cancelled -> readVisibleDirectory(path, filter, cancelled));
+            owner.addressRead = read;
             readDetail(read, result -> {
-                if (version == listingVersion) {
+                if (owner.addressRead == read && shows(owner, version)) {
+                    owner.addressRead = null;
                     complete.accept(new AddressBar.Children(result.entries().stream()
                             .filter(LocalFiles.Entry::directory).map(BrowserItem::file).map(this::folderChoice).toList(),
                             "没有可显示的子文件夹"));
                 }
             }, failure -> {
-                if (version == listingVersion) { complete.accept(new AddressBar.Children(List.of(), "无法读取子文件夹")); }
+                if (owner.addressRead == read && shows(owner, version)) {
+                    owner.addressRead = null;
+                    complete.accept(new AddressBar.Children(List.of(), "无法读取子文件夹"));
+                }
             });
         });
     }
@@ -632,8 +737,8 @@ public final class FileManagerApp extends Application {
     }
 
     private Location parentLocation() {
-        if (location.path() == null) { return null; }
-        Path path = location.path();
+        if (context.location.path() == null) { return null; }
+        Path path = context.location.path();
         if (path.getParent() != null) { return Location.folder(path.getParent()); }
         return Location.page(containerPage(path));
     }
@@ -644,11 +749,12 @@ public final class FileManagerApp extends Application {
 
     private void navigate(Location target, boolean openAddressFile) {
         if (target == null) { return; }
-        Location previous = location;
-        startBrowse(new BrowseIntent(target, "", homeTab, "", openAddressFile, () -> {
+        BrowseContext owner = context;
+        Location previous = owner.location;
+        startBrowse(new BrowseIntent(target, "", owner.homeTab, "", openAddressFile, () -> {
             if (!previous.equals(target)) {
-                past.push(previous);
-                future.clear();
+                owner.past.push(previous);
+                owner.future.clear();
             }
             visitFolder(target);
         }));
@@ -656,7 +762,7 @@ public final class FileManagerApp extends Application {
 
     private void history(Deque<Location> from, Deque<Location> to) {
         if (from.isEmpty()) { return; }
-        Location previous = location;
+        Location previous = context.location;
         Location target = from.peek();
         request(target, "", "", () -> {
             from.pop();
@@ -667,36 +773,45 @@ public final class FileManagerApp extends Application {
 
     private void search() {
         String query = searchField.getText().strip();
-        request(location, query, "", () -> {});
+        request(context.location, query, "", () -> {});
     }
 
     private void refresh(String message) {
-        if (browseRequest == null) {
-            request(location, activeQuery, message, () -> {});
+        if (context.browseRequest == null) {
+            if (context.needsReload) { reloadContext(message); }
+            else { request(context.location, context.activeQuery, message, () -> {}); }
         } else {
-            var pending = browseRequest.intent();
+            var pending = context.browseRequest.intent();
             startBrowse(new BrowseIntent(pending.location(), pending.query(), pending.tab(), message,
-                    pending.openAddressFile(), pending.committed()));
+                    pending.openAddressFile(), pending.committed(), null, pending.restoring()));
         }
     }
 
+    private void reloadContext(String message) {
+        Location opening = context.opening;
+        Location target = opening == null ? context.location : opening;
+        startBrowse(new BrowseIntent(target, context.activeQuery, context.homeTab, message, false,
+                () -> { if (opening != null) { visitFolder(opening); } }, null, opening == null));
+    }
+
     private void request(Location target, String query, String message, Runnable loaded) {
-        startBrowse(new BrowseIntent(target, query, homeTab, message, false, loaded));
+        startBrowse(new BrowseIntent(target, query, context.homeTab, message, false, loaded));
     }
 
     private void startBrowse(BrowseIntent intent) {
         if (places == null || closing) { return; }
-        cancelBrowse();
+        BrowseContext owner = context;
+        cancelBrowse(owner);
         Location target = intent.location();
         Work<Listing> work = listingWork(target, intent.query(), intent.tab());
-        Map<BrowserItem, Selection> selected = intent.automatic() ? selectionProof : Map.of();
+        Map<BrowserItem, Selection> selected = intent.automatic() || intent.restoring() ? owner.selectionProof : Map.of();
         long queued = System.nanoTime();
         var worker = task(cancelled -> {
             readObserver.started(target.path(), intent.query(), System.nanoTime() - queued);
             return readBrowse(intent, work, selected, cancelled);
         });
-        var request = new BrowseRequest(intent, worker, queued);
-        browseRequest = request;
+        var request = new BrowseRequest(owner, intent, worker, queued);
+        owner.browseRequest = request;
         if (!intent.automatic()) {
             status.setText(intent.query().isEmpty() ? "正在读取「" + target.label() + "」…"
                     : "正在搜索「" + intent.query() + "」…");
@@ -714,7 +829,10 @@ public final class FileManagerApp extends Application {
     private BrowseData readBrowse(BrowseIntent intent, Work<Listing> work, Map<BrowserItem, Selection> selected,
                                   BooleanSupplier cancelled) throws Exception {
         Path path = intent.location().path();
-        if (path == null) { return new BrowseData(work.read(cancelled), null, null, Map.of()); }
+        if (path == null) {
+            Listing data = work.read(cancelled);
+            return new BrowseData(data, null, null, verifySelection(selected, data.items(), cancelled));
+        }
         requireVisible(path);
         var attributes = Files.readAttributes(path, BasicFileAttributes.class);
         if (!attributes.isDirectory() && intent.openAddressFile()) {
@@ -724,7 +842,7 @@ public final class FileManagerApp extends Application {
         var data = work.read(cancelled);
         readObserver.ready(path, false);
         if (cancelled.getAsBoolean()) { return null; }
-        var verified = verifySelection(selected, data.items(), before, cancelled);
+        var verified = verifySelection(selected, data.items(), cancelled);
         var after = DirectoryIdentity.read(path);
         if ((before.known() || after.known()) && !before.equals(after)) {
             throw new IOException("读取期间目录身份已变化，请刷新：" + path);
@@ -733,12 +851,10 @@ public final class FileManagerApp extends Application {
     }
 
     private static Map<BrowserItem, SelectedItem> verifySelection(Map<BrowserItem, Selection> selected,
-            List<BrowserItem> items, DirectoryIdentity directory, BooleanSupplier cancelled) {
-        if (selected.isEmpty() || directory.ntfs() == null) { return Map.of(); }
+            List<BrowserItem> items, BooleanSupplier cancelled) {
+        if (selected.isEmpty()) { return Map.of(); }
         var expected = new HashMap<Path, BrowserItem>();
-        selected.forEach((item, proof) -> {
-            if (directory.ntfs().equals(proof.nativeItem().parent())) { expected.put(item.path(), item); }
-        });
+        selected.forEach((item, proof) -> expected.put(item.path(), item));
         var verified = new HashMap<BrowserItem, SelectedItem>();
         for (BrowserItem item : items) {
             if (cancelled.getAsBoolean()) { break; }
@@ -752,136 +868,162 @@ public final class FileManagerApp extends Application {
         return verified;
     }
 
-    private boolean owns(BrowseRequest request) { return !closing && browseRequest == request; }
+    private boolean owns(BrowseRequest request) {
+        return !closing && context == request.owner() && !context.closed && context.browseRequest == request;
+    }
 
-    private void cancelBrowse() {
-        var old = browseRequest;
-        browseRequest = null;
+    private boolean shows(BrowseContext owner, long version) {
+        return !closing && owner == context && !owner.closed && owner.listingVersion == version;
+    }
+
+    private void cancelBrowse() { cancelBrowse(context); }
+
+    private void cancelBrowse(BrowseContext owner) {
+        var old = owner.browseRequest;
+        owner.browseRequest = null;
         if (old != null) { reads.cancel(old.task()); }
     }
 
     private boolean isSearching() {
-        return browseRequest != null && (!browseRequest.intent().query().isEmpty()
-                || browseRequest.intent().location().page() == Page.GALLERY);
+        return context.browseRequest != null && (!context.browseRequest.intent().query().isEmpty()
+                || context.browseRequest.intent().location().page() == Page.GALLERY);
     }
 
     private void commitBrowse(BrowseRequest request, BrowseData data) {
         long applyStarted = System.nanoTime();
-        browseRequest = null;
+        context.browseRequest = null;
         if (data.file() != null) {
             settleBrowse("");
             openFile(data.file(), data.file().getFileName().toString());
             return;
         }
         var intent = request.intent();
-        deferredRefresh = null;
-        boolean sameLocation = location.equals(intent.location());
-        if (!sameLocation || !activeQuery.equals(intent.query()) || homeTab != intent.tab()) {
-            pendingFileRefresh = null;
+        context.deferredRefresh = null;
+        boolean sameLocation = context.location.equals(intent.location());
+        boolean sameView = sameLocation && context.activeQuery.equals(intent.query()) && context.homeTab == intent.tab();
+        if (!sameView) {
+            context.pendingFileRefresh = null;
         }
-        boolean replaced = sameLocation && directoryIdentity != null && directoryIdentity.known()
-                && !directoryIdentity.equals(data.identity());
-        if (!sameLocation || !activeQuery.equals(intent.query()) || homeTab != intent.tab() || replaced) {
+        boolean replaced = sameLocation && context.directoryIdentity != null && context.directoryIdentity.known()
+                && !context.directoryIdentity.equals(data.identity());
+        if (!sameView || replaced) {
             browser.resetFilters();
         }
-        location = intent.location();
-        activeQuery = intent.query();
-        homeTab = intent.tab();
-        directoryIdentity = data.identity();
-        directoryUnavailable = false;
-        listing = data.listing();
-        listingQueuedAt = request.queuedAt();
-        listingVersion++;
+        var scroll = intent.restoring() && sameView && !replaced ? context.presentation.scroll() : null;
+        boolean restore = intent.restoring() && sameView && !replaced;
+        context.needsReload = false;
+        context.opening = null;
+        context.refreshOnReturn = "";
+        context.location = intent.location();
+        context.activeQuery = intent.query();
+        context.homeTab = intent.tab();
+        context.directoryIdentity = data.identity();
+        context.directoryUnavailable = false;
+        context.listing = data.listing();
+        context.listingQueuedAt = request.queuedAt();
+        context.listingVersion++;
+        if (!sameView) { updateTabHeader(context); }
         browser.cutItems(Set.of());
         syncDirectoryWatch();
-        if (intent.automatic()) {
+        if (intent.automatic() && !replaced) {
             renderAutomatic(data, intent.changes());
         } else {
-            selectionProof = Map.of();
+            var retained = new LinkedHashMap<BrowserItem, Selection>();
+            if (restore) {
+                for (BrowserItem previous : context.selectionProof.keySet()) {
+                    var verified = data.verified().get(previous);
+                    if (verified != null) { retained.put(verified.item(), verified.proof()); }
+                }
+            }
+            context.selectionProof = Map.copyOf(retained);
             updateLocation();
-            render(false);
+            render(false, restore ? List.copyOf(retained.keySet()) : null);
+            if (scroll != null) {
+                browser.applyCss();
+                browser.layout();
+                browser.restoreScroll(scroll);
+            }
         }
         intent.committed().run();
         verifyCutMarks();
         updateControls();
         updateListingStatus(replaced ? "目录身份已变化，已重新读取" : intent.message());
-        readObserver.committed(location.path(), System.nanoTime() - applyStarted);
+        readObserver.committed(context.location.path(), System.nanoTime() - applyStarted);
         flushWatchRefresh();
     }
 
     private void browseFailed(BrowseRequest request, Throwable failure) {
-        browseRequest = null;
-        if (request.intent().location().equals(location) && location.path() != null
+        context.browseRequest = null;
+        if (request.intent().location().equals(context.opening)) { context.opening = null; }
+        if (request.intent().location().equals(context.location) && context.location.path() != null
                 && (failure instanceof NoSuchFileException || failure instanceof NotDirectoryException
                     || failure instanceof AccessDeniedException)) {
-            directoryUnavailable = true;
-            listing = new Listing(List.of(), 0, false);
-            listingVersion++;
+            context.directoryUnavailable = true;
+            context.listing = Listing.EMPTY;
+            context.selectionProof = Map.of();
+            context.listingVersion++;
             browser.cutItems(Set.of());
             render(false);
+            syncDirectoryWatch();
         }
         boolean automatic = request.intent().automatic();
-        String message = directoryUnavailable ? "当前位置无法访问，可返回或上移"
+        String message = context.directoryUnavailable ? "当前位置无法访问，可返回或上移"
                 : automatic ? "自动刷新失败，可按 F5 重试" : "读取失败，当前页面已保留";
-        if (automatic) {
+        if (automatic || request.intent().restoring()) {
             updateControls();
             updateListingStatus(message);
             flushWatchRefresh();
         } else {
             settleBrowse(message);
             showError(failure);
+            if (context.needsReload && context.browseRequest == null && !context.directoryUnavailable) { reloadContext(""); }
         }
     }
 
     private void settleBrowse(String message) {
-        if (!Objects.equals(searchField.getText(), activeQuery)) { searchField.setText(activeQuery); }
+        if (!Objects.equals(searchField.getText(), context.activeQuery)) { searchField.setText(context.activeQuery); }
         updateControls();
         updateListingStatus(message);
-        if (deferredRefresh != null) {
-            String refresh = deferredRefresh;
-            deferredRefresh = null;
-            request(location, activeQuery, refresh, () -> {});
+        if (context.deferredRefresh != null) {
+            String refresh = context.deferredRefresh;
+            context.deferredRefresh = null;
+            request(context.location, context.activeQuery, refresh, () -> {});
         }
         flushWatchRefresh();
     }
 
     private void syncDirectoryWatch() {
         if (closing) { return; }
-        Path path = automaticRefresh && activeQuery.isEmpty() && directoryIdentity != null
-                && directoryIdentity.ntfs() != null ? location.path() : null;
-        if (watchTarget != null && watchTarget.directory().equals(path)) { return; }
-        pendingChanges = null;
-        selectionProof = Map.of();
-        if (selectionRead != null) {
-            reads.cancel(selectionRead);
-            selectionRead = null;
-        }
+        Path path = automaticRefresh && context.activeQuery.isEmpty() && context.directoryIdentity != null
+                && context.directoryIdentity.ntfs() != null ? context.location.path() : null;
+        if (context.watchTarget != null && context.watchTarget.directory().equals(path)) { return; }
+        context.pendingChanges = null;
         if (path != null) {
-            watchTarget = watcher.watch(path);
+            context.watchTarget = watcher.watch(path);
             updateWatchStatus("正在启动自动刷新");
         } else {
-            watchTarget = null;
+            context.watchTarget = null;
             watcher.pause();
             updateWatchStatus(automaticRefresh ? "手动刷新" : "自动刷新已关闭");
         }
     }
 
     private void directoryChanged(DirectoryWatcher.Notice notice) {
-        if (closing || notice.target() != watchTarget) { return; }
+        if (closing || notice.target() != context.watchTarget) { return; }
         updateWatchStatus(switch (notice.status()) {
             case ACTIVE -> "自动刷新已开启";
             case WAITING -> "等待目录恢复 · F5";
             case UNAVAILABLE -> "监听不可用 · F5";
         });
         var batch = notice.changes();
-        if (batch != null && !batch.coveredBy(listingQueuedAt)) {
+        if (batch != null && !batch.coveredBy(context.listingQueuedAt)) {
             queueWatchChanges(batch);
             flushWatchRefresh();
         }
     }
 
     private void queueWatchChanges(DirectoryEvents.Batch batch) {
-        pendingChanges = pendingChanges == null ? batch : pendingChanges.merge(batch);
+        context.pendingChanges = context.pendingChanges == null ? batch : context.pendingChanges.merge(batch);
     }
 
     private void updateWatchStatus(String message) {
@@ -889,27 +1031,27 @@ public final class FileManagerApp extends Application {
     }
 
     private void flushWatchRefresh() {
-        if (closing || browseRequest != null || browser.editingName() || (fileTask != null && !writing)) { return; }
-        var batch = pendingChanges;
-        var written = pendingFileRefresh;
-        pendingChanges = null;
-        pendingFileRefresh = null;
+        if (closing || context.browseRequest != null || browser.editingName() || (fileTask != null && !writing)) { return; }
+        var batch = context.pendingChanges;
+        var written = context.pendingFileRefresh;
+        context.pendingChanges = null;
+        context.pendingFileRefresh = null;
         if (written != null) {
-            request(location, activeQuery, written.message(), written.committed());
-        } else if (batch != null && !batch.coveredBy(listingQueuedAt)
-                && dependsOn(batch.impact(location.path()), location, activeQuery, homeTab)) {
-            startBrowse(new BrowseIntent(location, activeQuery, homeTab, "", false, () -> {}, batch));
+            request(context.location, context.activeQuery, written.message(), written.committed());
+        } else if (batch != null && !batch.coveredBy(context.listingQueuedAt)
+                && dependsOn(batch.impact(context.location.path()), context.location, context.activeQuery, context.homeTab)) {
+            startBrowse(new BrowseIntent(context.location, context.activeQuery, context.homeTab, "", false, () -> {}, batch));
         }
     }
 
     private void updateListingStatus(String message) {
-        if (browseRequest != null) { return; }
-        String total = Integer.toString(listing.items().size());
+        if (context.browseRequest != null) { return; }
+        String total = Integer.toString(context.listing.items().size());
         String count = browser.filtersActive() ? "显示 " + browser.items().size() + " / " + total : total;
-        count += activeQuery.isEmpty() ? " 个项目" : " 个搜索结果";
-        if (listing.limited()) { count += " · 已达结果上限"; }
-        if (listing.unreadable() != 0) { count += " · " + listing.unreadable() + " 项无法读取"; }
-        if (directoryUnavailable && message.isEmpty()) { message = "当前位置无法访问，可返回或上移"; }
+        count += context.activeQuery.isEmpty() ? " 个项目" : " 个搜索结果";
+        if (context.listing.limited()) { count += " · 已达结果上限"; }
+        if (context.listing.unreadable() != 0) { count += " · " + context.listing.unreadable() + " 项无法读取"; }
+        if (context.directoryUnavailable && message.isEmpty()) { message = "当前位置无法访问，可返回或上移"; }
         status.setText(message.isEmpty() ? count : message + " · " + count);
     }
 
@@ -1006,19 +1148,19 @@ public final class FileManagerApp extends Application {
     }
 
     private void updateLocation() {
-        address.setLocation(location.path() == null ? location.label() : location.path().toString(), breadcrumbs());
-        if (!Objects.equals(searchField.getText(), activeQuery)) { searchField.setText(activeQuery); }
-        searchField.setPromptText("在「" + location.label() + "」中搜索");
+        address.setLocation(context.location.path() == null ? context.location.label() : context.location.path().toString(), breadcrumbs());
+        if (!Objects.equals(searchField.getText(), context.activeQuery)) { searchField.setText(context.activeQuery); }
+        searchField.setPromptText("在「" + context.location.label() + "」中搜索");
         refreshOverview();
         markLocation();
     }
 
     private View currentView() {
-        return views.getOrDefault(location.page(), new View(Mode.DETAILS, Field.NAME, false, null));
+        return context.view();
     }
 
     private boolean homeLayout() {
-        return location.page() == Page.HOME && activeQuery.isEmpty();
+        return context.location.page() == Page.HOME && context.activeQuery.isEmpty();
     }
 
     private void render(boolean preserveSelection) {
@@ -1027,13 +1169,13 @@ public final class FileManagerApp extends Application {
 
     private void render(boolean preserveSelection, List<BrowserItem> verifiedSelection) {
         View config = currentView();
-        boolean computer = location.page() == Page.COMPUTER;
-        boolean gallery = location.page() == Page.GALLERY;
-        boolean recent = location.page() == Page.HOME && homeTab == HomeTab.RECENT;
+        boolean computer = context.location.page() == Page.COMPUTER;
+        boolean gallery = context.location.page() == Page.GALLERY;
+        boolean recent = context.location.page() == Page.HOME && context.homeTab == HomeTab.RECENT;
         Field sort = config.sort() == Field.VISITED && !recent ? Field.NAME : config.sort();
-        browser.render(listing.items(), new BrowserView.Settings(config.mode(), sort, config.descending(), config.group(),
-                compact, checkboxes, extensions, computer, !activeQuery.isEmpty(), recent, homeLayout(), gallery,
-                listing.imageRatios()), preserveSelection, verifiedSelection);
+        browser.render(context.listing.items(), new BrowserView.Settings(config.mode(), sort, config.descending(), config.group(),
+                compact, checkboxes, extensions, computer, !context.activeQuery.isEmpty(), recent, homeLayout(), gallery,
+                context.listing.imageRatios()), preserveSelection, verifiedSelection);
     }
 
     private void renderAutomatic(BrowseData data, DirectoryEvents.Batch changes) {
@@ -1045,34 +1187,34 @@ public final class FileManagerApp extends Application {
         }
         BrowserItem previous = selected.size() == 1 ? selected.getFirst() : null;
         var verified = previous == null ? null : data.verified().get(previous);
-        keepPreview = pane == Pane.PREVIEW && previewLoaded && verified != null
+        context.keepPreview = context.pane == Pane.PREVIEW && context.previewLoaded && verified != null
                 && previous.entry().sameMetadata(verified.item().entry())
-                && !changes.full() && !changes.impact(location.path()).affectsEntry(previous.path());
-        selectionProof = Map.copyOf(retained);
+                && !changes.full() && !changes.impact(context.location.path()).affectsEntry(previous.path());
+        context.selectionProof = Map.copyOf(retained);
         try {
             render(false, List.copyOf(retained.keySet()));
         } finally {
-            keepPreview = false;
+            context.keepPreview = false;
         }
     }
 
     private void sort(Field field, boolean descending) {
         View config = currentView();
         if (config.sort() != field || config.descending() != descending) {
-            views.put(location.page(), new View(config.mode(), field, descending, config.group()));
+            context.views.put(context.location.page(), new View(config.mode(), field, descending, config.group()));
             render(true);
         }
     }
 
     private void group(Field field) {
         View config = currentView();
-        views.put(location.page(), new View(config.mode(), config.sort(), config.descending(), field));
+        context.views.put(context.location.page(), new View(config.mode(), config.sort(), config.descending(), field));
         render(true);
     }
 
     private void mode(Mode mode) {
         View config = currentView();
-        views.put(location.page(), new View(mode, config.sort(), config.descending(), config.group()));
+        context.views.put(context.location.page(), new View(mode, config.sort(), config.descending(), config.group()));
         render(true);
     }
 
@@ -1100,7 +1242,7 @@ public final class FileManagerApp extends Application {
             MenuItem choice = radio(fieldLabel(field), keys, config.sort() == field,
                     () -> sort(field, config.descending()));
             choice.setId("sort-" + field.name().toLowerCase(Locale.ROOT));
-            if (fields.indexOf(field) >= 3 && location.page() == Page.COMPUTER) { advanced.add(choice); }
+            if (fields.indexOf(field) >= 3 && context.location.page() == Page.COMPUTER) { advanced.add(choice); }
             else { commands.add(choice); }
         }
         if (!advanced.isEmpty()) { commands.add(submenu("更多", advanced)); }
@@ -1123,26 +1265,26 @@ public final class FileManagerApp extends Application {
     }
 
     private List<Field> availableFields() {
-        if (location.page() == Page.COMPUTER) {
+        if (context.location.page() == Page.COMPUTER) {
             return List.of(Field.NAME, Field.TYPE, Field.SIZE, Field.AVAILABLE, Field.FILE_SYSTEM,
                     Field.COMMENT, Field.NETWORK, Field.USED);
         }
         List<Field> fields = new ArrayList<>(List.of(Field.NAME, Field.TYPE, Field.SIZE, Field.MODIFIED));
-        if (location.page() == Page.HOME && homeTab == HomeTab.RECENT) { fields.add(Field.VISITED); }
-        if (!activeQuery.isEmpty() || location.page() == Page.GALLERY || location.page() == Page.HOME) {
+        if (context.location.page() == Page.HOME && context.homeTab == HomeTab.RECENT) { fields.add(Field.VISITED); }
+        if (!context.activeQuery.isEmpty() || context.location.page() == Page.GALLERY || context.location.page() == Page.HOME) {
             fields.add(Field.LOCATION);
         }
         return fields;
     }
 
     private String fieldLabel(Field field) {
-        return field == Field.SIZE && location.page() == Page.COMPUTER ? "总大小" : field.label;
+        return field == Field.SIZE && context.location.page() == Page.COMPUTER ? "总大小" : field.label;
     }
 
     private List<MenuItem> viewItems() {
         ToggleGroup modes = new ToggleGroup();
         List<MenuItem> result = new ArrayList<>();
-        List<Mode> modesForPage = switch (location.page()) {
+        List<Mode> modesForPage = switch (context.location.page()) {
             case GALLERY -> List.of(Mode.HUGE, Mode.LARGE, Mode.MEDIUM, Mode.SMALL);
             case HOME -> homeLayout() ? List.of() : List.of(Mode.values());
             default -> List.of(Mode.values());
@@ -1153,8 +1295,8 @@ public final class FileManagerApp extends Application {
             result.add(item);
         }
         if (!result.isEmpty()) { result.add(new SeparatorMenuItem()); }
-        result.add(checkItem("详细信息窗格", "show-details", pane == Pane.DETAILS, enabled -> changePane(Pane.DETAILS)));
-        result.add(checkItem("预览窗格", "show-preview", pane == Pane.PREVIEW, enabled -> changePane(Pane.PREVIEW)));
+        result.add(checkItem("详细信息窗格", "show-details", context.pane == Pane.DETAILS, enabled -> changePane(Pane.DETAILS)));
+        result.add(checkItem("预览窗格", "show-preview", context.pane == Pane.PREVIEW, enabled -> changePane(Pane.PREVIEW)));
         result.add(checkItem("自动刷新", "auto-refresh", automaticRefresh, enabled -> {
             automaticRefresh = enabled;
             preferences.putBoolean("automaticRefresh", enabled);
@@ -1205,7 +1347,7 @@ public final class FileManagerApp extends Application {
         List<MenuItem> commands = new ArrayList<>();
         commands.add(iconMenu("撤消", "undo", UiGlyph.UNDO, this::undo, fileTask != null || undo.isEmpty()));
         BrowserItem drive = driveForTools();
-        if (windows && (location.page() == Page.COMPUTER || drive != null)) {
+        if (windows && (context.location.page() == Page.COMPUTER || drive != null)) {
             commands.add(new SeparatorMenuItem());
             commands.add(iconMenu("清理", "clean-drive", UiGlyph.CLEAN,
                     () -> driveTool(drive, "清理", () -> WindowsPlaces.cleanDrive(drive.path()), false), drive == null || fileTask != null));
@@ -1214,11 +1356,11 @@ public final class FileManagerApp extends Application {
             commands.add(iconMenu("格式化", "format-drive", UiGlyph.FORMAT,
                     () -> driveTool(drive, "格式化", () -> WindowsPlaces.formatDrive(drive.path()), true), drive == null || fileTask != null));
         }
-        if (location.page() == Page.DIRECTORY) {
+        if (context.location.page() == Page.DIRECTORY) {
             commands.add(new SeparatorMenuItem());
-            commands.add(pinItem(location.path()));
+            commands.add(pinItem(context.location.path()));
         }
-        if (windows && (location.page() == Page.COMPUTER || location.page() == Page.NETWORK)) {
+        if (windows && (context.location.page() == Page.COMPUTER || context.location.page() == Page.NETWORK)) {
             commands.add(new SeparatorMenuItem());
             commands.add(iconMenu("连接到媒体服务器", "media-server", UiGlyph.MEDIA, this::connectMedia, false));
             commands.add(iconMenu("添加一个网络位置", "add-network", UiGlyph.NETWORK, this::addNetwork, false));
@@ -1240,12 +1382,12 @@ public final class FileManagerApp extends Application {
     }
 
     private BrowserItem driveForTools() {
-        if (location.page() == Page.COMPUTER && browser.selection().size() == 1) {
+        if (context.location.page() == Page.COMPUTER && browser.selection().size() == 1) {
             BrowserItem drive = selectedItem();
             return WindowsPlaces.supportsDriveTools(drive) ? drive : null;
         }
-        if (location.page() == Page.DIRECTORY && location.path().getParent() == null) {
-            return places.computer().stream().filter(item -> location.path().equals(item.path()))
+        if (context.location.page() == Page.DIRECTORY && context.location.path().getParent() == null) {
+            return places.computer().stream().filter(item -> context.location.path().equals(item.path()))
                     .filter(WindowsPlaces::supportsDriveTools).findFirst().orElse(null);
         }
         return null;
@@ -1271,14 +1413,17 @@ public final class FileManagerApp extends Application {
             commands.add(menuItem("刷新", "context-refresh", () -> fire("refresh")));
             commands.add(submenu("排序", sortItems()));
             commands.add(submenu("查看", viewItems()));
-            if (location.path() != null) {
+            if (context.location.path() != null) {
                 commands.add(new SeparatorMenuItem());
                 if (canCreate()) { commands.add(submenu("新建", newItems())); }
                 commands.add(menuItem("粘贴", "context-paste", this::paste, transferUnavailable || !clipboardHasFiles()));
             }
         } else {
             commands.add(menuItem("打开", "context-open", () -> open(item)));
-            if (item.entry() != null && (location.path() == null || !activeQuery.isEmpty())) {
+            if (item.directory() && item.path() != null) {
+                commands.add(menuItem("在新标签页中打开", "context-open-tab", () -> openTab(Location.folder(item.path()))));
+            }
+            if (item.entry() != null && (context.location.path() == null || !context.activeQuery.isEmpty())) {
                 commands.add(menuItem("打开所在文件夹", "context-parent", () -> navigate(Location.folder(item.path().getParent()))));
             }
             if (canModify(browser.selection())) {
@@ -1303,7 +1448,7 @@ public final class FileManagerApp extends Application {
                 commands.add(menuItem(favorites.contains(item.path()) ? "从收藏夹移除" : "添加到收藏夹",
                         "context-favorite", () -> toggleFavorite(item.path())));
             }
-            if (location.page() == Page.NETWORK && networkLocations.contains(item.path())) {
+            if (context.location.page() == Page.NETWORK && networkLocations.contains(item.path())) {
                 commands.add(menuItem("移除网络位置", "remove-network", () -> removeNetwork(item.path())));
             }
         }
@@ -1486,8 +1631,8 @@ public final class FileManagerApp extends Application {
         return branch;
     }
 
-    private static TreeItem<SideNode> branch(String label, Location location) {
-        var branch = new TreeItem<>(new SideNode(label, location, null));
+    private static TreeItem<SideNode> branch(String label, Location target) {
+        var branch = new TreeItem<>(new SideNode(label, target, null));
         branch.setExpanded(true);
         return branch;
     }
@@ -1499,7 +1644,7 @@ public final class FileManagerApp extends Application {
     private void markLocation() {
         for (int i = 0; i < tree.getExpandedItemCount(); i++) {
             var item = tree.getTreeItem(i);
-            if (item != null && location.equals(item.getValue().location())) {
+            if (item != null && context.location.equals(item.getValue().location())) {
                 tree.getSelectionModel().select(item);
                 return;
             }
@@ -1598,7 +1743,7 @@ public final class FileManagerApp extends Application {
         overview.getChildren().clear();
         if (homeLayout()) {
             browser.refreshHomeHeader();
-        } else if (location.page() == Page.NETWORK) {
+        } else if (context.location.page() == Page.NETWORK) {
             Button discover = new Button("浏览 Windows 网络");
             discover.setDisable(!WindowsPlaces.WINDOWS);
             discover.setOnAction(event -> browseNetwork());
@@ -1606,21 +1751,24 @@ public final class FileManagerApp extends Application {
             add.setDisable(!WindowsPlaces.WINDOWS);
             add.setOnAction(event -> addNetwork());
             overview.getChildren().add(new HBox(8, discover, add));
-        } else if (location.page() == Page.LINUX && listing.items().isEmpty()) {
+        } else if (context.location.page() == Page.LINUX && context.listing.items().isEmpty()) {
             overview.getChildren().add(new Label("Windows 中没有可用的 WSL 发行版"));
         }
         overview.setVisible(!overview.getChildren().isEmpty());
     }
 
     private Region homeHeader() {
+        BrowseContext owner = context;
+        long version = owner.listingVersion;
         Button quickAccess = new Button("快速访问",
-                (quickAccessExpanded ? UiGlyph.DOWN : UiGlyph.RIGHT).graphic(12, "command-symbol"));
+                (context.quickAccessExpanded ? UiGlyph.DOWN : UiGlyph.RIGHT).graphic(12, "command-symbol"));
         quickAccess.setId("home-quick-access");
         quickAccess.getStyleClass().add("home-section");
         quickAccess.setOnAction(event -> {
-            quickAccessExpanded = !quickAccessExpanded;
+            context.quickAccessExpanded = !context.quickAccessExpanded;
             browser.refreshHomeHeader();
             Platform.runLater(() -> {
+                if (!shows(owner, version)) { return; }
                 Node replacement = browser.lookup("#home-quick-access");
                 if (replacement != null) { replacement.requestFocus(); }
             });
@@ -1628,7 +1776,7 @@ public final class FileManagerApp extends Application {
 
         VBox header = new VBox(9, quickAccess);
         header.getStyleClass().add("home-header");
-        if (quickAccessExpanded) {
+        if (context.quickAccessExpanded) {
             TilePane links = new TilePane(12, 4);
             links.getStyleClass().add("quick-links");
             links.setTileAlignment(Pos.CENTER_LEFT);
@@ -1647,6 +1795,7 @@ public final class FileManagerApp extends Application {
         expandFiles.setOnAction(event -> {
             browser.toggleHomeFiles();
             Platform.runLater(() -> {
+                if (!shows(owner, version)) { return; }
                 Node replacement = browser.lookup("#home-expand-files");
                 if (replacement != null) { replacement.requestFocus(); }
             });
@@ -1663,9 +1812,9 @@ public final class FileManagerApp extends Application {
         Label title = new Label(item.name());
         title.getStyleClass().add("quick-link-name");
         boolean knownFolder = places.fixed().stream().anyMatch(fixed -> fixed.path().equals(item.path()));
-        Label location = new Label(knownFolder ? "本地存储" : item.location());
-        location.getStyleClass().add("muted-label");
-        HBox detail = new HBox(4, location);
+        Label subtitle = new Label(knownFolder ? "本地存储" : item.location());
+        subtitle.getStyleClass().add("muted-label");
+        HBox detail = new HBox(4, subtitle);
         detail.setAlignment(Pos.CENTER_LEFT);
         if (pinned) { detail.getChildren().addFirst(UiGlyph.PIN.graphic(10, "command-symbol")); }
         VBox text = new VBox(1, title, detail);
@@ -1684,11 +1833,11 @@ public final class FileManagerApp extends Application {
     private Button homeTab(String label, HomeTab tab, UiGlyph glyph) {
         Button button = new Button(label, glyph.graphic(13, "home-tab-icon"));
         button.setId("home-" + tab.name().toLowerCase(Locale.ROOT));
-        button.getStyleClass().add(tab == homeTab ? "active-tab" : "home-tab");
+        button.getStyleClass().add(tab == context.homeTab ? "active-tab" : "home-tab");
         button.setOnAction(event -> {
             if (!browser.homeFilesExpanded()) { browser.toggleHomeFiles(); }
-            if (tab == homeTab && browseRequest == null) { return; }
-            startBrowse(new BrowseIntent(location, activeQuery, tab, "", false, () -> {}));
+            if (tab == context.homeTab && context.browseRequest == null) { return; }
+            startBrowse(new BrowseIntent(context.location, context.activeQuery, tab, "", false, () -> {}));
         });
         return button;
     }
@@ -1696,7 +1845,7 @@ public final class FileManagerApp extends Application {
     private void toggleFavorite(Path path) {
         if (!favorites.remove(path)) { favorites.add(path); }
         savePaths("favorites", favorites);
-        if (location.page() == Page.HOME && homeTab == HomeTab.FAVORITES) { refresh(""); }
+        if (context.location.page() == Page.HOME && context.homeTab == HomeTab.FAVORITES) { refresh(""); }
     }
 
     private List<MenuItem> galleryItems() {
@@ -1805,46 +1954,47 @@ public final class FileManagerApp extends Application {
     private void selectionChanged() {
         updateControls();
         observeVisibleSelection();
-        if (!keepPreview || browser.selection().size() != 1) { refreshInspector(); }
+        if (!context.keepPreview || browser.selection().size() != 1) { refreshInspector(); }
     }
 
     private void observeVisibleSelection() {
-        if (selectionRead != null) {
-            reads.cancel(selectionRead);
-            selectionRead = null;
+        if (context.needsReload) { return; }
+        if (context.selectionRead != null) {
+            reads.cancel(context.selectionRead);
+            context.selectionRead = null;
         }
         var selected = browser.selection();
-        if (watchTarget == null || selected.isEmpty() || selected.size() > MAX_RETAINED_SELECTION) {
-            selectionProof = Map.of();
+        if (selected.isEmpty() || selected.size() > MAX_RETAINED_SELECTION) {
+            context.selectionProof = Map.of();
             return;
         }
         var retained = new HashMap<BrowserItem, Selection>();
         for (BrowserItem item : selected) {
-            var proof = selectionProof.get(item);
+            var proof = context.selectionProof.get(item);
             if (proof != null) { retained.put(item, proof); }
         }
-        selectionProof = Map.copyOf(retained);
+        context.selectionProof = Map.copyOf(retained);
         var missing = selected.stream().filter(item -> !retained.containsKey(item)).toList();
         if (missing.isEmpty()) { return; }
-        var directory = directoryIdentity.ntfs();
-        var target = watchTarget;
+        BrowseContext owner = context;
+        long version = owner.listingVersion;
         var read = task(cancelled -> {
             var observed = new HashMap<>(retained);
             for (BrowserItem item : missing) {
                 if (cancelled.getAsBoolean()) { break; }
                 var proof = observeSelection(item);
-                if (proof != null && directory.equals(proof.nativeItem().parent())) { observed.put(item, proof); }
+                if (proof != null) { observed.put(item, proof); }
             }
             return Map.copyOf(observed);
         });
-        selectionRead = read;
+        owner.selectionRead = read;
         readDetail(read, observed -> {
-            if (selectionRead == read && watchTarget == target) {
-                selectionRead = null;
-                selectionProof = observed;
+            if (owner.selectionRead == read && shows(owner, version)) {
+                owner.selectionRead = null;
+                owner.selectionProof = observed;
             }
         }, failure -> {
-            if (selectionRead == read) { selectionRead = null; }
+            if (owner.selectionRead == read) { owner.selectionRead = null; }
         });
     }
 
@@ -1859,20 +2009,20 @@ public final class FileManagerApp extends Application {
     }
 
     private void changePane(Pane next) {
-        pane = pane == next ? Pane.NONE : next;
-        inspector.setVisible(pane != Pane.NONE);
+        context.pane = context.pane == next ? Pane.NONE : next;
+        inspector.setVisible(context.pane != Pane.NONE);
         refreshInspector();
     }
 
     private void refreshInspector() {
-        previewLoaded = false;
-        if (previewTask != null) {
-            reads.cancel(previewTask);
-            previewTask = null;
+        context.previewLoaded = false;
+        if (context.previewTask != null) {
+            reads.cancel(context.previewTask);
+            context.previewTask = null;
         }
         inspector.getChildren().clear();
-        if (pane == Pane.NONE) { return; }
-        Label heading = new Label(pane == Pane.DETAILS ? "详细信息" : "预览");
+        if (context.pane == Pane.NONE) { return; }
+        Label heading = new Label(context.pane == Pane.DETAILS ? "详细信息" : "预览");
         heading.getStyleClass().add("section-title");
         inspector.getChildren().add(heading);
         BrowserItem item = selectedItem();
@@ -1880,7 +2030,7 @@ public final class FileManagerApp extends Application {
             inspector.getChildren().add(new Label("已选择 " + browser.selection().size() + " 个项目"));
         } else if (item == null) {
             inspector.getChildren().add(new Label("选择一个项目以查看"));
-        } else if (pane == Pane.DETAILS) {
+        } else if (context.pane == Pane.DETAILS) {
             Label text = new Label(propertiesText(item));
             text.setWrapText(true);
             inspector.getChildren().addAll(icons.graphic(item, 32), text);
@@ -1896,8 +2046,9 @@ public final class FileManagerApp extends Application {
         }
         Label hint = new Label("正在读取预览…");
         inspector.getChildren().add(hint);
-        long version = listingVersion;
-        Selection known = selectionProof.get(item);
+        BrowseContext owner = context;
+        long version = owner.listingVersion;
+        Selection known = owner.selectionProof.get(item);
         var read = task(cancelled -> {
             requireVisible(item.path());
             var selection = known == null ? FileChanges.capture(item.entry()) : known;
@@ -1921,11 +2072,11 @@ public final class FileManagerApp extends Application {
             }
             return data;
         });
-        previewTask = read;
+        owner.previewTask = read;
         readDetail(read, result -> {
-            if (previewTask != read || listingVersion != version || selectedItem() != item) { return; }
-            previewTask = null;
-            previewLoaded = true;
+            if (owner.previewTask != read || !shows(owner, version) || selectedItem() != item) { return; }
+            owner.previewTask = null;
+            owner.previewLoaded = true;
             if (result.image() != null) {
                 var image = new ImageView(result.image());
                 image.setPreserveRatio(true);
@@ -1946,8 +2097,8 @@ public final class FileManagerApp extends Application {
                 VBox.setVgrow(preview, Priority.ALWAYS);
             }
         }, failure -> {
-            if (previewTask == read) {
-                previewTask = null;
+            if (owner.previewTask == read && shows(owner, version)) {
+                owner.previewTask = null;
                 hint.setText("无法读取此文件，项目可能已变化");
             }
         });
@@ -1981,9 +2132,9 @@ public final class FileManagerApp extends Application {
     }
 
     private void showLocationProperties() {
-        Path path = location.path();
+        Path path = context.location.path();
         if (path == null) {
-            info("属性", location.label() + " · " + browser.items().size() + " 个项目");
+            info("属性", context.location.label() + " · " + browser.items().size() + " 个项目");
         } else if (WindowsPlaces.WINDOWS) {
             showNativeProperties(path);
         } else {
@@ -1991,9 +2142,11 @@ public final class FileManagerApp extends Application {
             if (drive.isPresent()) {
                 showProperties(drive.get());
             } else {
-                long version = listingVersion;
+                var owner = context;
+                long version = owner.listingVersion;
                 readDetail(task(ignored -> BrowserItem.file(LocalFiles.describe(path))),
-                        item -> { if (version == listingVersion) { showProperties(item); } }, this::showError);
+                        item -> { if (shows(owner, version)) { showProperties(item); } },
+                        failure -> { if (shows(owner, version)) { showError(failure); } });
             }
         }
     }
@@ -2029,18 +2182,18 @@ public final class FileManagerApp extends Application {
             if (path.getParent() != null) {
                 rememberVisit("recentFolders", folderHistory, path.getParent());
             }
-            if (location.page() == Page.HOME && homeTab == HomeTab.RECENT) { refresh("已打开「" + name + "」"); }
+            if (context.location.page() == Page.HOME && context.homeTab == HomeTab.RECENT) { refresh("已打开「" + name + "」"); }
             else { status.setText("已打开「" + name + "」"); }
         }, this::showError);
     }
 
     private boolean canCreate() {
-        return !fileCommandsUnavailable() && location.path() != null && activeQuery.isEmpty();
+        return !fileCommandsUnavailable() && context.location.path() != null && context.activeQuery.isEmpty();
     }
 
     private void create(NewItems.Type type) {
         if (!canCreate() || places == null) { return; }
-        Path directory = location.path();
+        Path directory = context.location.path();
         switch (type.kind()) {
             case COMMAND -> runFileTask(task(ignored -> {
                 WindowsPlaces.launchNewCommand(directory, type.value());
@@ -2057,8 +2210,9 @@ public final class FileManagerApp extends Application {
 
     private void createItem(String label, Work<NewItems.Created> work) {
         if (fileCommandsUnavailable()) { return; }
-        Location origin = location;
-        long view = listingVersion;
+        BrowseContext owner = context;
+        Location origin = owner.location;
+        long view = owner.listingVersion;
         runFileTask(task(cancelled -> {
             var created = work.read(cancelled);
             try {
@@ -2071,11 +2225,11 @@ public final class FileManagerApp extends Application {
             undo = List.of(FileChanges.undoCreation(created.path()));
             recordFolderEdits(Stream.of(created.path().getParent()));
             rebuildSidebar();
-            if (browseRequest != null || !location.equals(origin) || listingVersion != view) {
+            if (context.browseRequest != null || !shows(owner, view) || !context.location.equals(origin)) {
                 refreshAffected(BrowseImpact.ofParent(created.path()), "已新建" + label, () -> {});
                 return;
             }
-            request(location, "", "已新建" + label, () -> {
+            request(context.location, "", "已新建" + label, () -> {
                 if (browser.filtersActive() && browser.items().stream().noneMatch(item -> created.path().equals(item.path()))) {
                     browser.clearFilters();
                     updateListingStatus("已新建" + label);
@@ -2093,17 +2247,19 @@ public final class FileManagerApp extends Application {
         BrowserItem selected = selectedItem();
         if (selected == null || selected.entry() == null || browser.selection().size() != 1 || fileCommandsUnavailable()) { return; }
         String extension = selected.name().substring(LocalFiles.extensionStart(selected.name(), selected.directory()));
-        Selection known = selectionProof.get(selected);
+        BrowseContext owner = context;
+        long version = owner.listingVersion;
+        Selection known = owner.selectionProof.get(selected);
         runFileTask(task(ignored -> captureSelected(selected, known)), "正在核对所选项目…", false, selection -> {
             updateListingStatus("");
-            if (browseRequest == null && selectedItem() == selected) {
+            if (shows(owner, version) && owner.browseRequest == null && selectedItem() == selected) {
                 editName(selection, extension, false);
             }
         });
     }
 
     private void editName(Selection selection, String extension, boolean keepExtension) {
-        if (watchTarget != null && selection.needsPathConfirmation()) {
+        if (context.watchTarget != null && selection.needsPathConfirmation()) {
             updateListingStatus("无法确认项目身份，已取消行内编辑");
             return;
         }
@@ -2120,8 +2276,10 @@ public final class FileManagerApp extends Application {
                 return;
             }
             Change change = FileChanges.rename(entry, target, entry.needsPathConfirmation());
+            BrowseContext owner = context;
+            Location origin = owner.location;
             applyChanges(Kind.RENAME, "正在重命名…", "已重命名", List.of(change), ignored -> { },
-                    () -> browser.reveal(target));
+                    () -> { if (context == owner && context.location.equals(origin)) { browser.reveal(target); } });
         } catch (InvalidPathException exception) {
             showError(exception);
         }
@@ -2153,7 +2311,7 @@ public final class FileManagerApp extends Application {
     }
 
     private void captureSelection(List<BrowserItem> selected, Consumer<List<Selection>> ready) {
-        var known = selectionProof;
+        var known = context.selectionProof;
         runFileTask(task(ignored -> {
             List<Selection> result = new ArrayList<>();
             for (BrowserItem item : selected) {
@@ -2297,18 +2455,18 @@ public final class FileManagerApp extends Application {
     }
 
     private void paste() {
-        if (location.path() != null) { pasteInto(location.path(), null); }
+        if (context.location.path() != null) { pasteInto(context.location.path(), null); }
     }
 
     private void pasteInto(Path directory, BrowserItem folder) {
         if (fileCommandsUnavailable() || clipboardCommand != null) { return; }
-        var target = new PasteTarget(directory, location, directory.equals(location.path()) ? directoryIdentity : null,
-                folder, folder == null ? null : selectionProof.get(folder));
+        var target = new PasteTarget(directory, directory.equals(context.location.path()) ? context.directoryIdentity : null,
+                folder, folder == null ? null : context.selectionProof.get(folder));
         updateListingStatus("正在读取文件剪贴板…");
         runClipboardTask(task(ignored -> clipboard.read()), true, data -> {
             observeClipboard(data.state());
             var request = pasteRequest(data);
-            if (request != null && pasteTargetCurrent(target)) { preparePaste(target, request); }
+            if (request != null && pasteCanContinue()) { preparePaste(target, request); }
         });
     }
 
@@ -2339,9 +2497,9 @@ public final class FileManagerApp extends Application {
         return null;
     }
 
-    private boolean pasteTargetCurrent(PasteTarget target) {
-        if (location.equals(target.origin()) && !fileCommandsUnavailable()) { return true; }
-        updateListingStatus("当前位置已变化或正忙，请重新发起粘贴");
+    private boolean pasteCanContinue() {
+        if (!closing && fileTask == null) { return true; }
+        if (!closing) { updateListingStatus("有其他文件任务正在执行，请重新发起粘贴"); }
         return false;
     }
 
@@ -2371,7 +2529,7 @@ public final class FileManagerApp extends Application {
             }
             return new PreparedPaste(destination, List.copyOf(sources));
         }), "正在核对粘贴来源和目标…", false, prepared -> {
-            if (!pasteTargetCurrent(target)) { return; }
+            if (!pasteCanContinue()) { return; }
             var destination = prepared.destination();
             var sources = prepared.sources();
             Predicate<Selection> unverified = source -> source.needsPathConfirmation(destination, pending.move());
@@ -2421,9 +2579,9 @@ public final class FileManagerApp extends Application {
     }
 
     private void verifyCutMarks() {
-        if (cutMarkRead != null) {
-            reads.cancel(cutMarkRead);
-            cutMarkRead = null;
+        if (context.cutMarkRead != null) {
+            reads.cancel(context.cutMarkRead);
+            context.cutMarkRead = null;
         }
         var current = transfer;
         if (clipboardUnavailable || current == null || !current.move() || current.sources().isEmpty()) {
@@ -2434,12 +2592,13 @@ public final class FileManagerApp extends Application {
         for (var source : current.sources()) {
             if (source.nativeItem() != null) { wanted.put(source.path(), source); }
         }
-        List<BrowserItem> candidates = listing.items().stream().filter(item -> wanted.containsKey(item.path())).toList();
+        List<BrowserItem> candidates = context.listing.items().stream().filter(item -> wanted.containsKey(item.path())).toList();
         if (candidates.isEmpty()) {
             browser.cutItems(Set.of());
             return;
         }
-        long version = listingVersion;
+        BrowseContext owner = context;
+        long version = owner.listingVersion;
         var read = task(cancelled -> {
             Set<BrowserItem> verified = new HashSet<>();
             for (var item : candidates) {
@@ -2449,14 +2608,14 @@ public final class FileManagerApp extends Application {
             }
             return Set.copyOf(verified);
         });
-        cutMarkRead = read;
+        owner.cutMarkRead = read;
         readDetail(read, marks -> {
-            if (cutMarkRead == read && transfer == current && listingVersion == version && !clipboardUnavailable) {
-                cutMarkRead = null;
+            if (owner.cutMarkRead == read && transfer == current && shows(owner, version) && !clipboardUnavailable) {
+                owner.cutMarkRead = null;
                 browser.cutItems(marks);
             }
         }, failure -> {
-            if (cutMarkRead == read) { cutMarkRead = null; }
+            if (owner.cutMarkRead == read) { owner.cutMarkRead = null; }
         });
     }
 
@@ -2557,6 +2716,11 @@ public final class FileManagerApp extends Application {
     }
 
     private void refreshAffected(BrowseImpact impact, String message, Runnable reloaded) {
+        for (BrowseContext owner : tabHeaders.keySet()) {
+            if (owner != context && dependsOn(impact, owner.location, owner.activeQuery, owner.homeTab)) {
+                owner.refreshOnReturn = message;
+            }
+        }
         boolean sidebarAffected = false;
         for (int index = 0; index < tree.getExpandedItemCount(); index++) {
             var branch = tree.getTreeItem(index);
@@ -2569,18 +2733,19 @@ public final class FileManagerApp extends Application {
             }
         }
         if (sidebarAffected) { rebuildSidebar(); }
-        boolean affectsCurrent = dependsOn(impact, location, activeQuery, homeTab);
-        if (affectsCurrent && browseRequest != null && browseRequest.intent().automatic()) {
-            pendingFileRefresh = new FileRefresh(message, reloaded);
+        boolean affectsCurrent = dependsOn(impact, context.location, context.activeQuery, context.homeTab);
+        if (affectsCurrent && context.browseRequest != null && context.browseRequest.intent().automatic()) {
+            context.pendingFileRefresh = new FileRefresh(message, reloaded);
             return;
         }
-        if (affectsCurrent) { pendingFileRefresh = null; }
-        if (browseRequest == null) {
-            if (affectsCurrent) { request(location, activeQuery, message, reloaded); }
+        if (affectsCurrent) { context.pendingFileRefresh = null; }
+        if (context.browseRequest == null) {
+            if (affectsCurrent && context.needsReload) { reloadContext(message); }
+            else if (affectsCurrent) { request(context.location, context.activeQuery, message, reloaded); }
             else { updateListingStatus(message); }
         } else {
-            if (affectsCurrent) { deferredRefresh = message; }
-            BrowseIntent pending = browseRequest.intent();
+            if (affectsCurrent) { context.deferredRefresh = message; }
+            BrowseIntent pending = context.browseRequest.intent();
             if (dependsOn(impact, pending.location(), pending.query(), pending.tab())) {
                 startBrowse(pending);
             }
@@ -2615,11 +2780,11 @@ public final class FileManagerApp extends Application {
     private void locateReportedPath(Path path) {
         if (path.getParent() == null || closing) { return; }
         Location target = Location.folder(path.getParent());
-        Location previous = location;
+        Location previous = context.location;
         request(target, "", "请在当前目录核查项目", () -> {
             if (!target.equals(previous)) {
-                past.addFirst(previous);
-                future.clear();
+                context.past.addFirst(previous);
+                context.future.clear();
             }
             browser.reveal(path);
         });
@@ -2634,13 +2799,13 @@ public final class FileManagerApp extends Application {
 
     private <T> void runFileTask(Task<T> task, String running, boolean writesDisk, Consumer<T> success) {
         if (fileTask != null || closing) { return; }
-        if (browseRequest != null && browseRequest.intent().automatic()) {
-            if (watchTarget != null) { queueWatchChanges(browseRequest.intent().changes()); }
+        if (context.browseRequest != null && context.browseRequest.intent().automatic()) {
+            if (context.watchTarget != null) { queueWatchChanges(context.browseRequest.intent().changes()); }
             cancelBrowse();
         }
         fileTask = task;
         writing = writesDisk;
-        if (browseRequest == null) { status.setText(running); }
+        if (context.browseRequest == null) { status.setText(running); }
         updateControls();
         task.setOnSucceeded(event -> {
             finishFileTask();
@@ -2677,7 +2842,7 @@ public final class FileManagerApp extends Application {
     private void updateControls() {
         boolean unavailable = closing || places == null;
         boolean commandsUnavailable = fileCommandsUnavailable();
-        boolean writableFolder = !commandsUnavailable && location.path() != null;
+        boolean writableFolder = !commandsUnavailable && context.location.path() != null;
         unknownResults.setDisable(unavailable);
         writeNotice.setVisible(fileTask != null);
         List<BrowserItem> selected = browser.selection();
@@ -2687,13 +2852,13 @@ public final class FileManagerApp extends Application {
         overview.setDisable(unavailable);
         address.setDisable(unavailable);
         searchField.setDisable(unavailable);
-        controls.get("back").setDisable(unavailable || past.isEmpty());
-        controls.get("forward").setDisable(unavailable || future.isEmpty());
+        controls.get("back").setDisable(unavailable || context.past.isEmpty());
+        controls.get("forward").setDisable(unavailable || context.future.isEmpty());
         controls.get("up").setDisable(unavailable || parentLocation() == null);
         controls.get("refresh").setDisable(unavailable);
         controls.get("search").setDisable(unavailable);
         controls.get("cancel-search").setVisible(isSearching());
-        controls.get("clear-search").setVisible(!isSearching() && !activeQuery.isEmpty());
+        controls.get("clear-search").setVisible(!isSearching() && !context.activeQuery.isEmpty());
         controls.get("clear-search").setDisable(unavailable);
         controls.get("new").setDisable(unavailable || !canCreate());
         controls.get("copy").setDisable(!editable || clipboardCommand != null);
@@ -2702,14 +2867,15 @@ public final class FileManagerApp extends Application {
         controls.get("rename").setDisable(!editable || selected.size() != 1);
         controls.get("paste").setDisable(!writableFolder || clipboardCommand != null || !clipboardHasFiles());
         for (String id : List.of("sort", "view", "more", "gallery-sources")) { controls.get(id).setDisable(unavailable); }
-        controls.get("gallery-sources").setVisible(location.page() == Page.GALLERY);
+        controls.get("gallery-sources").setVisible(context.location.page() == Page.GALLERY);
         controls.get("details-pane").setDisable(places == null);
-        progress.setVisible((browseRequest != null && !browseRequest.intent().automatic()) || fileTask != null || catalogTask != null);
+        progress.setVisible((context.browseRequest != null && !context.browseRequest.intent().automatic()) || fileTask != null || catalogTask != null);
     }
 
     private boolean fileCommandsUnavailable() {
-        return closing || places == null || fileTask != null || directoryUnavailable
-                || (browseRequest != null && !browseRequest.intent().automatic());
+        return closing || places == null || fileTask != null || context.directoryUnavailable
+                || context.needsReload
+                || (context.browseRequest != null && !context.browseRequest.intent().automatic());
     }
 
     private BrowserItem selectedItem() { return browser.selection().stream().findFirst().orElse(null); }

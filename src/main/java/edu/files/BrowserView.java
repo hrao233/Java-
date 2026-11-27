@@ -156,7 +156,10 @@ final class BrowserView extends StackPane {
     }
 
     private record NameEdit(Path path, String text, int selectionEnd, String suffix, Consumer<String> commit) { }
-    private record ScrollPosition(VirtualFlow<?> flow, Path firstPath, int index, double position) { }
+    record ScrollPosition(Path firstPath, double position) { }
+    record Presentation(Map<Field, Set<ColumnFilters.Bucket>> filters, ScrollPosition scroll, boolean homeFilesExpanded) {
+        static final Presentation DEFAULT = new Presentation(Map.of(), null, true);
+    }
 
     private final TableView<Line> table = new TableView<>();
     private final ListView<Line> tiles = new ListView<>() {
@@ -272,6 +275,21 @@ final class BrowserView extends StackPane {
         applyFilters();
     }
 
+    Presentation presentation() {
+        return new Presentation(filters.snapshot(), scrollPosition(), homeFilesExpanded);
+    }
+
+    void usePresentation(Presentation presentation) {
+        filters.restore(presentation.filters());
+        homeFilesExpanded = presentation.homeFilesExpanded();
+    }
+
+    void dismissTransientControls() {
+        cancelNewName();
+        if (context != null) { context.hide(); }
+        if (filterMenu != null) { filterMenu.hide(); }
+    }
+
     void render(List<BrowserItem> items, Settings next, boolean retainSelection, List<BrowserItem> verifiedSelection) {
         ScrollPosition scroll = verifiedSelection == null ? null : scrollPosition();
         boolean columnsChanged = !next.equals(settings);
@@ -309,13 +327,16 @@ final class BrowserView extends StackPane {
         syncing = true;
         try {
             if (details) {
+                tiles.getItems().clear();
                 if (columnsChanged) { updateColumns(); }
                 filterButtons.forEach((field, button) -> button.pseudoClassStateChanged(FILTERED, filters.active(field)));
                 table.getItems().setAll(lines);
                 syncTable();
             } else if (next.home()) {
+                table.getItems().clear();
                 updateHomeRows();
             } else {
+                table.getItems().clear();
                 tileColumns = 0;
                 galleryWidth = 0;
                 updateTiles();
@@ -335,21 +356,23 @@ final class BrowserView extends StackPane {
         int index = first == null ? -1 : first.getIndex();
         var displayed = table.isVisible() ? table.getItems() : tiles.getItems();
         BrowserItem item = index >= 0 && index < displayed.size() ? displayed.get(index).item() : null;
-        return new ScrollPosition(flow, item == null ? null : item.path(), index, flow.getPosition());
+        return new ScrollPosition(item == null ? null : item.path(), flow.getPosition());
     }
 
-    private void restoreScroll(ScrollPosition scroll) {
+    void restoreScroll(ScrollPosition scroll) {
+        if (scroll == null) { return; }
+        var control = table.isVisible() ? table : tiles;
+        if (!(control.lookup(".virtual-flow") instanceof VirtualFlow<?> flow)) { return; }
         if (scroll.firstPath() != null) {
             var displayed = table.isVisible() ? table.getItems() : tiles.getItems();
             for (int index = 0; index < displayed.size(); index++) {
                 if (displayed.get(index).items().stream().anyMatch(item -> scroll.firstPath().equals(item.path()))) {
-                    if (index == scroll.index()) { break; }
-                    scroll.flow().scrollToTop(index);
+                    flow.scrollToTop(index);
                     return;
                 }
             }
         }
-        scroll.flow().setPosition(scroll.position());
+        flow.setPosition(scroll.position());
     }
 
     void selectAll() { replaceSelection(ordered); }
@@ -368,7 +391,11 @@ final class BrowserView extends StackPane {
         refreshNameCells();
     }
 
-    void cancelNewName() { nameEdit = null; }
+    void cancelNewName() {
+        if (nameEdit == null) { return; }
+        nameEdit = null;
+        refreshNameCells();
+    }
 
     boolean reveal(Path path) {
         var item = ordered.stream().filter(candidate -> path.equals(candidate.path())).findFirst().orElse(null);

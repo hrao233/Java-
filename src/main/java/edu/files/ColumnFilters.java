@@ -47,6 +47,17 @@ final class ColumnFilters {
     void clear() { selected.clear(); }
     void clear(Field field) { selected.remove(field); }
 
+    Map<Field, Set<Bucket>> snapshot() {
+        Map<Field, Set<Bucket>> copy = new EnumMap<>(Field.class);
+        selected.forEach((field, buckets) -> copy.put(field, Set.copyOf(buckets)));
+        return Map.copyOf(copy);
+    }
+
+    void restore(Map<Field, Set<Bucket>> snapshot) {
+        selected.clear();
+        snapshot.forEach((field, buckets) -> selected.put(field, new HashSet<>(buckets)));
+    }
+
     List<Bucket> options(Field field, List<BrowserItem> items, LocalDate today) {
         return java.util.stream.Stream.concat(items.stream().map(item -> bucket(field, item, today)),
                         selected.getOrDefault(field, Set.of()).stream())

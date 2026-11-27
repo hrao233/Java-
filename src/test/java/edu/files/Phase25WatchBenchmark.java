@@ -329,7 +329,7 @@ final class Phase25WatchBenchmark {
     }
 
     private boolean listed(Path path) { return browser.items().stream().anyMatch(item -> path.equals(item.path())); }
-    private boolean idle() throws Exception { return field(app, "browseRequest") == null; }
+    private boolean idle() throws Exception { return ((BrowseContext) field(app, "context")).browseRequest == null; }
     private void refresh() throws Exception { fx(() -> { button("refresh").fire(); return null; }); }
     private Button button(String name) { return (Button) scene.lookup("#" + name); }
     private static Object field(FileManagerApp app, String name) throws Exception {
