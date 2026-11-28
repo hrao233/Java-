@@ -19,4 +19,4 @@
 
 核心实现和自动化回归在 `497ebcd7898b`，包括 `FileManagerApp`、`BrowserView`、样式及测试。阶段 3.0 的浏览请求、监听和文件任务接口继续复用。 [实现提交](https://github.com/hrao233/Java-/commit/497ebcd7898ba594da776361947647067d3b12ad)
 
-以开发分支供人工验收。通过阶段 3.1 的人工验收后可快进更新 `main`。 [GitHub 开发分支](https://github.com/hrao233/Java-/tree/feature/phase-3.1-dual-pane)
+2026-11-28，用户确认阶段 3.1 桌面验收通过。正式交付以 `main` 上的验收记录提交为准。 [桌面验收记录](02_验证与人工验收.md#桌面验收记录) · [GitHub 开发分支](https://github.com/hrao233/Java-/tree/feature/phase-3.1-dual-pane)
