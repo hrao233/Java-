@@ -22,6 +22,14 @@ function Invoke-Checked {
     if ($LASTEXITCODE -ne 0) { throw "$Tool exited with code $LASTEXITCODE" }
 }
 
+function Invoke-JPackage {
+    param([string]$Tool, [string]$ArgumentFile, [string[]]$Arguments)
+    # Use UTF-8 through jpackage's response file parser, including on non-Chinese Windows.
+    $Arguments | ForEach-Object { '"' + $_.Replace('\', '\\').Replace('"', '\"') + '"' } |
+        Set-Content -LiteralPath $ArgumentFile -Encoding utf8NoBOM
+    Invoke-Checked $Tool @("@$ArgumentFile")
+}
+
 function Copy-WindowsDependencies {
     param([string]$ResolvedJars, [string]$ApplicationInput, [string]$JavaFxInput)
 
@@ -112,7 +120,7 @@ try {
         '--module-path', $fxJars.FullName, '--class-path', $classPath, (Join-Path $inputJars.FullName $appJar))
     $modules = @($detectedModules -split ',' | Where-Object { $_ -notlike 'javafx.*' })
     # Keep modules used by diagnostics, non-English resources, and native code that jdeps cannot trace.
-    $modules += @('java.management', 'jdk.charsets', 'jdk.localedata', 'jdk.unsupported')
+    $modules += @('java.management', 'jdk.charsets', 'jdk.localedata', 'jdk.unsupported', 'jdk.zipfs')
     $modules = ($modules | Sort-Object -Unique) -join ','
     $runtime = Join-Path $build 'runtime'
     Invoke-Checked (Join-Path $jdkTools 'jlink.exe') @('--module-path', (Join-Path $javaHome 'jmods'),
@@ -122,7 +130,8 @@ try {
     $console = Join-Path $build 'diagnostics.properties'
     @('win-console=true', 'win-menu=false', 'win-shortcut=false') | Set-Content -LiteralPath $console -Encoding ascii
     $jpackage = Join-Path $jdkTools 'jpackage.exe'
-    Invoke-Checked $jpackage @('--type', 'app-image', '--name', $app, '--app-version', $version,
+    $packageArgs = Join-Path $build 'jpackage-arguments.txt'
+    Invoke-JPackage $jpackage $packageArgs @('--type', 'app-image', '--name', $app, '--app-version', $version,
         '--description', '本地文件管理器', '--vendor', 'hrao233', '--dest', $output, '--input', $inputJars.FullName,
         '--main-jar', $appJar, '--main-class', 'edu.files.FileManagerApp', '--icon', $icon,
         '--runtime-image', $runtime, '--add-launcher', "$app-Diagnostics=$console",
@@ -161,7 +170,7 @@ try {
         }
         foreach ($installerVersion in $installerVersions) {
             $setup = Join-Path $build "setup-$installerVersion"
-            Invoke-Checked $jpackage @('--type', 'exe', '--app-image', $image, '--name', '本地文件管理器',
+            Invoke-JPackage $jpackage $packageArgs @('--type', 'exe', '--app-image', $image, '--name', '本地文件管理器',
                 '--app-version', $installerVersion, '--description', '本地文件管理器', '--vendor', 'hrao233',
                 '--dest', $setup, '--icon', $icon, '--win-per-user-install', '--win-dir-chooser',
                 '--install-dir', $app, '--win-menu', '--win-menu-group', '本地文件管理器',

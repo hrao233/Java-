@@ -371,9 +371,12 @@ final class WindowsPlaces {
         return path;
     }
 
-    private static ProcessBuilder powershell(String script) {
+    static ProcessBuilder powershell(String script) {
+        String root = System.getenv("SystemRoot");
+        String executable = root == null ? "powershell.exe"
+                : Path.of(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe").toString();
         String encoded = Base64.getEncoder().encodeToString(script.getBytes(StandardCharsets.UTF_16LE));
-        return new ProcessBuilder("powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded);
+        return new ProcessBuilder(executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand", encoded);
     }
 
     private static void waitFor(ProcessBuilder command, String failure) throws IOException {

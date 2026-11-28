@@ -387,7 +387,7 @@ class NtfsFileOperationsTest {
         Path direct = Files.createDirectory(root.resolve("direct"));
         Path file = Files.writeString(direct.resolve("original.txt"), "original");
         Path junction = root.resolve("junction");
-        var command = new ProcessBuilder("powershell.exe", "-NoProfile", "-NonInteractive", "-Command",
+        var command = WindowsPlaces.powershell(
                 "New-Item -ItemType Junction -Path $env:PHASE_JUNCTION -Target $env:PHASE_TARGET -ErrorAction Stop | Out-Null")
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD).redirectError(ProcessBuilder.Redirect.DISCARD);
         command.environment().put("PHASE_JUNCTION", junction.toString());
