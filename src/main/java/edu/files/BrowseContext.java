@@ -31,6 +31,13 @@ final class BrowseContext {
 
     enum HomeTab { RECENT, FAVORITES, SHARED }
     enum Pane { NONE, DETAILS, PREVIEW }
+    enum Layout {
+        TRADITIONAL("传统"), COLUMNS("列式"), HYBRID("混合");
+
+        final String label;
+
+        Layout(String label) { this.label = label; }
+    }
 
     record Location(Page page, Path path) {
         static Location page(Page page) { return new Location(page, null); }
@@ -89,6 +96,8 @@ final class BrowseContext {
     String activeQuery = "";
     boolean quickAccessExpanded = true;
     Pane pane = Pane.NONE;
+    Layout layout = Layout.TRADITIONAL;
+    double hierarchyHeight = 0.33;
     BrowserView.Presentation presentation = BrowserView.Presentation.DEFAULT;
     Location opening;
     Listing listing = Listing.EMPTY;
@@ -124,6 +133,8 @@ final class BrowseContext {
         directoryUnavailable = original.directoryUnavailable;
         quickAccessExpanded = original.quickAccessExpanded;
         pane = original.pane;
+        layout = original.layout;
+        hierarchyHeight = original.hierarchyHeight;
         past.addAll(original.past);
         future.addAll(original.future);
         views.putAll(original.views);

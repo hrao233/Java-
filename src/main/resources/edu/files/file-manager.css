@@ -77,6 +77,89 @@
     -fx-background-color: -fm-surface;
 }
 
+.command-bar > #browse-layout {
+    -fx-background-color: -fm-secondary;
+    -fx-border-color: -fm-border;
+}
+
+.command-bar > #browse-layout:hover, .command-bar > #browse-layout:showing {
+    -fx-background-color: -fm-hover;
+}
+
+.command-bar > #browse-layout:focused {
+    -fx-border-color: -fm-accent;
+}
+
+.miller-column {
+    -fx-background-color: -fm-surface;
+    -fx-border-color: transparent -fm-border transparent transparent;
+}
+
+.miller-heading {
+    -fx-min-width: 0;
+    -fx-min-height: 33;
+    -fx-padding: 0 12;
+    -fx-background-color: -fm-secondary;
+    -fx-border-color: transparent transparent -fm-border transparent;
+    -fx-text-fill: -fm-muted;
+    -fx-font-weight: bold;
+}
+
+.miller-current > .miller-heading {
+    -fx-text-fill: -fm-text;
+}
+
+.miller-branches, .miller-entries {
+    -fx-background-color: -fm-surface;
+    -fx-padding: 0;
+}
+
+.miller-branches .list-cell {
+    -fx-background-color: -fm-surface;
+    -fx-padding: 0 10;
+    -fx-graphic-text-gap: 8;
+    -fx-text-fill: -fm-text;
+}
+
+.miller-branches .list-cell:filled:hover {
+    -fx-background-color: -fm-hover;
+}
+
+.miller-branches .list-cell:filled:path-branch,
+.miller-branches:focused .list-cell:filled:selected {
+    -fx-background-color: -fm-selection;
+    -fx-text-fill: -fm-accent-text;
+}
+
+.miller-branches:focused .list-cell:filled:focused {
+    -fx-border-color: -fm-accent;
+    -fx-border-insets: 2;
+    -fx-border-radius: 5;
+}
+
+.miller-message {
+    -fx-padding: 12;
+    -fx-text-fill: -fm-muted;
+}
+
+.browser-tiles.miller-entries .list-cell {
+    -fx-padding: 0 5;
+}
+
+.miller-entries .icon-entry {
+    -fx-padding: 4 6;
+    -fx-min-height: 32;
+}
+
+#browser-view:compact .miller-entries .icon-entry {
+    -fx-min-height: 25;
+}
+
+.hybrid-browser > .split-pane-divider {
+    -fx-padding: 3 0;
+    -fx-background-insets: 1 0;
+}
+
 .navigation {
     -fx-padding: 4 10;
     -fx-background-color: -fm-surface;

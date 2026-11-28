@@ -5,6 +5,7 @@ import edu.files.BrowseContext.BrowseIntent;
 import edu.files.BrowseContext.BrowseRequest;
 import edu.files.BrowseContext.FileRefresh;
 import edu.files.BrowseContext.HomeTab;
+import edu.files.BrowseContext.Layout;
 import edu.files.BrowseContext.Listing;
 import edu.files.BrowseContext.Location;
 import edu.files.BrowseContext.Page;
@@ -30,6 +31,7 @@ import javafx.concurrent.Task;
 import javafx.concurrent.WorkerStateEvent;
 import javafx.css.PseudoClass;
 import javafx.geometry.Insets;
+import javafx.geometry.Orientation;
 import javafx.geometry.Pos;
 import javafx.scene.Node;
 import javafx.scene.Scene;
@@ -118,6 +120,7 @@ public final class FileManagerApp extends Application {
         void ready(Path path, boolean preview);
         default void started(Path path, String query, long queueNanos) { }
         default void committed(Path path, long applyNanos) { }
+        default void ancestorReady(Path path) throws IOException { }
     }
 
     private final ExecutorService writes = Executors.newSingleThreadExecutor(work -> new Thread(work, "file-manager-write"));
@@ -303,7 +306,11 @@ public final class FileManagerApp extends Application {
         scene.getAccelerators().put(new KeyCodeCombination(KeyCode.F6, KeyCombination.SHORTCUT_DOWN,
                 KeyCombination.SHIFT_DOWN), () -> transferAcross(true));
         scene.getAccelerators().put(new KeyCodeCombination(KeyCode.N, KeyCombination.SHORTCUT_DOWN, KeyCombination.SHIFT_DOWN),
-                () -> { if (!newTypes.isEmpty()) { create(newTypes.getFirst()); } });
+                () -> {
+                    if (!newTypes.isEmpty() && !activePane.hierarchy.isNavigationFocus(scene.getFocusOwner())) {
+                        create(newTypes.getFirst());
+                    }
+                });
         stage.setTitle("本地文件管理器");
         stage.getIcons().add(new Image(getClass().getResource("application-icon.png").toExternalForm()));
         stage.setMinWidth(960);
@@ -626,6 +633,10 @@ public final class FileManagerApp extends Application {
             singleNavigation.getChildren().setAll(leftPane.navigation);
             leftPane.content.pseudoClassStateChanged(ACTIVE_BROWSER, false);
         }
+        if (leftPane.mountedLayout != leftPane.effectiveLayout()) {
+            leftPane.browser.dismissTransientControls();
+            leftPane.render(true);
+        }
         updateInspectorHost();
         updateControls();
     }
@@ -647,6 +658,8 @@ public final class FileManagerApp extends Application {
         MenuButton more = menuButton("···", "more", this::moreItems);
         commandGraphic(more, "更多命令", UiGlyph.MORE, false);
         more.getStyleClass().add("command-more");
+        MenuButton layout = menuButton("布局", "browse-layout", () -> activePane.layoutItems());
+        commandGraphic(layout, "浏览布局", UiGlyph.SPLIT, true);
         MenuButton sources = menuButton("图库来源", "gallery-sources", this::galleryItems);
         commandGraphic(sources, "图库来源", UiGlyph.GALLERY, true);
         sources.managedProperty().bind(sources.visibleProperty());
@@ -670,7 +683,7 @@ public final class FileManagerApp extends Application {
                 commandButton("粘贴", "paste", UiGlyph.PASTE, this::paste),
                 commandButton("重命名", "rename", UiGlyph.RENAME, this::renameSelected),
                 commandButton("移到回收站", "trash", UiGlyph.DELETE, this::trashSelected),
-                commandDivider(), sort, view, sources, dual, copyAcross, moveAcross, commandDivider(), more, space, details);
+                commandDivider(), sort, view, sources, more, space, layout, dual, copyAcross, moveAcross, details);
         bar.setId("command-bar");
         bar.getStyleClass().add("command-bar");
         bar.setAlignment(Pos.CENTER_LEFT);
@@ -1729,7 +1742,9 @@ public final class FileManagerApp extends Application {
     private void fileClipboardKey(KeyEvent event) {
         if (!event.isShortcutDown() || event.isAltDown()
                 || event.getTarget() instanceof TextInputControl
-                || stage.getScene().getFocusOwner() instanceof TextInputControl) { return; }
+                || stage.getScene().getFocusOwner() instanceof TextInputControl
+                || event.getTarget() instanceof Node node && activePane.hierarchy.isNavigationFocus(node)
+                || activePane.hierarchy.isNavigationFocus(stage.getScene().getFocusOwner())) { return; }
         switch (event.getCode()) {
             case C -> { if (event.isShiftDown()) { copyPaths(activePane); } else { fire("copy"); } }
             case X -> { if (event.isShiftDown()) { return; } fire("cut"); }
@@ -2641,6 +2656,11 @@ public final class FileManagerApp extends Application {
         controls.get("paste").setDisable(!writableFolder || clipboardCommand != null || !clipboardHasFiles());
         for (String id : List.of("sort", "view", "more", "gallery-sources")) { controls.get(id).setDisable(unavailable); }
         controls.get("gallery-sources").setVisible(activePane.context.location.page() == Page.GALLERY);
+        var layout = (MenuButton) controls.get("browse-layout");
+        layout.setText("布局 · " + activePane.effectiveLayout().label);
+        layout.setDisable(unavailable || !activePane.supportsProfessionalLayout());
+        layout.getTooltip().setText(dualPaneOpen ? "双栏使用传统布局"
+                : activePane.supportsProfessionalLayout() ? "浏览布局" : "当前页面使用传统布局");
         controls.get("details-pane").setDisable(places == null);
         controls.get("dual-pane").setDisable(unavailable);
         ((Button) controls.get("dual-pane")).setText(dualPaneOpen ? "单栏" : "双栏");
@@ -2864,8 +2884,12 @@ public final class FileManagerApp extends Application {
         final TextField searchField = new TextField();
         final Label heading;
         final VBox overview = new VBox(13);
+        final StackPane browserHost = new StackPane();
         final VBox inspector = new VBox(10);
         final BrowserView browser;
+        final MillerColumns hierarchy;
+        final SplitPane hybrid = new SplitPane();
+        Layout mountedLayout = Layout.TRADITIONAL;
         final Map<String, Button> navigationControls = new LinkedHashMap<>();
         final DirectoryWatcher watcher = new DirectoryWatcher(DirectoryIdentity::read, staging::contains,
                 notice -> Platform.runLater(() -> FileManagerApp.this.directoryChanged(notice)));
@@ -2883,6 +2907,18 @@ public final class FileManagerApp extends Application {
                     item -> contextMenu(this, item), () -> updateListingStatus(""),
                     this::homeHeader, this::flushWatchRefresh);
             browser.setMinWidth(0);
+            browser.setMinHeight(100);
+            hierarchy = new MillerColumns(reads, this::readAncestor, path -> {
+                browser.dismissTransientControls();
+                browser.clearSelection();
+                navigate(Location.folder(path));
+            }, () -> {
+                browser.cancelNewName();
+                if (!browser.selection().isEmpty()) { browser.clearSelection(); }
+            }, icons);
+            hybrid.setId("hybrid-browser");
+            hybrid.setOrientation(Orientation.VERTICAL);
+            hybrid.getStyleClass().add("hybrid-browser");
             browser.addEventFilter(MouseEvent.MOUSE_PRESSED, event -> pressFileDrag(this, event));
             browser.addEventFilter(MouseEvent.MOUSE_RELEASED, event -> dragPress = null);
             // File cells can consume DRAG_DETECTED before it bubbles to the browser.
@@ -2899,8 +2935,9 @@ public final class FileManagerApp extends Application {
             inspector.getStyleClass().add("inspector");
             inspector.setMinWidth(174);
             inspector.setPrefWidth(238);
-            content.getChildren().addAll(overview, browser);
-            VBox.setVgrow(browser, Priority.ALWAYS);
+            browserHost.getChildren().add(browser);
+            content.getChildren().addAll(overview, browserHost);
+            VBox.setVgrow(browserHost, Priority.ALWAYS);
             content.addEventFilter(MouseEvent.MOUSE_PRESSED, event -> activatePane(this));
             navigation.addEventFilter(MouseEvent.MOUSE_PRESSED, event -> activatePane(this));
             browser.addEventFilter(KeyEvent.KEY_PRESSED, this::browserKey);
@@ -3010,6 +3047,7 @@ public final class FileManagerApp extends Application {
 
         private void releaseBrowse(BrowseContext owner) {
             cancelBrowse(owner);
+            if (owner == context) { hierarchy.clear(); }
             for (Task<?> task : new Task<?>[]{owner.addressRead, owner.previewTask, owner.selectionRead, owner.cutMarkRead}) {
                 if (task != null) { reads.cancel(task); }
             }
@@ -3462,9 +3500,68 @@ public final class FileManagerApp extends Application {
             boolean gallery = context.location.page() == Page.GALLERY;
             boolean recent = context.location.page() == Page.HOME && context.homeTab == HomeTab.RECENT;
             Field sort = config.sort() == Field.VISITED && !recent ? Field.NAME : config.sort();
-            browser.render(context.listing.items(), new BrowserView.Settings(config.mode(), sort, config.descending(), config.group(),
+            Layout layout = effectiveLayout();
+            mountLayout(layout);
+            browser.render(context.listing.items(), new BrowserView.Settings(
+                    layout == Layout.COLUMNS ? Mode.LIST : config.mode(), sort, config.descending(), config.group(),
                     compact, checkboxes, extensions, computer, !context.activeQuery.isEmpty(), recent, homeLayout(), gallery,
-                    context.listing.imageRatios()), preserveSelection, verifiedSelection);
+                    context.listing.imageRatios(), layout == Layout.COLUMNS), preserveSelection, verifiedSelection);
+            if (layout != Layout.TRADITIONAL) {
+                hierarchy.showPath(context.location.path(), context.listingVersion, layout == Layout.HYBRID,
+                        browser, context.listing.items(), context.directoryUnavailable);
+            }
+        }
+
+        private boolean supportsProfessionalLayout() {
+            return !dualPaneOpen && context.location.page() == Page.DIRECTORY && context.activeQuery.isEmpty();
+        }
+
+        private Layout effectiveLayout() {
+            return supportsProfessionalLayout() && !context.needsReload ? context.layout : Layout.TRADITIONAL;
+        }
+
+        private List<MenuItem> layoutItems() {
+            var group = new ToggleGroup();
+            return Arrays.stream(Layout.values()).map(layout -> {
+                MenuItem item = radio(layout.label, group, layout == context.layout, () -> {
+                    if (!supportsProfessionalLayout() || layout == context.layout) { return; }
+                    browser.dismissTransientControls();
+                    context.layout = layout;
+                    render(true);
+                });
+                item.setId("layout-" + layout.name().toLowerCase(Locale.ROOT));
+                return item;
+            }).toList();
+        }
+
+        private void mountLayout(Layout layout) {
+            if (layout == mountedLayout) { return; }
+            if (mountedLayout == Layout.HYBRID) { context.hierarchyHeight = hybrid.getDividerPositions()[0]; }
+            hierarchy.clear();
+            hybrid.getItems().clear();
+            browserHost.getChildren().clear();
+            browser.setVisible(true);
+            browser.setManaged(true);
+            mountedLayout = layout;
+            switch (layout) {
+                case TRADITIONAL -> browserHost.getChildren().add(browser);
+                case COLUMNS -> browserHost.getChildren().add(hierarchy);
+                case HYBRID -> {
+                    hybrid.getItems().setAll(hierarchy, browser);
+                    hybrid.setDividerPositions(context.hierarchyHeight);
+                    browserHost.getChildren().add(hybrid);
+                }
+            }
+        }
+
+        private Task<List<BrowserItem>> readAncestor(Path path) {
+            LocalFiles.Visibility filters = visibility;
+            return task(cancelled -> {
+                var entries = readVisibleDirectory(path, filters, cancelled).entries().stream()
+                        .filter(LocalFiles.Entry::directory).map(BrowserItem::file).toList();
+                readObserver.ancestorReady(path);
+                return entries;
+            });
         }
 
         private void renderAutomatic(BrowseData data, DirectoryEvents.Batch changes) {
@@ -3559,7 +3656,7 @@ public final class FileManagerApp extends Application {
         private List<MenuItem> viewItems() {
             ToggleGroup modes = new ToggleGroup();
             List<MenuItem> result = new ArrayList<>();
-            List<Mode> modesForPage = switch (context.location.page()) {
+            List<Mode> modesForPage = effectiveLayout() == Layout.COLUMNS ? List.of() : switch (context.location.page()) {
                 case GALLERY -> List.of(Mode.HUGE, Mode.LARGE, Mode.MEDIUM, Mode.SMALL);
                 case HOME -> homeLayout() ? List.of() : List.of(Mode.values());
                 default -> List.of(Mode.values());

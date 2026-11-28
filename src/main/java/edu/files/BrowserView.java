@@ -150,7 +150,7 @@ final class BrowserView extends StackPane {
 
     record Settings(Mode mode, Field sort, boolean descending, Field group, boolean compact,
                     boolean checkboxes, boolean extensions, boolean computer, boolean locations,
-                    boolean recent, boolean home, boolean gallery, Map<Path, Double> imageRatios) { }
+                    boolean recent, boolean home, boolean gallery, Map<Path, Double> imageRatios, boolean columns) { }
 
     private record Line(String heading, List<BrowserItem> items) {
         BrowserItem item() { return items.isEmpty() ? null : items.getFirst(); }
@@ -352,9 +352,10 @@ final class BrowserView extends StackPane {
         boolean details = next.mode() == Mode.DETAILS && !next.home() && !next.gallery();
         table.setVisible(details);
         tiles.setVisible(!details);
-        tiles.getStyleClass().removeAll("home-entries", "gallery-entries");
+        tiles.getStyleClass().removeAll("home-entries", "gallery-entries", "miller-entries");
         if (next.home()) { tiles.getStyleClass().add("home-entries"); }
         if (next.gallery()) { tiles.getStyleClass().add("gallery-entries"); }
+        if (next.columns()) { tiles.getStyleClass().add("miller-entries"); }
         pseudoClassStateChanged(COMPACT, next.compact());
         syncing = true;
         try {
@@ -782,7 +783,7 @@ final class BrowserView extends StackPane {
             @Override
             protected double computePrefWidth(double height) {
                 // The gallery fits its rows to the viewport width assigned by VirtualFlow.
-                return galleryVisible() ? 0 : super.computePrefWidth(height);
+                return galleryVisible() || settings != null && settings.columns() ? 0 : super.computePrefWidth(height);
             }
 
             @Override
@@ -835,7 +836,7 @@ final class BrowserView extends StackPane {
             return;
         }
         int width = settings.mode().width;
-        int count = width == 0 ? 1 : Math.max(1, (int) (tiles.getWidth() - 24) / (width + 8));
+        int count = settings.columns() || width == 0 ? 1 : Math.max(1, (int) (tiles.getWidth() - 24) / (width + 8));
         if (count == tileColumns) {
             return;
         }
@@ -1075,6 +1076,10 @@ final class BrowserView extends StackPane {
         } else {
             Label label = new Label(item.displayName(settings.extensions()));
             label.getStyleClass().add("icon-name");
+            if (settings.columns()) {
+                label.setMinWidth(0);
+                label.setTooltip(new Tooltip(item.displayName(settings.extensions())));
+            }
             name = label;
         }
         Node graphic = iconGraphic(item, mode);
@@ -1099,6 +1104,11 @@ final class BrowserView extends StackPane {
             }
             HBox row = new HBox(9, graphic, text);
             row.setAlignment(Pos.CENTER_LEFT);
+            if (settings.columns()) {
+                text.setMinWidth(0);
+                HBox.setHgrow(text, Priority.ALWAYS);
+                if (item.directory()) { row.getChildren().add(UiGlyph.RIGHT.graphic(13)); }
+            }
             content = row;
         }
         StackPane frame = new StackPane(content);
@@ -1108,6 +1118,11 @@ final class BrowserView extends StackPane {
             frame.getChildren().add(check);
         }
         frame.getStyleClass().add("icon-entry");
+        if (settings.columns()) {
+            frame.setMinWidth(0);
+            frame.prefWidthProperty().bind(Bindings.max(0, tiles.widthProperty().subtract(26)));
+            return selectableEntry(frame, item);
+        }
         double width = mode.width == 0 ? Math.max(220, tiles.getWidth() - 34) : mode.width;
         frame.setMinWidth(width);
         frame.setPrefWidth(width);
@@ -1127,7 +1142,10 @@ final class BrowserView extends StackPane {
             if (event.getButton() == MouseButton.PRIMARY && !editingName(item)) {
                 event.consume();
                 tiles.requestFocus();
-                if (event.getClickCount() == 2 && item.equals(anchor) && selected.contains(item)
+                if (settings.columns() && item.directory() && event.getClickCount() == 1
+                        && !event.isShiftDown() && !event.isShortcutDown()) {
+                    onOpen.accept(item);
+                } else if (event.getClickCount() == 2 && item.equals(anchor) && selected.contains(item)
                         && !event.isShiftDown() && !event.isShortcutDown()) {
                     onOpen.accept(item);
                 } else {

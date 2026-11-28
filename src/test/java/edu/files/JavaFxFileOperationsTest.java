@@ -18,8 +18,11 @@ import javafx.scene.control.ComboBox;
 import javafx.scene.control.ContextMenu;
 import javafx.scene.control.DialogPane;
 import javafx.scene.control.Label;
+import javafx.scene.control.ListCell;
 import javafx.scene.control.ListView;
+import javafx.scene.control.MenuButton;
 import javafx.scene.control.MenuItem;
+import javafx.scene.control.ScrollPane;
 import javafx.scene.control.Tab;
 import javafx.scene.control.TabPane;
 import javafx.scene.control.TableRow;
@@ -101,6 +104,8 @@ class JavaFxFileOperationsTest {
     private final CountDownLatch copyHasBytes = new CountDownLatch(1);
     private final CountDownLatch releaseCopy = new CountDownLatch(1);
     private final AtomicReference<ReadGate> heldRead = new AtomicReference<>();
+    private final AtomicReference<ReadGate> heldAncestor = new AtomicReference<>();
+    private final AtomicReference<Path> failedAncestor = new AtomicReference<>();
     private final AtomicReference<Gate> heldPublish = new AtomicReference<>();
     private final AtomicReference<Gate> heldMove = new AtomicReference<>();
     private final AtomicInteger browseCommits = new AtomicInteger();
@@ -109,6 +114,147 @@ class JavaFxFileOperationsTest {
     private final AtomicReference<FileDrag.Intent> dragIntent = new AtomicReference<>(FileDrag.Intent.COPY);
     private Map<Path, CompletableFuture<Long>> timedPanes = Map.of();
     private Path captures;
+
+    @Test
+    void professionalLayoutsShareNavigationAndTheCurrentFileSelection() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path parent = Files.createDirectories(root.resolve("project/data"));
+        Path left = Files.createDirectory(parent.resolve("branch-one"));
+        Path right = Files.createDirectory(parent.resolve("branch-two"));
+        Path file = Files.writeString(left.resolve("report.txt"), "source");
+        Path child = Files.createDirectory(left.resolve("subdirectory"));
+        openWindow(true);
+        goWatched(left);
+        menu("viewItems", "mode-large");
+        pickLayout("columns");
+        await(() -> branchEntries(parent).containsAll(List.of(left, right)), "ancestor siblings", 8);
+        fx(() -> {
+            var hierarchy = (ScrollPane) scene.lookup("#miller-columns");
+            assertEquals(hierarchy.getHmax(), hierarchy.getHvalue());
+            assertTrue(hierarchy.getContent().getBoundsInLocal().getWidth() > hierarchy.getViewportBounds().getWidth());
+            return null;
+        });
+        select(file);
+        await(this::hasSelectionProof, "verified current file", 8);
+        click("copy");
+        await(() -> idle() && cutSources().equals(List.of(file)), "copy binds the current column", 8);
+        fx(() -> {
+            var branches = scene.getRoot().lookupAll(".miller-column").stream()
+                    .filter(node -> parent.equals(node.getUserData())).findFirst().orElseThrow()
+                    .lookup(".miller-branches");
+            shortcut(branches, KeyCode.V, false);
+            assertNull(field(app, "clipboardCommand"), "navigation cells cannot start a paste");
+            clickColumnRow(".miller-branches .list-cell", right);
+            assertTrue(button("copy").isDisabled());
+            return null;
+        });
+        await(() -> browseAt(right) && browser.items().isEmpty(), "sibling branch", 8);
+        clickOnPane(false, "back");
+        await(() -> browseAt(left) && listed(file), "back from sibling", 8);
+        clickOnPane(false, "forward");
+        await(() -> browseAt(right), "forward to sibling", 8);
+        go(left);
+        fx(() -> {
+            clickColumnRow(".miller-entries .selectable-entry", child);
+            return null;
+        });
+        await(() -> browseAt(child), "single click in current column", 8);
+        clickOnPane(false, "back");
+        await(() -> browseAt(left), "back to file directory", 8);
+        Path external = Files.writeString(left.resolve("external.txt"), "external change");
+        await(() -> listed(external), "watch updates the current column", 10);
+        pickLayout("hybrid");
+        fx(() -> {
+            assertNotNull(scene.lookup("#hybrid-browser"));
+            assertTrue(branchEntries(left).contains(child));
+            assertEquals(BrowserView.Mode.LARGE, currentBrowse().view().mode());
+            assertTrue(scene.lookup(".browser-tiles").isVisible());
+            var search = (TextField) scene.lookup("#search-field");
+            search.setText("report");
+            search.fireEvent(new ActionEvent());
+            return null;
+        });
+        await(() -> "report".equals(currentBrowse().activeQuery) && scene.lookup("#miller-columns") == null,
+                "traditional search results", 8);
+        clickOnPane(false, "clear-search");
+        await(() -> currentBrowse().activeQuery.isEmpty() && scene.lookup("#hybrid-browser") != null,
+                "restore hybrid after search", 8);
+        click("dual-pane");
+        await(() -> paneAt(true, left) && scene.lookup("#miller-columns") == null, "traditional dual pane", 8);
+        click("dual-pane");
+        await(() -> scene.lookup("#hybrid-browser") != null, "restore hybrid after dual pane", 8);
+        pickLayout("traditional");
+        assertTrue(fx(() -> scene.lookup("#miller-columns") == null && browseAt(left)
+                && currentBrowse().view().mode() == BrowserView.Mode.LARGE));
+    }
+
+    @Test
+    void ancestorReadsRefreshFailAndDiscardResultsAfterTabChanges() throws Exception {
+        Path parent = Files.createDirectory(root.resolve("first"));
+        Path old = Files.createDirectory(parent.resolve("old"));
+        Path next = Files.createDirectories(root.resolve("second/next"));
+        openWindow(false);
+        go(old);
+        var delayed = new Gate();
+        heldAncestor.set(new ReadGate(parent, false, delayed));
+        pickLayout("columns");
+        try {
+            assertTrue(delayed.entered.await(8, TimeUnit.SECONDS));
+            await(() -> scene.getRoot().lookupAll(".miller-message").stream().anyMatch(node ->
+                    node.isVisible() && ((Label) node).getText().equals("正在读取…")), "loading ancestor", 8);
+            var previous = fx(() -> tabs().getSelectionModel().getSelectedItem());
+            click("new-tab");
+            await(() -> browseAt(old) && currentBrowse() != owner(previous), "new tab", 8);
+            fx(() -> { close(previous); return null; });
+            go(next);
+            failedAncestor.set(next.getParent());
+            pickLayout("hybrid");
+            await(() -> scene.getRoot().lookupAll(".miller-message").stream().anyMatch(node ->
+                    node.isVisible() && ((Label) node).getText().contains("无法读取")), "ancestor read error", 8);
+            delayed.release.countDown();
+            assertTrue(delayed.returned.await(8, TimeUnit.SECONDS));
+            assertTrue(fx(() -> scene.getRoot().lookupAll(".miller-column").stream().noneMatch(node -> parent.equals(node.getUserData()))));
+            Path added = Files.createDirectory(next.getParent().resolve("new sibling"));
+            clickOnPane(false, "refresh");
+            await(() -> branchEntries(next.getParent()).contains(added), "refresh recovers ancestor", 8);
+        } finally {
+            delayed.release.countDown();
+        }
+    }
+
+    private void pickLayout(String layout) throws Exception {
+        fx(() -> {
+            var button = (MenuButton) scene.lookup("#browse-layout");
+            assertFalse(button.isDisabled());
+            button.show();
+            try {
+                button.getItems().stream().filter(item -> ("layout-" + layout).equals(item.getId()))
+                        .findFirst().orElseThrow().fire();
+            } finally {
+                button.hide();
+            }
+            return null;
+        });
+    }
+
+    private List<Path> branchEntries(Path folder) {
+        for (Node node : scene.getRoot().lookupAll(".miller-column")) {
+            if (folder.equals(node.getUserData()) && node.lookup(".miller-branches") instanceof ListView<?> rows) {
+                return rows.getItems().stream().map(BrowserItem.class::cast).map(BrowserItem::path).toList();
+            }
+        }
+        return List.of();
+    }
+
+    private void clickColumnRow(String selector, Path path) {
+        scene.getRoot().applyCss();
+        scene.getRoot().layout();
+        Node row = scene.getRoot().lookupAll(selector).stream().filter(node -> {
+            Object item = node instanceof ListCell<?> cell ? cell.getItem() : node.getUserData();
+            return item instanceof BrowserItem file && path.equals(file.path());
+        }).findFirst().orElseThrow();
+        Event.fireEvent(row, sceneMouse(MouseEvent.MOUSE_CLICKED, 3, 3, MouseButton.PRIMARY, false));
+    }
 
     @Test
     void tabStripAndNameColumnAdaptToAvailableSpace() throws Exception {
@@ -335,6 +481,18 @@ class JavaFxFileOperationsTest {
             app = new FileManagerApp(preferences, this::operation, new FileManagerApp.ReadObserver() {
                 @Override
                 public void ready(Path path, boolean preview) { readReady(path, preview); }
+
+                @Override
+                public void ancestorReady(Path path) throws IOException {
+                    Path failure = failedAncestor.get();
+                    if (path.equals(failure) && failedAncestor.compareAndSet(failure, null)) {
+                        throw new IOException("simulated ancestor read error");
+                    }
+                    var read = heldAncestor.get();
+                    if (read != null && path.equals(read.path()) && heldAncestor.compareAndSet(read, null)) {
+                        read.gate().hold();
+                    }
+                }
 
                 @Override
                 public void committed(Path path, long applyNanos) {
