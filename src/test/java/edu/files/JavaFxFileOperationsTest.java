@@ -18,12 +18,15 @@ import javafx.scene.control.ComboBox;
 import javafx.scene.control.ContextMenu;
 import javafx.scene.control.DialogPane;
 import javafx.scene.control.Label;
+import javafx.scene.control.ListView;
 import javafx.scene.control.MenuItem;
 import javafx.scene.control.Tab;
 import javafx.scene.control.TabPane;
 import javafx.scene.control.TableRow;
+import javafx.scene.control.TableView;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
+import javafx.scene.control.Tooltip;
 import javafx.scene.control.skin.VirtualFlow;
 import javafx.scene.image.Image;
 import javafx.scene.image.PixelFormat;
@@ -37,6 +40,10 @@ import javafx.scene.input.MouseButton;
 import javafx.scene.input.MouseEvent;
 import javafx.scene.input.PickResult;
 import javafx.scene.input.TransferMode;
+import javafx.scene.layout.Region;
+import javafx.scene.paint.Color;
+import javafx.stage.Popup;
+import javafx.stage.PopupWindow;
 import javafx.stage.Stage;
 import javafx.stage.Window;
 import javafx.stage.WindowEvent;
@@ -102,6 +109,143 @@ class JavaFxFileOperationsTest {
     private final AtomicReference<FileDrag.Intent> dragIntent = new AtomicReference<>(FileDrag.Intent.COPY);
     private Map<Path, CompletableFuture<Long>> timedPanes = Map.of();
     private Path captures;
+
+    @Test
+    void themeSwitchUpdatesTaskAndConflictWindowsAndLaterDialogs() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path from = Files.createDirectory(root.resolve("theme-source"));
+        Path to = Files.createDirectory(root.resolve("theme-target"));
+        Path source = Files.writeString(from.resolve("collision.txt"), "source");
+        Path target = Files.writeString(to.resolve("collision.txt"), "target");
+        openWindow(false);
+        go(from);
+        select(source);
+        click("copy");
+        await(() -> idle() && cutSources().equals(List.of(source)), "theme fixture copy request", 8);
+        go(to);
+        click("paste");
+        await(() -> progressScene() != null && conflictScene() != null, "visible task and conflict windows", 10);
+        fx(() -> {
+            assertBackground((Region) scene.getRoot(), "#EDF1F7");
+            fireTheme("theme-dark");
+            assertBackground((Region) scene.getRoot(), "#222A36");
+            assertBackground((Region) progressScene().getRoot(), "#202733");
+            assertBackground((Region) conflictScene().getRoot(), "#202733");
+            assertEquals(Color.web("#E6EBF4"), ((Label) conflictScene().lookup(".operation-heading")).getTextFill());
+            return null;
+        });
+        chooseConflict("conflict-skip");
+        await(() -> idle() && conflictScene() == null, "conflict skipped", 10);
+        assertEquals("target", Files.readString(target));
+        fx(() -> {
+            var items = (List<?>) call(app, "moreItems");
+            var options = items.stream().filter(MenuItem.class::isInstance).map(MenuItem.class::cast)
+                    .filter(item -> "options".equals(item.getId())).findFirst().orElseThrow();
+            Platform.runLater(options::fire);
+            return null;
+        });
+        await(() -> dialog("文件管理器选项") != null, "new dialog in dark theme", 8);
+        fx(() -> {
+            DialogPane options = dialog("文件管理器选项");
+            assertBackground(options, "#181E28");
+            fireTheme("theme-light");
+            assertBackground(options, "#FFFFFF");
+            ((Button) options.lookupButton(ButtonType.CANCEL)).fire();
+            return null;
+        });
+    }
+
+    @Test
+    void themeStylesTooltipsMenusAndAddressSuggestions() throws Exception {
+        Path folder = Files.createDirectory(root.resolve("suggestion"));
+        openWindow(false);
+        go(folder);
+        fx(() -> {
+            Node anchor = button("edit-address");
+            // These real popup windows stay open across a palette change.
+            Tooltip tooltip = new Tooltip("编辑路径");
+            ContextMenu menu = new ContextMenu(new MenuItem("复制"));
+            menu.show(anchor, stage.getX() + 140, stage.getY() + 100);
+            tooltip.show(anchor, stage.getX() + 140, stage.getY() + 210);
+            try {
+                fireTheme("theme-dark");
+                Region menuSurface = (Region) menu.getSkin().getNode();
+                Region tooltipSurface = (Region) tooltip.getSkin().getNode();
+                assertBackground(menuSurface, "#181E28");
+                assertBackground(tooltipSurface, "#181E28");
+                assertEquals(Color.web("#E6EBF4"), ((Label) menuSurface.lookup(".label")).getTextFill());
+            } finally {
+                tooltip.hide();
+                menu.hide();
+            }
+            return null;
+        });
+        fx(() -> {
+            button("edit-address").fire();
+            AddressBar bar = (AddressBar) field(pane(false), "address");
+            Method history = AddressBar.class.getDeclaredMethod("showHistory", boolean.class);
+            history.setAccessible(true);
+            history.invoke(bar, false);
+            return null;
+        });
+        AddressBar bar = fx(() -> (AddressBar) field(pane(false), "address"));
+        Popup popup = fx(() -> (Popup) field(bar, "popup"));
+        await(popup::isShowing, "address suggestions in dark theme", 8);
+        fx(() -> {
+            var choices = (ListView<?>) popup.getScene().lookup("#address-choices");
+            assertFalse(choices.getItems().isEmpty());
+            assertBackground(choices, "#181E28");
+            fireTheme("theme-light");
+            assertBackground(choices, "#FFFFFF");
+            popup.hide();
+            return null;
+        });
+    }
+
+    @Test
+    void themeAndDensityKeepTheSelectedFileInTheVirtualTable() throws Exception {
+        Path file = Files.writeString(root.resolve("项目记录.txt"), "selected");
+        openWindow(false);
+        go(root);
+        select(file);
+        fx(() -> {
+            TableView<?> table = (TableView<?>) scene.lookup("#entries");
+            scene.getRoot().applyCss();
+            scene.getRoot().layout();
+            assertEquals(32, table.getFixedCellSize());
+            var row = (TableRow<?>) table.lookupAll(".table-row-cell").stream()
+                    .filter(node -> node instanceof TableRow<?> visible && visible.isSelected())
+                    .findFirst().orElseThrow();
+            assertBackground(row, "#E2ECFF");
+            fireTheme("theme-dark");
+            assertBackground(row, "#293F67");
+            return null;
+        });
+        fx(() -> {
+            var menu = (javafx.scene.control.Menu) ((List<?>) call(activePane(), "viewItems")).getLast();
+            var compact = (CheckMenuItem) menu.getItems().stream()
+                    .filter(item -> "show-compact".equals(item.getId())).findFirst().orElseThrow();
+            compact.setSelected(true);
+            compact.fire();
+            var table = (TableView<?>) scene.lookup("#entries");
+            scene.getRoot().applyCss();
+            assertEquals(25, table.getFixedCellSize());
+            assertEquals(List.of(file), selectedPaths());
+            return null;
+        });
+    }
+
+    private void fireTheme(String id) throws Exception {
+        var preview = (javafx.scene.control.Menu) call(app, "appearanceMenu");
+        preview.getItems().stream().filter(item -> id.equals(item.getId())).findFirst().orElseThrow().fire();
+    }
+
+    private static void assertBackground(Region node, String hex) {
+        assertNotNull(node);
+        node.getScene().getRoot().applyCss();
+        assertNotNull(node.getBackground(), node::toString);
+        assertEquals(Color.web(hex), node.getBackground().getFills().getLast().getFill());
+    }
 
     @BeforeAll
     static void startJavaFx() throws Exception {
@@ -3086,15 +3230,27 @@ class JavaFxFileOperationsTest {
         fx(() -> {
             assertTrue(button("paste").isDisabled());
             button("paste").fire();
+            fireTheme("theme-dark");
             button("unknown-results").fire();
             return null;
         });
         await(() -> unknownDialog() != null, "read-only findings", 12);
         fx(() -> {
             var pane = unknownDialog();
+            assertBackground(pane, "#181E28");
             @SuppressWarnings("unchecked")
             var paths = (ComboBox<Path>) pane.lookup("#unknown-path");
             assertEquals(original, paths.getValue());
+            paths.show();
+            try {
+                Region choices = Window.getWindows().stream().filter(PopupWindow.class::isInstance)
+                        .map(window -> window.getScene().lookup(".list-view"))
+                        .filter(Region.class::isInstance).map(Region.class::cast)
+                        .findFirst().orElseThrow();
+                assertBackground(choices, "#181E28");
+            } finally {
+                paths.hide();
+            }
             assertTrue(((TextArea) pane.lookup("#unknown-details")).getText().contains("当前路径观测"));
             var open = pane.getButtonTypes().stream().filter(button -> button.getText().contains("重新选择"))
                     .findFirst().orElseThrow();
