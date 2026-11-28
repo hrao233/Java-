@@ -1,0 +1,41 @@
+{
+  "jdk": {
+    "version": "21.0.13.0.2",
+    "source": "86770f4f323a4d711534e07ebef5ce2419f2ecf8",
+    "url": "https://aka.ms/download-jdk/microsoft-jdk-21.0.13.0.2-windows-x64.zip",
+    "sha256": "c5706a9cf482ef1a0622a86eea5b13d557b07f04554572af061e2d02b58c0f99"
+  },
+  "wix": {
+    "version": "3.14.1.8722",
+    "url": "https://github.com/wixtoolset/wix3/releases/download/wix3141rtm/wix314-binaries.zip",
+    "sha256": "6ac824e1642d6f7277d0ed7ea09411a508f6116ba6fae0aa5f2c7daa2ff43d31"
+  },
+  "maven": "3.10.0",
+  "mavenDistribution": {
+  "version": "3.10.0",
+  "url": "https://repo.maven.apache.org/maven2/org/apache/maven/apache-maven/3.10.0/apache-maven-3.10.0-bin.zip",
+  "sha512": "22d31676d5b92ed53308c19ecded3245d0efd0cddfec51ec7bab62f4f13ad70ddddceff8e62940e0e8e2421f3cde8106737f4becec0aa034ffeff2a754e88337"
+},
+  "sources": {
+  "Microsoft-OpenJDK-21.0.13.0.2.tar.gz": {
+    "url": "https://codeload.github.com/microsoft/openjdk-jdk21u/tar.gz/86770f4f323a4d711534e07ebef5ce2419f2ecf8",
+    "sha256": "2e6d0139395e6634e1a1452c7a101c2702bd9c3532401256fa4bd7267bff4394"
+  },
+  "OpenJFX-21.0.6+3.tar.gz": {
+    "url": "https://codeload.github.com/openjdk/jfx21u/tar.gz/5ad442749972f73caf4aa320106d9a25e866addc",
+    "sha256": "1c7ebe11118f261bb1cc40e3b273523f1fcf47f229ba68cba5badc46187304ff"
+  },
+  "WiX-3.14.1.tar.gz": {
+    "url": "https://codeload.github.com/wixtoolset/wix3/tar.gz/refs/tags/wix3141rtm",
+    "sha256": "374ec1923954c0df5874964d845c09d887012fbab5aa13d000201d0b9f789d96"
+  }
+},
+  "upgradeUuid": "ea08d918-b57f-4da2-8704-33ef88e9b709",
+  "dependencies": {
+    "javafx-base-21.0.6-win.jar": "618a1149089d1459cc569cc10eac05c5589a532473d09f35c1e9ea2c5b6de50e",
+    "javafx-controls-21.0.6-win.jar": "df877b7d330abeed47f2cae466a54f338cccf9d81bf29c464f5a948ee49e4f72",
+    "javafx-graphics-21.0.6-win.jar": "4b0981384551f39a0ca9679672f2abbedd9d0966763205534fca230b1cf314a5",
+    "jna-5.17.0.jar": "b3a9408e7c51e08ef0e3bfcc08f443f6ec0f6191ba8cd7c18d53d2b22e5bdbc0",
+    "icu4j-79.1.jar": "28b292e60d0d00c496bae88a15b2615f89f781be13670aeac9dc90f189570e07"
+  }
+}

@@ -1,0 +1,27 @@
+本地文件管理器 1.0.0 第三方声明
+
+本项目声明见 FileManager-MIT.txt。第三方组件的许可见同一目录下的 third-party，JDK 导出的模块声明位于 runtime/legal。
+
+* Microsoft Build of OpenJDK 21.0.13.0.2 (Windows x64)
+  GPL-2.0-only with the Classpath Exception，另有 runtime/legal 所列条款。
+  对应源提交 86770f4f323a4d711534e07ebef5ce2419f2ecf8，包含运行时与 jpackage 启动器构建脚本。
+  https://github.com/microsoft/openjdk-jdk21u/tree/86770f4f323a4d711534e07ebef5ce2419f2ecf8
+* OpenJFX 21.0.6+3 (Windows x64，base、controls、graphics)
+  GPL-2.0-only with the Classpath Exception。附带实际模块的 ADDITIONAL_LICENSE_INFO、ASSEMBLY_EXCEPTION、LICENSE、JPEG 和 Mesa 声明。
+  对应源码标签 21.0.6+3，提交 5ad442749972f73caf4aa320106d9a25e866addc。
+  https://github.com/openjdk/jfx21u/tree/5ad442749972f73caf4aa320106d9a25e866addc
+* JNA 5.17.0
+  按 Apache-2.0 分发。保留 Java 类、Windows x64 jnidispatch DLL 与原 JAR 许可，移除其他平台的 jnidispatch 库。
+  本地库的 libffi 声明位于 third-party/JNA。上游标签和源文件见下方。
+  https://github.com/java-native-access/jna/tree/695ae749e7bfd92f88324147c5d96b7129efec3e
+* ICU4J 79.1
+  Unicode License V3，附上完整版权及其他 ICU 数据声明。
+  https://github.com/unicode-org/icu/tree/ddc6b66926bfac6036144ca9902992a0d6d50af9
+* WiX 3.14.1
+  EXE 安装程序由此版工具生成。附带 MSI 用户界面与自定义操作所涉及的 WiX 声明和源代码来源。
+  https://github.com/wixtoolset/wix3/tree/wix3141rtm
+
+JavaFX 和 Microsoft JDK 的 Windows 发行件包含其随附的 Microsoft Visual C++ 运行库。版权归 Microsoft。
+https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist
+
+正式二进制分发时，请一并提供同版本源码附件 JavaFXFileManager-1.0.0-third-party-sources.zip，或在与二进制相同的下载页提供符合随附许可的对应源代码获取方式。

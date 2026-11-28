@@ -1,0 +1,2 @@
+# Preserve the original upstream license files, including line endings.
+/packaging/third-party/** -text -whitespace
