@@ -55,6 +55,6 @@ jobs:
           ./scripts/test-windows-installation.ps1 `
               -Setup (Join-Path $assets 'JavaFXFileManager-1.0.0-windows-x64-setup.exe') `
               -Upgrade (Join-Path $assets 'JavaFXFileManager-1.0.1-windows-x64-upgrade-test.exe') `
-              -UseMsiPayload -SkipShortcutLaunch `
+              -UseMsiPayload `
               -FixtureDirectory (Join-Path $env:RUNNER_TEMP 'installation fixtures') |
               Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append

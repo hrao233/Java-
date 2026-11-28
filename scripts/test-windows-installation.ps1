@@ -95,7 +95,8 @@ if ($UseMsiPayload) {
     $Upgrade = $upgradePayload
     Write-Host 'Testing the exact embedded MSI payloads. The EXE bootstrap is a desktop acceptance item.'
 }
-$install = Join-Path $root '安装 目录'
+# JDK 21's native launcher requires an executable path representable in the active Windows code page.
+$install = Join-Path $root 'Install Directory'
 $exe = Join-Path $install 'JavaFXFileManager.exe'
 $fixture = Join-Path $root '用户 文件.txt'
 Set-Content -LiteralPath $fixture -Value 'installer lifecycle fixture'
@@ -181,6 +182,7 @@ function Test-ShortcutLaunch {
         $env:Path = "$env:SystemRoot\System32;$env:SystemRoot"
         $env:JAVA_HOME = $null
         $env:JAVA_TOOL_OPTIONS = "-Dedu.files.preferencesNode=$profile"
+        Write-Host "Launching $Shortcut"
         Start-Process -FilePath $Shortcut -WorkingDirectory $root
         $deadline = [DateTime]::UtcNow.AddSeconds(35)
         do {
@@ -195,6 +197,7 @@ function Test-ShortcutLaunch {
                 if (-not $window.CloseMainWindow() -or -not $window.WaitForExit(20000)) {
                     throw 'The installed application did not close normally'
                 }
+                Write-Host 'The application opened and closed with the bundled JVM.'
                 return
             }
             Start-Sleep -Milliseconds 150
