@@ -27,7 +27,7 @@ $shell = New-Object -ComObject WScript.Shell
 
 function InstalledProducts {
     @(Get-ItemProperty -Path "$uninstallPath\*" -ErrorAction SilentlyContinue |
-        Where-Object DisplayName -eq '本地文件管理器')
+        Where-Object DisplayName -eq 'JavaFXFileManager')
 }
 
 function Invoke-Installer {
