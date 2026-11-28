@@ -180,12 +180,18 @@ class JavaFxFileOperationsTest {
         await(() -> currentBrowse().activeQuery.isEmpty() && scene.lookup("#hybrid-browser") != null,
                 "restore hybrid after search", 8);
         click("dual-pane");
-        await(() -> paneAt(true, left) && scene.lookup("#miller-columns") == null, "traditional dual pane", 8);
+        await(() -> paneAt(true, left) && paneLayout(false, "hybrid-browser") && !paneLayout(true, "miller-columns"),
+                "left hybrid remains mounted in dual pane", 8);
         click("dual-pane");
         await(() -> scene.lookup("#hybrid-browser") != null, "restore hybrid after dual pane", 8);
         pickLayout("traditional");
         assertTrue(fx(() -> scene.lookup("#miller-columns") == null && browseAt(left)
                 && currentBrowse().view().mode() == BrowserView.Mode.LARGE));
+    }
+
+    private boolean paneLayout(boolean right, String id) {
+        Node content = scene.lookup(right ? "#right-pane" : "#left-pane");
+        return content != null && content.lookup("#" + id) != null;
     }
 
     @Test
@@ -775,12 +781,20 @@ class JavaFxFileOperationsTest {
         go(left);
         click("dual-pane");
         goPane(true, right);
+        focusPane(false);
+        pickLayout("columns");
+        focusPane(true);
+        pickLayout("hybrid");
         fx(() -> { browser.selectAll(); return null; });
         await(() -> paneContext(false).selectionProof.size() == 2, "mixed selection verified", 8);
         var multi = beginFileDrag(false, file);
         assertEquals(2, fx(() -> multi.board().getFiles().size()));
         fx(() -> { browser.clearSelection(); return null; });
         Node rightList = fx(() -> paneBrowser(true));
+        Node history = fx(() -> scene.lookup("#right-pane").lookup(".miller-branches"));
+        assertNotNull(history);
+        assertFalse(dragOver(multi, history), "hierarchy branches reject drag over");
+        assertFalse(dropFiles(multi, history), "hierarchy branches cannot write files");
         assertTrue(dragOver(multi, rightList));
         assertEquals("复制 2 项 到「收件」", fx(this::dragStatusText));
         captureDrag("copy-across.png");
@@ -1281,6 +1295,9 @@ class JavaFxFileOperationsTest {
         assertTrue(fx(() -> button("copy-across").isDisabled()));
         goPane(true, right);
         focusPane(true);
+        pickLayout("hybrid");
+        assertTrue(fx(() -> ((MenuButton) scene.lookup("#browse-layout")).getText().contains("右栏")));
+        assertTrue(fx(() -> !paneControl(true, "search-field").getParent().isVisible()));
         menu("sortItems", "sort-size");
         assertEquals(BrowserView.Field.SIZE, fx(() -> paneContext(true).view().sort()));
         assertEquals(BrowserView.Field.NAME, fx(() -> paneContext(false).view().sort()));
@@ -1291,6 +1308,7 @@ class JavaFxFileOperationsTest {
         goPane(false, child);
         clickOnPane(false, "up");
         await(() -> paneAt(false, left) && paneAt(true, right), "left up preserves right location", 10);
+        clickOnPane(true, "toggle-search");
         fx(() -> {
             var filters = (ColumnFilters) field(browser, "filters");
             filters.select(BrowserView.Field.TYPE, new ColumnFilters.Bucket(0, "TXT 文件"), true);
@@ -1305,6 +1323,7 @@ class JavaFxFileOperationsTest {
         });
         await(() -> activePane() == pane(true) && paneAt(true, right) && paneContext(true).activeQuery.equals("交付")
                 && paneListed(true, target), "right search takes the window command focus", 12);
+        assertTrue(fx(() -> !paneLayout(true, "hybrid-browser")));
         assertTrue(fx(() -> browser.filtersActive() && paneContext(false).activeQuery.isEmpty()));
         focusPane(false);
         select(text);
@@ -1331,6 +1350,21 @@ class JavaFxFileOperationsTest {
         assertTrue(fx(() -> scene.lookup("#right-pane") == null && paneAt(false, left)));
         click("dual-pane");
         await(() -> paneAt(true, right) && paneContext(true).activeQuery.equals("交付"), "right state is restored after reopening", 10);
+        clickOnPane(true, "clear-search");
+        await(() -> paneLayout(true, "hybrid-browser") && paneContext(true).activeQuery.isEmpty(), "right layout restored", 10);
+        goPane(false, left);
+        focusPane(false);
+        select(text);
+        await(() -> paneContext(false).selectionProof.size() == 1, "verified left selection", 8);
+        pickLayout("columns");
+        assertTrue(fx(() -> browser.selection().stream().anyMatch(item -> text.equals(item.path()))));
+        Tab columnsTab = fx(() -> tabs().getSelectionModel().getSelectedItem());
+        click("new-tab");
+        await(() -> paneAt(false, left) && !paneLayout(false, "miller-columns") && paneLayout(true, "hybrid-browser"),
+                "new left tab uses its own layout", 10);
+        fx(() -> { tabs().getSelectionModel().select(columnsTab); return null; });
+        await(() -> paneLayout(false, "miller-columns") && paneLayout(true, "hybrid-browser")
+                && browser.selection().stream().anyMatch(item -> text.equals(item.path())), "left tab restores layout and selection", 10);
     }
 
     @Test
@@ -1345,6 +1379,10 @@ class JavaFxFileOperationsTest {
         go(first);
         click("dual-pane");
         goPane(true, second);
+        focusPane(false);
+        pickLayout("columns");
+        focusPane(true);
+        pickLayout("hybrid");
         var leftGate = new Gate();
         var rightGate = new Gate();
         heldRead.set(new ReadGate(leftNext, false, leftGate));
@@ -1358,6 +1396,7 @@ class JavaFxFileOperationsTest {
             focusPane(true);
             leftGate.release.countDown();
             await(() -> paneAt(false, leftNext) && paneListed(false, leftFile), "inactive left pane commits its own read", 10);
+            assertTrue(fx(() -> paneLayout(false, "miller-columns") && paneLayout(true, "hybrid-browser")));
             assertSame(pendingRight, fx(() -> paneContext(true).browseRequest));
             assertSame(fx(() -> pane(true)), fx(this::activePane));
             click("dual-pane");
@@ -1371,6 +1410,7 @@ class JavaFxFileOperationsTest {
         click("dual-pane");
         await(() -> paneAt(false, leftNext) && paneAt(true, second) && !paneListed(true, rightFile),
                 "reopening reads the last committed right directory", 12);
+        assertTrue(fx(() -> paneLayout(false, "miller-columns") && paneLayout(true, "hybrid-browser")));
     }
 
     @Test
@@ -1487,6 +1527,10 @@ class JavaFxFileOperationsTest {
         go(left);
         click("dual-pane");
         goPane(true, right);
+        focusPane(false);
+        pickLayout("hybrid");
+        focusPane(true);
+        pickLayout("columns");
         clipboardAcross(false, copyLeft, false, right);
         clipboardAcross(true, copyRight, false, left);
         clipboardAcross(false, cutLeft, true, right);

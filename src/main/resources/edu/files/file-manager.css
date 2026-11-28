@@ -190,6 +190,14 @@
     -fx-text-fill: -fm-accent-text;
 }
 
+.browser-pane .scroll-bar > .thumb {
+    -fx-opacity: 0.62;
+}
+
+.browser-pane .scroll-bar:hover > .thumb {
+    -fx-opacity: 1;
+}
+
 .command-bar {
     -fx-padding: 4 10;
     -fx-background-color: -fm-surface;

@@ -633,10 +633,6 @@ public final class FileManagerApp extends Application {
             singleNavigation.getChildren().setAll(leftPane.navigation);
             leftPane.content.pseudoClassStateChanged(ACTIVE_BROWSER, false);
         }
-        if (leftPane.mountedLayout != leftPane.effectiveLayout()) {
-            leftPane.browser.dismissTransientControls();
-            leftPane.render(true);
-        }
         updateInspectorHost();
         updateControls();
     }
@@ -2657,10 +2653,11 @@ public final class FileManagerApp extends Application {
         for (String id : List.of("sort", "view", "more", "gallery-sources")) { controls.get(id).setDisable(unavailable); }
         controls.get("gallery-sources").setVisible(activePane.context.location.page() == Page.GALLERY);
         var layout = (MenuButton) controls.get("browse-layout");
-        layout.setText("布局 · " + activePane.effectiveLayout().label);
+        String scope = dualPaneOpen ? activePane.heading.getText() : "";
+        layout.setText(scope + "布局 · " + activePane.effectiveLayout().label);
         layout.setDisable(unavailable || !activePane.supportsProfessionalLayout());
-        layout.getTooltip().setText(dualPaneOpen ? "双栏使用传统布局"
-                : activePane.supportsProfessionalLayout() ? "浏览布局" : "当前页面使用传统布局");
+        layout.getTooltip().setText(activePane.supportsProfessionalLayout()
+                ? "更改" + (dualPaneOpen ? scope : "当前标签页") + "的浏览布局" : "当前页面使用传统布局");
         controls.get("details-pane").setDisable(places == null);
         controls.get("dual-pane").setDisable(unavailable);
         ((Button) controls.get("dual-pane")).setText(dualPaneOpen ? "单栏" : "双栏");
@@ -2917,6 +2914,7 @@ public final class FileManagerApp extends Application {
                 if (!browser.selection().isEmpty()) { browser.clearSelection(); }
             }, icons);
             hybrid.setId("hybrid-browser");
+            hybrid.setMinWidth(0);
             hybrid.setOrientation(Orientation.VERTICAL);
             hybrid.getStyleClass().add("hybrid-browser");
             browser.addEventFilter(MouseEvent.MOUSE_PRESSED, event -> pressFileDrag(this, event));
@@ -3004,19 +3002,25 @@ public final class FileManagerApp extends Application {
 
         void mountNavigation() {
             addressRow.getChildren().remove(searchRow);
-            address.setMinWidth(110);
+            addressRow.getChildren().add(navigationControls.get("toggle-search"));
+            addressRow.setSpacing(6);
+            address.setMinWidth(72);
             searchField.setPrefWidth(150);
             navigation.getStyleClass().add("split-navigation");
             navigation.getChildren().setAll(heading, addressRow, searchRow);
             if (!content.getChildren().contains(navigation)) { content.getChildren().addFirst(navigation); }
+            updateSearchVisibility();
         }
 
         void useSingleNavigation() {
             navigation.getStyleClass().remove("split-navigation");
             navigation.getChildren().setAll(addressRow);
+            addressRow.getChildren().remove(navigationControls.get("toggle-search"));
+            addressRow.setSpacing(10);
             address.setMinWidth(180);
             searchField.setPrefWidth(192);
             if (!addressRow.getChildren().contains(searchRow)) { addressRow.getChildren().add(searchRow); }
+            updateSearchVisibility();
         }
 
         Button button(String label, String id, Runnable action) {
@@ -3075,6 +3079,12 @@ public final class FileManagerApp extends Application {
             searchField.setId("search-field");
             searchField.setMinWidth(54);
             searchField.setOnAction(event -> search());
+            navButton(UiGlyph.SEARCH, "展开搜索", "toggle-search", () -> {
+                context.searchExpanded = !context.searchExpanded;
+                updateSearchVisibility();
+                if (context.searchExpanded) { searchField.requestFocus(); }
+            });
+            searchRow.managedProperty().bind(searchRow.visibleProperty());
             Button search = button("搜索", "search", this::search);
             search.setGraphic(UiGlyph.SEARCH.graphic(15));
             search.setMinWidth(Region.USE_PREF_SIZE);
@@ -3092,6 +3102,14 @@ public final class FileManagerApp extends Application {
             navigation.getStyleClass().add("navigation");
         }
 
+        private void updateSearchVisibility() {
+            searchRow.setVisible(!dualPaneOpen || context.searchExpanded || isSearching());
+            Button toggle = navigationControls.get("toggle-search");
+            String label = context.searchExpanded ? "收起搜索" : "展开搜索";
+            toggle.setAccessibleText(label);
+            toggle.getTooltip().setText(label);
+        }
+
         private void updateNavigationControls(boolean unavailable) {
             overview.setDisable(unavailable);
             address.setDisable(unavailable);
@@ -3101,6 +3119,8 @@ public final class FileManagerApp extends Application {
             navigationControls.get("up").setDisable(unavailable || parentLocation() == null);
             navigationControls.get("refresh").setDisable(unavailable);
             navigationControls.get("search").setDisable(unavailable);
+            navigationControls.get("toggle-search").setDisable(unavailable || isSearching());
+            updateSearchVisibility();
             navigationControls.get("cancel-search").setVisible(isSearching());
             navigationControls.get("clear-search").setVisible(!isSearching() && !context.activeQuery.isEmpty());
             navigationControls.get("clear-search").setDisable(unavailable);
@@ -3513,7 +3533,7 @@ public final class FileManagerApp extends Application {
         }
 
         private boolean supportsProfessionalLayout() {
-            return !dualPaneOpen && context.location.page() == Page.DIRECTORY && context.activeQuery.isEmpty();
+            return context.location.page() == Page.DIRECTORY && context.activeQuery.isEmpty();
         }
 
         private Layout effectiveLayout() {
@@ -3521,12 +3541,15 @@ public final class FileManagerApp extends Application {
         }
 
         private List<MenuItem> layoutItems() {
+            BrowseContext owner = context;
             var group = new ToggleGroup();
             return Arrays.stream(Layout.values()).map(layout -> {
-                MenuItem item = radio(layout.label, group, layout == context.layout, () -> {
-                    if (!supportsProfessionalLayout() || layout == context.layout) { return; }
+                MenuItem item = radio(layout.label, group, layout == owner.layout, () -> {
+                    if (!visible(this) || context != owner || !supportsProfessionalLayout() || layout == owner.layout) {
+                        return;
+                    }
                     browser.dismissTransientControls();
-                    context.layout = layout;
+                    owner.layout = layout;
                     render(true);
                 });
                 item.setId("layout-" + layout.name().toLowerCase(Locale.ROOT));

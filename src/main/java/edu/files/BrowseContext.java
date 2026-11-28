@@ -94,6 +94,7 @@ final class BrowseContext {
     Location location = Location.page(Page.HOME);
     HomeTab homeTab = HomeTab.RECENT;
     String activeQuery = "";
+    boolean searchExpanded;
     boolean quickAccessExpanded = true;
     Pane pane = Pane.NONE;
     Layout layout = Layout.TRADITIONAL;
@@ -129,6 +130,7 @@ final class BrowseContext {
         location = original.location;
         homeTab = original.homeTab;
         activeQuery = original.activeQuery;
+        searchExpanded = original.searchExpanded;
         directoryIdentity = original.directoryIdentity;
         directoryUnavailable = original.directoryUnavailable;
         quickAccessExpanded = original.quickAccessExpanded;

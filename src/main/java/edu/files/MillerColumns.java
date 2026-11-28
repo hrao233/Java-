@@ -55,6 +55,7 @@ final class MillerColumns extends ScrollPane {
         setFitToWidth(true);
         setHbarPolicy(ScrollBarPolicy.AS_NEEDED);
         setVbarPolicy(ScrollBarPolicy.NEVER);
+        setMinWidth(0);
         setMinHeight(110);
         configureColumn(current);
         current.getStyleClass().add("miller-current");
