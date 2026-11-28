@@ -27,7 +27,8 @@ function Invoke-JPackage {
     # Use UTF-8 through jpackage's response file parser, including on non-Chinese Windows.
     $Arguments | ForEach-Object { '"' + $_.Replace('\', '\\').Replace('"', '\"') + '"' } |
         Set-Content -LiteralPath $ArgumentFile -Encoding utf8NoBOM
-    Invoke-Checked $Tool @("@$ArgumentFile")
+    # WiX selects its MSI code page from the jpackage locale.
+    Invoke-Checked $Tool @('-J-Duser.language=zh', '-J-Duser.country=CN', "@$ArgumentFile")
 }
 
 function Copy-WindowsDependencies {
