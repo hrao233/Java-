@@ -208,6 +208,19 @@ try {
     Uninstall-TestProduct
     "Passed: install, Start menu and desktop launch, close, repeat ($repeat), upgrade, uninstall and reinstall"
     'The external fixture hash and Java Preferences marker survived the lifecycle'
+} catch {
+    "Installer path exists: $(Test-Path -LiteralPath $exe)" | Write-Host
+    foreach ($uninstall in @($uninstallPath, 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall')) {
+        $records = Get-ItemProperty -Path "$uninstall\*" -ErrorAction SilentlyContinue |
+            Where-Object DisplayName -like '*JavaFXFileManager*'
+        $records | Select-Object DisplayName, DisplayVersion, InstallLocation, PSPath | Format-List | Out-String | Write-Host
+    }
+    Get-ChildItem -LiteralPath $root -Filter '*.log' -File | ForEach-Object {
+        Get-Content -LiteralPath $_.FullName |
+            Select-String -Pattern 'Property\([CS]\): (ALLUSERS|MSIINSTALLPERUSER|INSTALLDIR|ARPINSTALLLOCATION|ProductName|ProductVersion) =|Installation completed|Installation failed' |
+            ForEach-Object Line | Write-Host
+    }
+    throw
 } finally {
     $records = @(InstalledProducts)
     if ($records.Count -eq 1 -and $records[0].InstallLocation.TrimEnd('\') -eq $install) {
