@@ -85,8 +85,9 @@ $uninstallPaths = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
 $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $profile = 'explorer-install-test-' + ([guid]::NewGuid().ToString('N'))
 $preferences = "HKCU:\Software\JavaSoft\Prefs\edu\files\$profile"
-$startMenu = [Environment]::GetFolderPath('Programs')
-$desktop = [Environment]::GetFolderPath('DesktopDirectory')
+# A fresh runner may not have created these known folders before the first install.
+$startMenu = [Environment]::GetFolderPath('Programs', 'DoNotVerify')
+$desktop = [Environment]::GetFolderPath('DesktopDirectory', 'DoNotVerify')
 $shell = New-Object -ComObject WScript.Shell
 
 function InstalledProducts {
@@ -141,10 +142,13 @@ function Assert-Install {
 
 function Find-AppShortcuts {
     param([string]$Folder, [switch]$Recurse)
-    if (Test-Path -LiteralPath $Folder) {
-        Get-ChildItem -LiteralPath $Folder -Filter '*.lnk' -File -Recurse:$Recurse | Where-Object {
-            $shell.CreateShortcut($_.FullName).TargetPath -eq $exe
-        }
+    if ($Folder -and (Test-Path -LiteralPath $Folder -PathType Container)) {
+        Get-ChildItem -LiteralPath $Folder -Filter 'JavaFXFileManager.lnk' -File -Force -Recurse:$Recurse |
+            Where-Object {
+                $target = $shell.CreateShortcut($_.FullName).TargetPath
+                Write-Host "Shortcut $($_.FullName) -> $target"
+                $target -eq $exe
+            }
     }
 }
 
@@ -206,7 +210,9 @@ try {
     $initial = Assert-Install '1.0.0'
     $startLink = @(Find-AppShortcuts $startMenu -Recurse)
     $desktopLink = @(Find-AppShortcuts $desktop)
-    if ($startLink.Count -ne 1 -or $desktopLink.Count -ne 1) { throw 'Expected both application shortcuts' }
+    if ($startLink.Count -ne 1 -or $desktopLink.Count -ne 1) {
+        throw "Expected one application shortcut in '$startMenu' (found $($startLink.Count)) and '$desktop' (found $($desktopLink.Count))"
+    }
     Test-ShortcutLaunch $startLink[0].FullName
     Test-ShortcutLaunch $desktopLink[0].FullName
 
@@ -239,7 +245,7 @@ try {
     }
     Get-ChildItem -LiteralPath $root -Filter '*.log' -File | ForEach-Object {
         Get-Content -LiteralPath $_.FullName |
-            Select-String -Pattern 'Property\([CS]\): (ALLUSERS|MSIINSTALLPERUSER|INSTALLDIR|ARPINSTALLLOCATION|ProductName|ProductVersion) =|Installation completed|Installation failed' |
+            Select-String -Pattern 'Property\([CS]\): (ALLUSERS|MSIINSTALLPERUSER|INSTALLDIR|ARPINSTALLLOCATION|ProductName|ProductVersion|DesktopFolder|ProgramMenuFolder|JP_INSTALL_\w+_SHORTCUT) =|Executing op: ShortcutCreate|Installation completed|Installation failed' |
             ForEach-Object Line | Write-Host
     }
     throw
