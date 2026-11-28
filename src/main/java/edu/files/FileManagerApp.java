@@ -216,7 +216,8 @@ public final class FileManagerApp extends Application {
     private boolean checkboxes;
 
     public FileManagerApp() {
-        this(Preferences.userNodeForPackage(FileManagerApp.class).node("explorer"), FileOperationTask::new,
+        this(Preferences.userNodeForPackage(FileManagerApp.class)
+                        .node(System.getProperty("edu.files.preferencesNode", "explorer")), FileOperationTask::new,
                 (path, preview) -> {}, FileClipboard.system());
     }
 
@@ -300,6 +301,7 @@ public final class FileManagerApp extends Application {
         scene.getAccelerators().put(new KeyCodeCombination(KeyCode.N, KeyCombination.SHORTCUT_DOWN, KeyCombination.SHIFT_DOWN),
                 () -> { if (!newTypes.isEmpty()) { create(newTypes.getFirst()); } });
         stage.setTitle("本地文件管理器");
+        stage.getIcons().add(new Image(getClass().getResource("application-icon.png").toExternalForm()));
         stage.setMinWidth(960);
         stage.setMinHeight(550);
         stage.setScene(scene);
