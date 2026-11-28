@@ -4,8 +4,7 @@ param(
     [Parameter(Mandatory)] [string]$Setup,
     [Parameter(Mandatory)] [string]$Upgrade,
     [Parameter(Mandatory)] [string]$FixtureDirectory,
-    [switch]$UseMsiPayload,
-    [switch]$SkipShortcutLaunch
+    [switch]$UseMsiPayload
 )
 
 $ErrorActionPreference = 'Stop'
@@ -210,20 +209,6 @@ function Test-ShortcutLaunch {
     }
 }
 
-function Test-InstalledStartup {
-    param([string[]]$Shortcuts)
-    if ($SkipShortcutLaunch) {
-        # The hosted test has already verified the link targets. Smoke-test the installed runtime here.
-        $java = Join-Path $install 'runtime\bin\java.exe'
-        & $java --version | Write-Host
-        if ($LASTEXITCODE -ne 0) { throw "The installed Java runtime returned $LASTEXITCODE" }
-        return
-    }
-    foreach ($shortcut in $Shortcuts) {
-        Test-ShortcutLaunch $shortcut
-    }
-}
-
 function Uninstall-TestProduct {
     $product = @(InstalledProducts)
     if ($product.Count -ne 1 -or $product[0].InstallLocation.TrimEnd('\') -ne $install -or
@@ -250,7 +235,8 @@ try {
     if ($startLink.Count -ne 1 -or $desktopLink.Count -ne 1) {
         throw "Expected one application shortcut in '$startMenu' (found $($startLink.Count)) and '$desktop' (found $($desktopLink.Count))"
     }
-    Test-InstalledStartup @($startLink[0].FullName, $desktopLink[0].FullName)
+    Test-ShortcutLaunch $startLink[0].FullName
+    Test-ShortcutLaunch $desktopLink[0].FullName
 
     $repeat = Install-TestProduct $Setup 'repeat-install.log' @(0, 1638)
     $sameVersion = Assert-Install '1.0.0'
@@ -261,7 +247,7 @@ try {
     if ($initial.PSChildName -eq $updated.PSChildName) { throw 'Expected a major upgrade with a new MSI product code' }
     $updatedStart = @(Find-AppShortcuts $startMenu -Recurse)
     if ($updatedStart.Count -ne 1) { throw 'Expected one Start menu entry after the upgrade' }
-    Test-InstalledStartup @($updatedStart[0].FullName)
+    Test-ShortcutLaunch $updatedStart[0].FullName
     Uninstall-TestProduct
     if ((Test-Path -LiteralPath $startLink[0].FullName) -or (Test-Path -LiteralPath $desktopLink[0].FullName)) {
         throw 'One or more shortcuts survived uninstall'
@@ -271,11 +257,7 @@ try {
     Assert-Install '1.0.0' | Out-Null
     Uninstall-TestProduct
     "Passed: install, shortcut targets, repeat ($repeat), upgrade, uninstall and reinstall"
-    if ($SkipShortcutLaunch) {
-        'The bundled JVM ran. Desktop shortcut launch and close require desktop acceptance.'
-    } else {
-        'Start menu and desktop launch and normal close passed.'
-    }
+    'Start menu and desktop launch and normal close passed.'
     'The external fixture hash and Java Preferences marker survived the lifecycle'
 } catch {
     "Installer path exists: $(Test-Path -LiteralPath $exe)" | Write-Host
