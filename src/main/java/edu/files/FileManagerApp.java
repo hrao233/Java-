@@ -90,7 +90,8 @@ public final class FileManagerApp extends Application {
     private static final int MAX_RETAINED_SELECTION = 64;
 
     private record SideNode(String label, Location location, BrowserItem item) {
-        boolean divider() { return label.isEmpty(); }
+        boolean divider() { return location == null && item == null && (label.isEmpty() || label.startsWith("§")); }
+        String displayLabel() { return label.startsWith("§") ? label.substring(1) : label; }
     }
     private record SystemCatalog(WindowsPlaces.Places places, List<NewItems.Type> newTypes) { }
     private record PasteRequest(Snapshot snapshot, Transfer local, List<Path> external) {
@@ -420,7 +421,6 @@ public final class FileManagerApp extends Application {
         tabs.setTabClosingPolicy(TabPane.TabClosingPolicy.ALL_TABS);
         tabs.setTabDragPolicy(TabPane.TabDragPolicy.FIXED);
         installFileDrop(tabs, this::tabDropSite);
-        HBox.setHgrow(tabs, Priority.ALWAYS);
         addTabHeader(leftPane.context);
         tabs.getSelectionModel().selectedItemProperty().addListener((observable, previous, selected) -> {
             if (!closing && selected != null) {
@@ -435,6 +435,28 @@ public final class FileManagerApp extends Application {
         add.setTooltip(new Tooltip("新建标签页 (Ctrl+T)"));
         add.setOnAction(event -> newTab());
         HBox bar = new HBox(6, tabs, add);
+        tabs.setMaxWidth(Region.USE_PREF_SIZE);
+        Runnable sizeTabs = () -> {
+            double needed = 36;
+            for (Tab tab : tabs.getTabs()) {
+                var text = new javafx.scene.text.Text(tab.getText() == null ? "" : tab.getText());
+                text.setFont(javafx.scene.text.Font.font("Microsoft YaHei UI", 13));
+                needed += Math.clamp(text.getLayoutBounds().getWidth() + 57, 92, 190);
+            }
+            tabs.setPrefWidth(Math.min(needed, Math.max(92, bar.getWidth() - 70)));
+        };
+        bar.widthProperty().addListener((observable, oldWidth, width) -> sizeTabs.run());
+        tabs.getTabs().addListener((javafx.collections.ListChangeListener<Tab>) change -> {
+            while (change.next()) {
+                for (Tab tab : change.getAddedSubList()) {
+                    tab.textProperty().addListener((observable, oldText, text) -> sizeTabs.run());
+                }
+            }
+            sizeTabs.run();
+        });
+        for (Tab tab : tabs.getTabs()) {
+            tab.textProperty().addListener((observable, oldText, text) -> sizeTabs.run());
+        }
         bar.setAlignment(Pos.CENTER_LEFT);
         bar.getStyleClass().add("browse-tab-bar");
         // Cancel an inline edit before a header can take keyboard focus.
@@ -1105,7 +1127,7 @@ public final class FileManagerApp extends Application {
                 super.updateItem(node, empty);
                 boolean isDivider = !empty && node != null && node.divider();
                 pseudoClassStateChanged(NAV_DIVIDER, isDivider);
-                setText(empty || node == null || isDivider ? null : node.label());
+                setText(empty || node == null ? null : node.displayLabel());
                 setGraphic(empty || node == null ? null : sideGraphic(node));
                 Path path = node == null || node.location() == null ? null : node.location().path();
                 setTooltip(path == null ? null : new Tooltip(path.toString()));
@@ -1163,10 +1185,10 @@ public final class FileManagerApp extends Application {
             }
         }
         var root = branch("", null);
-        root.getChildren().addAll(List.of(pageItem(Page.HOME), pageItem(Page.GALLERY)));
+        root.getChildren().addAll(List.of(sideHeading("位置"), pageItem(Page.HOME), pageItem(Page.GALLERY)));
         for (BrowserItem cloud : places.oneDrive()) { root.getChildren().add(directoryItem(cloud, expanded)); }
-        quickAccessStart = new TreeItem<>(new SideNode("", null, null));
-        quickAccessEnd = new TreeItem<>(new SideNode("", null, null));
+        quickAccessStart = sideHeading("快速访问与收藏");
+        quickAccessEnd = sideHeading("设备与位置");
         root.getChildren().addAll(List.of(quickAccessStart, quickAccessEnd));
         places.computer().stream().filter(item -> item.kind() == BrowserItem.Kind.FOLDER)
                 .forEach(item -> root.getChildren().add(directoryItem(item, expanded)));
@@ -1219,6 +1241,10 @@ public final class FileManagerApp extends Application {
         var branch = new TreeItem<>(new SideNode(label, target, null));
         branch.setExpanded(true);
         return branch;
+    }
+
+    private static TreeItem<SideNode> sideHeading(String title) {
+        return new TreeItem<>(new SideNode("§" + title, null, null));
     }
 
     private static TreeItem<SideNode> pageItem(Page page) {
@@ -2952,7 +2978,7 @@ public final class FileManagerApp extends Application {
             navigation.getStyleClass().remove("split-navigation");
             navigation.getChildren().setAll(addressRow);
             address.setMinWidth(180);
-            searchField.setPrefWidth(224);
+            searchField.setPrefWidth(192);
             if (!addressRow.getChildren().contains(searchRow)) { addressRow.getChildren().add(searchRow); }
         }
 

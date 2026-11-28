@@ -78,10 +78,10 @@
 }
 
 .navigation {
-    -fx-padding: 7 12;
+    -fx-padding: 4 10;
     -fx-background-color: -fm-surface;
-    -fx-border-color: -fm-accent transparent -fm-border transparent;
-    -fx-border-width: 2 0 1;
+    -fx-border-color: transparent transparent -fm-border transparent;
+    -fx-border-width: 0 0 1;
 }
 
 .split-navigation {
@@ -108,7 +108,7 @@
 }
 
 .command-bar {
-    -fx-padding: 6 12;
+    -fx-padding: 4 10;
     -fx-background-color: -fm-surface;
     -fx-border-color: transparent transparent -fm-border transparent;
 }
@@ -189,9 +189,9 @@
 
 .sidebar .tree-cell:filled:nav-divider {
     -fx-background-color: transparent;
-    -fx-border-color: transparent transparent -fm-border transparent;
-    -fx-border-width: 0 0 1 0;
-    -fx-border-insets: 0 7 12 7;
+    -fx-text-fill: -fm-subtle;
+    -fx-font-size: 11px;
+    -fx-font-weight: bold;
 }
 
 .overview {
@@ -199,7 +199,7 @@
 }
 
 .status-bar {
-    -fx-padding: 5 12;
+    -fx-padding: 4 12;
     -fx-background-color: -fm-window;
     -fx-border-color: -fm-border transparent transparent transparent;
 }
@@ -484,6 +484,10 @@
 
 .table-view .table-cell.name-cell {
     -fx-text-fill: -fm-text;
+}
+
+.table-view .table-cell.numeric-cell {
+    -fx-alignment: center-right;
 }
 
 .inline-name-editor.text-field {

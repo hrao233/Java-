@@ -164,6 +164,8 @@ final class BrowserView extends StackPane {
     }
 
     private final TableView<Line> table = new TableView<>();
+    private double automaticNameWidth;
+    private boolean adjustingNameWidth;
     private final ListView<Line> tiles = new ListView<>() {
         @Override
         protected Skin<?> createDefaultSkin() {
@@ -589,6 +591,9 @@ final class BrowserView extends StackPane {
                 column.setGraphic(filter);
             }
             if (field == Field.NAME) { column.getStyleClass().add("name-cell"); }
+            if (field == Field.SIZE || field == Field.AVAILABLE || field == Field.USED) {
+                column.getStyleClass().add("numeric-cell");
+            }
             column.setCellValueFactory(cell -> new ReadOnlyObjectWrapper<>(cell.getValue()));
             column.setCellFactory(ignored -> new TableCell<>() {
                 @Override
@@ -611,6 +616,14 @@ final class BrowserView extends StackPane {
             columns.put(field, column);
             table.getColumns().add(column);
         }
+        table.widthProperty().addListener((observable, previous, width) -> expandNameColumn());
+        columns.get(Field.NAME).widthProperty().addListener((observable, previous, width) -> {
+            if (!adjustingNameWidth) { automaticNameWidth = 0; }
+        });
+        for (TableColumn<Line, ?> column : table.getColumns()) {
+            column.visibleProperty().addListener((observable, previous, visible) ->
+                    javafx.application.Platform.runLater(this::expandNameColumn));
+        }
         table.setSortPolicy(view -> {
             if (!syncing && !view.getSortOrder().isEmpty()) {
                 var column = view.getSortOrder().getFirst();
@@ -623,6 +636,22 @@ final class BrowserView extends StackPane {
             }
             return true;
         });
+    }
+
+    private void expandNameColumn() {
+        TableColumn<Line, Line> name = columns.get(Field.NAME);
+        if (name == null || !name.isVisible() || table.getWidth() <= 0) { return; }
+        double other = table.getColumns().stream().filter(column -> column != name && column.isVisible())
+                .mapToDouble(TableColumn::getWidth).sum();
+        double baseline = Math.max(name.getMinWidth(), name.getWidth() - automaticNameWidth);
+        double desired = Math.max(baseline, table.getWidth() - other - 20);
+        adjustingNameWidth = true;
+        try {
+            table.resizeColumn(name, desired - name.getWidth());
+            automaticNameWidth = Math.max(0, name.getWidth() - baseline);
+        } finally {
+            adjustingNameWidth = false;
+        }
     }
 
     private static boolean hitsTableCell(EventTarget target, TableRow<?> row) {

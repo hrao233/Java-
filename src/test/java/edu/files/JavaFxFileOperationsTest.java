@@ -111,6 +111,35 @@ class JavaFxFileOperationsTest {
     private Path captures;
 
     @Test
+    void tabStripAndNameColumnAdaptToAvailableSpace() throws Exception {
+        Files.writeString(root.resolve("layout.txt"), "fixture");
+        openWindow(false);
+        go(root);
+        fx(() -> {
+            stage.setWidth(1200);
+            scene.getRoot().applyCss();
+            scene.getRoot().layout();
+            var tabs = (TabPane) scene.lookup("#browse-tabs");
+            var add = button("new-tab");
+            assertTrue(add.localToScene(add.getBoundsInLocal()).getMinX() < 400,
+                    "new tab action follows the existing tab");
+            @SuppressWarnings("unchecked")
+            var table = (TableView<Object>) scene.lookup("#entries");
+            double used = table.getVisibleLeafColumns().stream().mapToDouble(column -> column.getWidth()).sum();
+            assertTrue(table.getWidth() - used < 25, "name column fills available width");
+            var name = table.getVisibleLeafColumns().getFirst();
+            double before = name.getWidth();
+            table.resizeColumn(name, -50);
+            assertTrue(name.getWidth() < before - 25, "manual column resize remains available");
+            stage.setWidth(960);
+            scene.getRoot().layout();
+            assertEquals(root, call(field(currentBrowse(), "location"), "path"));
+            assertTrue(tabs.getWidth() > 0);
+            return null;
+        });
+    }
+
+    @Test
     void themeSwitchUpdatesTaskAndConflictWindowsAndLaterDialogs() throws Exception {
         assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
         Path from = Files.createDirectory(root.resolve("theme-source"));
