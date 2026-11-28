@@ -18,6 +18,7 @@ Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
 using System.Text;
 
 public static class JPackageMsiResource {
@@ -63,6 +64,25 @@ public static class JPackageMsiResource {
         } finally { FreeLibrary(image); }
     }
 }
+
+public static class WindowsShortcut {
+    [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IShellLinkW {
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder path, int maxChars,
+            IntPtr findData, uint flags);
+    }
+
+    public static string ReadTarget(string shortcut) {
+        var shellLink = Type.GetTypeFromCLSID(new Guid("00021401-0000-0000-C000-000000000046"), true);
+        var link = Activator.CreateInstance(shellLink);
+        try {
+            ((IPersistFile)link).Load(shortcut, 0);
+            var path = new StringBuilder(32768);
+            ((IShellLinkW)link).GetPath(path, path.Capacity, IntPtr.Zero, 0);
+            return path.ToString();
+        } finally { Marshal.FinalReleaseComObject(link); }
+    }
+}
 '@
 if ($UseMsiPayload) {
     # Read the exact MSI embedded by jpackage without executing its GUI bootstrap.
@@ -88,7 +108,6 @@ $preferences = "HKCU:\Software\JavaSoft\Prefs\edu\files\$profile"
 # A fresh runner may not have created these known folders before the first install.
 $startMenu = [Environment]::GetFolderPath('Programs', 'DoNotVerify')
 $desktop = [Environment]::GetFolderPath('DesktopDirectory', 'DoNotVerify')
-$shell = New-Object -ComObject WScript.Shell
 
 function InstalledProducts {
     foreach ($path in $uninstallPaths) {
@@ -145,7 +164,7 @@ function Find-AppShortcuts {
     if ($Folder -and (Test-Path -LiteralPath $Folder -PathType Container)) {
         Get-ChildItem -LiteralPath $Folder -Filter 'JavaFXFileManager.lnk' -File -Force -Recurse:$Recurse |
             Where-Object {
-                $target = $shell.CreateShortcut($_.FullName).TargetPath
+                $target = [WindowsShortcut]::ReadTarget($_.FullName)
                 Write-Host "Shortcut $($_.FullName) -> $target"
                 $target -eq $exe
             }
