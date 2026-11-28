@@ -32,7 +32,10 @@ function InstalledProducts {
 
 function Invoke-Installer {
     param([string]$Executable, [string[]]$Arguments, [int[]]$Expected = @(0))
-    $process = Start-Process -FilePath $Executable -ArgumentList $Arguments -Wait -PassThru -WindowStyle Hidden
+    $process = Start-Process -FilePath $Executable -ArgumentList $Arguments -PassThru -WindowStyle Hidden
+    if (-not $process.WaitForExit(120000)) {
+        throw "$Executable did not finish within two minutes. See the MSI log under $root"
+    }
     if ($process.ExitCode -notin $Expected) {
         throw "$Executable returned $($process.ExitCode). See the MSI log under $root"
     }
@@ -42,8 +45,14 @@ function Invoke-Installer {
 function Install-TestProduct {
     param([string]$Path, [string]$LogName, [int[]]$Expected = @(0))
     $log = Join-Path $root $LogName
-    Invoke-Installer $Path @('/qn', '/norestart', '/l*v', ('"' + $log + '"'),
-        ('INSTALLDIR="' + $install + '"'), 'JP_INSTALL_STARTMENU_SHORTCUT=1', 'JP_INSTALL_DESKTOP_SHORTCUT=1') $Expected
+    Write-Host "Running $LogName"
+    try {
+        Invoke-Installer $Path @('/qn', '/norestart', '/l*v', ('"' + $log + '"'),
+            ('INSTALLDIR="' + $install + '"'), 'JP_INSTALL_STARTMENU_SHORTCUT=1', 'JP_INSTALL_DESKTOP_SHORTCUT=1') $Expected
+    } catch {
+        if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 30 | Write-Host }
+        throw
+    }
 }
 
 function Assert-Install {
