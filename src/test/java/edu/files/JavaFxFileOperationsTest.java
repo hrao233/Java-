@@ -1,5 +1,6 @@
 package edu.files;
 
+import com.sun.javafx.scene.SceneHelper;
 import com.sun.javafx.scene.input.DragboardHelper;
 import com.sun.javafx.tk.TKClipboard;
 import javafx.application.Platform;
@@ -177,6 +178,106 @@ class JavaFxFileOperationsTest {
             return null;
         });
         await(() -> idle() && field(app, "places") != null, "home page", 35);
+    }
+
+    @Test
+    void addressHistoryPopupSubmitsTypedPathOnEnterInBothPanes() throws Exception {
+        Path left = Files.createDirectory(root.resolve("left"));
+        Path right = Files.createDirectory(root.resolve("right"));
+        Path recent = Files.createDirectory(root.resolve("用回车进入的目录"));
+        openWindow(false);
+        go(recent);
+        go(left);
+        click("dual-pane");
+        goPane(true, right);
+        enterFromHistoryPopup(false, recent);
+        await(() -> paneAt(false, recent) && paneAt(true, right), "left typed address submitted from popup", 8);
+        enterFromHistoryPopup(true, left);
+        await(() -> paneAt(false, recent) && paneAt(true, left), "right typed address submitted from popup", 8);
+    }
+
+    private void enterFromHistoryPopup(boolean right, Path path) throws Exception {
+        fx(() -> {
+            var address = (AddressBar) field(pane(right), "address");
+            address.beginEdit();
+            var editor = (TextField) address.lookup("#address");
+            editor.setText(path.toString());
+            var popup = (javafx.stage.Popup) field(address, "popup");
+            assertTrue(popup.isShowing(), "typed address shows a matching history suggestion");
+            var suggestions = (javafx.scene.control.ListView<?>) field(address, "choices");
+            assertTrue(suggestions.getSelectionModel().isEmpty());
+            suggestions.requestFocus();
+            SceneHelper.processKeyEvent(popup.getScene(), new KeyEvent(KeyEvent.KEY_PRESSED, "", "",
+                    KeyCode.ENTER, false, false, false, false));
+            return null;
+        });
+    }
+
+    @Test
+    void sceneDragDetectionPublishesAFileOfferFromAPrimaryPress() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path sample = Files.writeString(root.resolve("drag.txt"), "drag source");
+        openWindow(false);
+        go(root);
+        select(sample);
+        await(this::hasSelectionProof, "visible drag source verified", 8);
+        fx(() -> {
+            Node picked = dragEntry(false, sample);
+            Node row = picked;
+            while (row != null && !(row instanceof TableRow<?>)) { row = row.getParent(); }
+            assertNotNull(row);
+            Node cell = row.lookupAll(".table-cell").stream()
+                    .filter(node -> node instanceof javafx.scene.control.TableCell<?, ?> column
+                            && column.isVisible() && sample.getFileName().toString().equals(column.getText()))
+                    .findFirst().orElseThrow();
+            var bounds = cell.localToScene(cell.getBoundsInLocal());
+            double x = bounds.getMinX() + bounds.getWidth() / 2;
+            double y = bounds.getMinY() + bounds.getHeight() / 2;
+            var dispatcher = scene.getEventDispatcher();
+            var offered = new AtomicReference<Dragboard>();
+            var detected = new AtomicBoolean();
+            scene.setEventDispatcher((event, tail) -> {
+                try {
+                    return dispatcher.dispatchEvent(event, tail);
+                } finally {
+                    if (event.getEventType() == MouseEvent.DRAG_DETECTED) {
+                        detected.set(true);
+                        try {
+                            var gesture = field(scene, "dndGesture");
+                            Field dragboardField = gesture.getClass().getDeclaredField("dragboard");
+                            dragboardField.setAccessible(true);
+                            offered.set((Dragboard) dragboardField.get(gesture));
+                            // Stop before JavaFX enters the desktop OLE loop.
+                            dragboardField.set(gesture, null);
+                        } catch (Exception failure) {
+                            throw new AssertionError(failure);
+                        }
+                    }
+                }
+            });
+            try {
+                SceneHelper.processMouseEvent(scene, sceneMouse(MouseEvent.MOUSE_PRESSED, x, y, MouseButton.PRIMARY, true));
+                assertNotNull(field(app, "dragPress"), "primary press reached the file row at " + bounds);
+                SceneHelper.processMouseEvent(scene, sceneMouse(MouseEvent.MOUSE_DRAGGED, x + 24, y, MouseButton.PRIMARY, true));
+                assertTrue(detected.get(), "JavaFX detected the drag threshold");
+                var board = offered.get();
+                assertNotNull(board, "the recognized gesture started JavaFX drag and drop");
+                assertEquals(List.of(sample.toFile()), board.getFiles());
+                assertTrue(board.hasContent(FileDrag.SESSION));
+                finishSimulatedDrag(new SimulatedDrag(board, browser), null);
+            } finally {
+                scene.setEventDispatcher(dispatcher);
+                SceneHelper.processMouseEvent(scene, sceneMouse(MouseEvent.MOUSE_RELEASED, x + 24, y, MouseButton.PRIMARY, false));
+                if (offered.get() != null) { call(DragboardHelper.getPeer(offered.get()), "close"); }
+            }
+            return null;
+        });
+    }
+
+    private static MouseEvent sceneMouse(javafx.event.EventType<MouseEvent> type, double x, double y,
+                                         MouseButton button, boolean primaryDown) {
+        return new MouseEvent(type, x, y, x, y, button, 1, false, false, false, false,
+                primaryDown, false, false, false, false, true, null);
     }
 
     @Test

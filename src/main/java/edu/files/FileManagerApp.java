@@ -1832,7 +1832,8 @@ public final class FileManagerApp extends Application {
     private void startFileDrag(BrowserPane pane, MouseEvent event) {
         var press = dragPress;
         dragPress = null;
-        if (press == null || press.pane() != pane || !event.isPrimaryButtonDown()) { return; }
+        // The primary press establishes ownership of the gesture.
+        if (press == null || press.pane() != pane) { return; }
         try {
             var source = createFileDrag(press);
             if (source == null) { return; }
@@ -2757,7 +2758,8 @@ public final class FileManagerApp extends Application {
             browser.setMinWidth(0);
             browser.addEventFilter(MouseEvent.MOUSE_PRESSED, event -> pressFileDrag(this, event));
             browser.addEventFilter(MouseEvent.MOUSE_RELEASED, event -> dragPress = null);
-            browser.setOnDragDetected(event -> startFileDrag(this, event));
+            // File cells can consume DRAG_DETECTED before it bubbles to the browser.
+            browser.addEventFilter(MouseEvent.DRAG_DETECTED, event -> startFileDrag(this, event));
             browser.setOnDragDone(event -> {
                 if (event.getGestureSource() == browser) { finishFileDrag(); }
             });

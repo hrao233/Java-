@@ -11,4 +11,6 @@
 
 拖放会话、窗口接入与可重复回归由提交 `f76535ce25fb` 引入。 [实现提交](https://github.com/hrao233/Java-/commit/f76535ce25fbc811ef1e33176622cd05842d0f07)
 
+修正版处理了桌面试用中发现的双栏地址栏回车和文件拖动启动问题。 [修复和回归记录](02_验证与人工验收.md#桌面试用反馈与修复)
+
 人工桌面验收完成前使用开发分支。 [GitHub 开发分支](https://github.com/hrao233/Java-/tree/feature/phase-3.2-drag-and-drop)

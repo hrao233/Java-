@@ -63,11 +63,7 @@ final class AddressBar extends StackPane {
         editor.setPromptText("输入位置或文件路径");
         editor.setAccessibleText("地址栏");
         editor.setMinWidth(0);
-        editor.setOnAction(event -> {
-            Choice selected = popup.isShowing() ? choices.getSelectionModel().getSelectedItem() : null;
-            if (selected != null) { choose(selected); }
-            else { submit(editor.getText()); }
-        });
+        editor.setOnAction(event -> submitEditor());
         editor.addEventFilter(KeyEvent.KEY_PRESSED, this::handleEditorKey);
         editor.textProperty().addListener((observable, previous, current) -> {
             if (editRow.isVisible()) { showHistory(!current.equals(displayAddress)); }
@@ -102,7 +98,12 @@ final class AddressBar extends StackPane {
                 setTooltip(empty || item == null ? null : new Tooltip(item.label()));
             }
         });
-        choices.setOnKeyPressed(event -> {
+        popup.getContent().add(choices);
+        popup.getScene().addEventFilter(KeyEvent.KEY_PRESSED, event -> {
+            if (editRow.isVisible()) {
+                handleEditorKey(event);
+                return;
+            }
             if (event.getCode() == KeyCode.ENTER && choices.getSelectionModel().getSelectedItem() != null) {
                 choose(choices.getSelectionModel().getSelectedItem());
                 event.consume();
@@ -111,7 +112,6 @@ final class AddressBar extends StackPane {
                 event.consume();
             }
         });
-        popup.getContent().add(choices);
         popup.setAutoHide(true);
         popup.setConsumeAutoHidingEvents(false);
         popup.setOnAutoHide(event -> {
@@ -161,6 +161,12 @@ final class AddressBar extends StackPane {
         onAddress.accept(text);
     }
 
+    private void submitEditor() {
+        Choice selected = popup.isShowing() ? choices.getSelectionModel().getSelectedItem() : null;
+        if (selected != null) { choose(selected); }
+        else { submit(editor.getText()); }
+    }
+
     private void choose(Choice choice) {
         endEdit();
         choice.open().run();
@@ -168,7 +174,11 @@ final class AddressBar extends StackPane {
 
     private void handleEditorKey(KeyEvent event) {
         KeyCode key = event.getCode();
-        if (key == KeyCode.ESCAPE) {
+        if (key == KeyCode.ENTER) {
+            event.consume();
+            submitEditor();
+            return;
+        } else if (key == KeyCode.ESCAPE) {
             endEdit();
         } else if (key == KeyCode.DOWN || key == KeyCode.UP) {
             if (!popup.isShowing()) { showHistory(!editor.getText().equals(displayAddress)); }
