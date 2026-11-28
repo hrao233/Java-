@@ -3,7 +3,8 @@
 param(
     [Parameter(Mandatory)] [string]$Setup,
     [Parameter(Mandatory)] [string]$Upgrade,
-    [Parameter(Mandatory)] [string]$FixtureDirectory
+    [Parameter(Mandatory)] [string]$FixtureDirectory,
+    [switch]$UseMsiPayload
 )
 
 $ErrorActionPreference = 'Stop'
@@ -12,6 +13,52 @@ $Upgrade = (Resolve-Path -LiteralPath $Upgrade).Path
 $root = [IO.Path]::GetFullPath($FixtureDirectory)
 if (Test-Path -LiteralPath $root) { throw 'Choose a fresh fixture directory in a test Windows account' }
 New-Item -ItemType Directory -Path $root | Out-Null
+$msiexec = "$env:SystemRoot\System32\msiexec.exe"
+if ($UseMsiPayload) {
+    # Read the exact MSI embedded by jpackage without executing its GUI bootstrap.
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class JPackageMsiResource {
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr LoadLibraryExW(string file, IntPtr reserved, uint flags);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    static extern IntPtr FindResourceW(IntPtr image, string name, IntPtr type);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern int SizeofResource(IntPtr image, IntPtr resource);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr LoadResource(IntPtr image, IntPtr resource);
+    [DllImport("kernel32.dll")]
+    static extern IntPtr LockResource(IntPtr resource);
+    [DllImport("kernel32.dll")]
+    static extern bool FreeLibrary(IntPtr image);
+
+    public static byte[] Read(string path) {
+        IntPtr image = LoadLibraryExW(path, IntPtr.Zero, 2);
+        if (image == IntPtr.Zero) throw new Win32Exception();
+        try {
+            IntPtr resource = FindResourceW(image, "msi", new IntPtr(10));
+            if (resource == IntPtr.Zero) throw new Win32Exception();
+            IntPtr data = LockResource(LoadResource(image, resource));
+            int size = SizeofResource(image, resource);
+            if (data == IntPtr.Zero || size <= 0) throw new Win32Exception();
+            byte[] bytes = new byte[size];
+            Marshal.Copy(data, bytes, 0, size);
+            return bytes;
+        } finally { FreeLibrary(image); }
+    }
+}
+'@
+    $setupPayload = Join-Path $root 'setup.msi'
+    $upgradePayload = Join-Path $root 'upgrade.msi'
+    [IO.File]::WriteAllBytes($setupPayload, [JPackageMsiResource]::Read($Setup))
+    [IO.File]::WriteAllBytes($upgradePayload, [JPackageMsiResource]::Read($Upgrade))
+    $Setup = $setupPayload
+    $Upgrade = $upgradePayload
+    Write-Host 'Testing the exact embedded MSI payloads. The EXE bootstrap is a desktop acceptance item.'
+}
 $install = Join-Path $root '安装 目录'
 $exe = Join-Path $install 'JavaFXFileManager.exe'
 $fixture = Join-Path $root '用户 文件.txt'
@@ -47,8 +94,13 @@ function Install-TestProduct {
     $log = Join-Path $root $LogName
     Write-Host "Running $LogName"
     try {
-        Invoke-Installer $Path @('/qn', '/norestart', '/l*v', ('"' + $log + '"'),
-            ('INSTALLDIR="' + $install + '"'), 'JP_INSTALL_STARTMENU_SHORTCUT=1', 'JP_INSTALL_DESKTOP_SHORTCUT=1') $Expected
+        $arguments = @('/qn', '/norestart', '/l*v', ('"' + $log + '"'),
+            ('INSTALLDIR="' + $install + '"'), 'JP_INSTALL_STARTMENU_SHORTCUT=1', 'JP_INSTALL_DESKTOP_SHORTCUT=1')
+        if ($UseMsiPayload) {
+            Invoke-Installer $msiexec (@('/i', ('"' + $Path + '"')) + $arguments) $Expected
+        } else {
+            Invoke-Installer $Path $arguments $Expected
+        }
     } catch {
         if (Test-Path -LiteralPath $log) { Get-Content -LiteralPath $log -Tail 30 | Write-Host }
         throw
@@ -115,7 +167,7 @@ function Uninstall-TestProduct {
         $product[0].PSChildName -notmatch '^\{[0-9a-fA-F-]{36}\}$') {
         throw 'Cannot identify the isolated MSI product to uninstall'
     }
-    Invoke-Installer "$env:SystemRoot\System32\msiexec.exe" @('/x', $product[0].PSChildName, '/qn', '/norestart',
+    Invoke-Installer $msiexec @('/x', $product[0].PSChildName, '/qn', '/norestart',
         '/l*v', ('"' + (Join-Path $root 'uninstall.log') + '"')) | Out-Null
     if (@(InstalledProducts).Count -ne 0 -or (Test-Path -LiteralPath $exe)) { throw 'The MSI product survived uninstall' }
     if ((Get-FileHash -LiteralPath $fixture).Hash -ne $hash) { throw 'Uninstall changed the external file fixture' }
