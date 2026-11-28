@@ -70,7 +70,7 @@ final class FileConflictDialog {
         form.getStyleClass().add("operation-window");
         form.setPadding(new Insets(21));
         Scene scene = new Scene(form, 620, 412);
-        scene.getStylesheets().add(getClass().getResource("file-manager.css").toExternalForm());
+        UiTheme.inherit(scene, owner);
         window.setScene(scene);
         window.setOnCloseRequest(event -> task.decideConflict(conflict, CANCEL, false));
     }

@@ -3,6 +3,7 @@ package edu.files;
 import javafx.animation.KeyFrame;
 import javafx.animation.PauseTransition;
 import javafx.animation.Timeline;
+import javafx.css.PseudoClass;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Scene;
@@ -28,6 +29,9 @@ import java.util.function.Consumer;
 import static edu.files.FileOperationTask.Kind.COPY;
 
 final class FileOperationProgress implements AutoCloseable {
+    private static final PseudoClass ERROR = PseudoClass.getPseudoClass("error");
+    private static final PseudoClass WARNING = PseudoClass.getPseudoClass("warning");
+
     private final Stage window = new Stage();
     private final Button launcher = new Button("文件任务");
     private final Label title = label("operation-title", "operation-heading");
@@ -109,7 +113,7 @@ final class FileOperationProgress implements AutoCloseable {
         content.getStyleClass().add("operation-window");
         VBox.setVgrow(detailPane, Priority.SOMETIMES);
         Scene scene = new Scene(content, 600, 438);
-        scene.getStylesheets().add(getClass().getResource("file-manager.css").toExternalForm());
+        UiTheme.inherit(scene, owner);
         window.setScene(scene);
 
         delay.setOnFinished(event -> {
@@ -159,6 +163,8 @@ final class FileOperationProgress implements AutoCloseable {
         boolean cancellation = task.cancellationRequested();
         title.setText(operationTitle(sample.kind()));
         phase.setText(unexpected != null ? "任务异常中断" : result != null ? resultText(result) : phaseText(sample, cancellation));
+        phase.pseudoClassStateChanged(ERROR, unexpected != null || result == FileOperationTask.Result.FAILED);
+        phase.pseudoClassStateChanged(WARNING, result == FileOperationTask.Result.UNKNOWN || result == FileOperationTask.Result.PARTIAL);
         current.setText(sample.currentPath() == null ? "等待磁盘任务开始" : sample.currentPath().getFileName().toString());
         if (sample.currentPath() != null) {
             String path = sample.currentPath().toString();

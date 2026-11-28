@@ -86,6 +86,7 @@ public final class FileManagerApp extends Application {
     private static final PseudoClass DROP_MOVE = PseudoClass.getPseudoClass("drop-move");
     private static final double MIN_NAV_WIDTH = 146;
     private static final double MAX_NAV_WIDTH = 480;
+    private static final double DEFAULT_NAV_WIDTH = 186;
     private static final int MAX_RETAINED_SELECTION = 64;
 
     private record SideNode(String label, Location location, BrowserItem item) {
@@ -198,6 +199,7 @@ public final class FileManagerApp extends Application {
     private boolean clipboardUnavailable;
     private boolean clipboardExpired;
     private FileOperationProgress operationProgress;
+    private UiTheme theme = UiTheme.LIGHT;
     private FileOperationTask activeFileOperation;
     private LocalFiles.Visibility visibility;
     private Task<?> fileTask;
@@ -252,7 +254,6 @@ public final class FileManagerApp extends Application {
     public void start(Stage window) {
         stage = window;
         automaticRefresh = preferences.getBoolean("automaticRefresh", true);
-        operationProgress = new FileOperationProgress(window, unknownResults, this::locateReportedPath);
         icons = new SystemIcons(window::getOutputScaleX);
         leftPane = new BrowserPane("left-pane", "左栏");
         activePane = leftPane;
@@ -264,7 +265,7 @@ public final class FileManagerApp extends Application {
         inspectorHost.visibleProperty().bind(inspectorHost.managedProperty());
         inspectorHost.setManaged(false);
         configureTree();
-        navigationWidth = Math.clamp(layoutValue("navigationWidth", 222), MIN_NAV_WIDTH, MAX_NAV_WIDTH);
+        navigationWidth = Math.clamp(layoutValue("navigationWidth", DEFAULT_NAV_WIDTH), MIN_NAV_WIDTH, MAX_NAV_WIDTH);
         navigationPane = preferences.getBoolean("navigation", true);
         workspace.setId("workspace-split");
         workspace.getStyleClass().add("workspace-split");
@@ -278,11 +279,13 @@ public final class FileManagerApp extends Application {
         BorderPane layout = new BorderPane();
         layout.setTop(new VBox(tabBar(), singleNavigation, commandBar()));
         layout.setCenter(workspace);
-        layout.setBottom(statusBar());
         Scene scene = new Scene(layout, 1200, 760);
+        theme.applyTo(scene);
+        stage.setScene(scene);
+        operationProgress = new FileOperationProgress(stage, unknownResults, this::locateReportedPath);
+        layout.setBottom(statusBar());
         scene.addEventFilter(KeyEvent.KEY_PRESSED, this::tabKey);
         scene.addEventFilter(KeyEvent.KEY_PRESSED, this::fileClipboardKey);
-        scene.getStylesheets().add(getClass().getResource("file-manager.css").toExternalForm());
         scene.focusOwnerProperty().addListener((observable, previous, focused) -> {
             for (BrowserPane pane : visiblePanes()) {
                 if (pane.contains(focused)) { activatePane(pane); break; }
@@ -304,7 +307,6 @@ public final class FileManagerApp extends Application {
         stage.getIcons().add(new Image(getClass().getResource("application-icon.png").toExternalForm()));
         stage.setMinWidth(960);
         stage.setMinHeight(550);
-        stage.setScene(scene);
         restoreWindowLayout();
         stage.focusedProperty().addListener((observable, previous, focused) -> {
             if (focused) {
@@ -426,7 +428,8 @@ public final class FileManagerApp extends Application {
                 activateTab((BrowseContext) selected.getUserData());
             }
         });
-        Button add = new Button("+");
+        Button add = new Button(null, UiGlyph.ADD.graphic(17));
+        add.getStyleClass().add("icon-button");
         add.setId("new-tab");
         add.setAccessibleText("新建标签页");
         add.setTooltip(new Tooltip("新建标签页 (Ctrl+T)"));
@@ -628,6 +631,7 @@ public final class FileManagerApp extends Application {
         Button details = button("详细信息", "details-pane", () -> activePane.changePane(Pane.DETAILS));
         commandGraphic(details, "详细信息", UiGlyph.DETAILS, true);
         Button dual = button("双栏", "dual-pane", () -> setDualPane(!dualPaneOpen));
+        commandGraphic(dual, "切换单双栏", UiGlyph.SPLIT, true);
         Button copyAcross = button("复制到对栏", "copy-across", () -> transferAcross(false));
         Button moveAcross = button("移动到对栏", "move-across", () -> transferAcross(true));
         copyAcross.setTooltip(new Tooltip("复制到对栏（Ctrl+Shift+F5）"));
@@ -658,7 +662,7 @@ public final class FileManagerApp extends Application {
     }
 
     private static void commandGraphic(Labeled control, String label, UiGlyph glyph, boolean showText) {
-        control.setGraphic(glyph.graphic(17, "command-symbol"));
+        control.setGraphic(glyph.graphic(17));
         control.setGraphicTextGap(7);
         control.setAccessibleText(label);
         control.setTooltip(new Tooltip(label));
@@ -2789,8 +2793,24 @@ public final class FileManagerApp extends Application {
 
     private static MenuItem iconMenu(String name, String id, UiGlyph glyph, Runnable action, boolean disabled) {
         MenuItem item = menuItem(name, id, action, disabled);
-        item.setGraphic(glyph.graphic(15, "command-symbol"));
+        item.setGraphic(glyph.graphic(15));
         return item;
+    }
+
+    private Menu appearanceMenu() {
+        ToggleGroup themes = new ToggleGroup();
+        MenuItem light = radio("浅色", themes, theme == UiTheme.LIGHT, () -> selectTheme(UiTheme.LIGHT));
+        light.setId("theme-light");
+        MenuItem dark = radio("深色", themes, theme == UiTheme.DARK, () -> selectTheme(UiTheme.DARK));
+        dark.setId("theme-dark");
+        return submenu("外观预览", List.of(light, dark));
+    }
+
+    private void selectTheme(UiTheme next) {
+        if (theme != next) {
+            theme = next;
+            theme.applyTo(stage);
+        }
     }
 
     private static MenuItem radio(String name, ToggleGroup group, boolean selected, Runnable action) {
@@ -2944,9 +2964,10 @@ public final class FileManagerApp extends Application {
             return button;
         }
 
-        Button navButton(String label, String help, String id, Runnable action) {
-            Button button = button(label, id, action);
-            button.getStyleClass().add("nav-button");
+        Button navButton(UiGlyph icon, String help, String id, Runnable action) {
+            Button button = button(null, id, action);
+            button.setGraphic(icon.graphic(17));
+            button.getStyleClass().addAll("icon-button", "nav-button");
             button.setTooltip(new Tooltip(help));
             button.setAccessibleText(help);
             return button;
@@ -2982,16 +3003,17 @@ public final class FileManagerApp extends Application {
 
         private void configureNavigation() {
             HBox arrows = new HBox(4,
-                    navButton("‹", "后退", "back", () -> history(context.past, context.future)),
-                    navButton("›", "前进", "forward", () -> history(context.future, context.past)),
-                    navButton("↑", "上一级", "up", () -> navigate(parentLocation())),
-                    navButton("⟳", "刷新", "refresh", this::refreshCommand));
+                    navButton(UiGlyph.BACK, "后退", "back", () -> history(context.past, context.future)),
+                    navButton(UiGlyph.FORWARD, "前进", "forward", () -> history(context.future, context.past)),
+                    navButton(UiGlyph.UP, "上一级", "up", () -> navigate(parentLocation())),
+                    navButton(UiGlyph.REFRESH, "刷新", "refresh", this::refreshCommand));
             HBox.setHgrow(address, Priority.ALWAYS);
             searchField.setId("search-field");
             searchField.setMinWidth(54);
             searchField.setOnAction(event -> search());
             Button search = button("搜索", "search", this::search);
-            search.getStyleClass().add("primary-button");
+            search.setGraphic(UiGlyph.SEARCH.graphic(15));
+            search.setMinWidth(Region.USE_PREF_SIZE);
             Button stop = button("取消搜索", "cancel-search", () -> {
                 if (isSearching()) { cancelBrowse(); settleBrowse(""); }
             });
@@ -3530,6 +3552,7 @@ public final class FileManagerApp extends Application {
                 visiblePanes().forEach(BrowserPane::syncDirectoryWatch);
             }));
             result.add(new SeparatorMenuItem());
+            result.add(appearanceMenu());
             result.add(submenu("显示", List.of(
                     checkItem("导航窗格", "show-navigation", navigationPane, value -> {
                         navigationPane = value;
@@ -3581,7 +3604,7 @@ public final class FileManagerApp extends Application {
             BrowseContext owner = context;
             long version = owner.listingVersion;
             Button quickAccess = new Button("快速访问",
-                    (context.quickAccessExpanded ? UiGlyph.DOWN : UiGlyph.RIGHT).graphic(12, "command-symbol"));
+                    (context.quickAccessExpanded ? UiGlyph.DOWN : UiGlyph.RIGHT).graphic(12));
             quickAccess.setId("home-quick-access");
             quickAccess.getStyleClass().add("home-section");
             quickAccess.setOnAction(event -> {
@@ -3608,7 +3631,7 @@ public final class FileManagerApp extends Application {
                 header.getChildren().add(links);
             }
             boolean expanded = browser.homeFilesExpanded();
-            Button expandFiles = new Button(null, (expanded ? UiGlyph.DOWN : UiGlyph.RIGHT).graphic(12, "command-symbol"));
+            Button expandFiles = new Button(null, (expanded ? UiGlyph.DOWN : UiGlyph.RIGHT).graphic(12));
             expandFiles.setId("home-expand-files");
             expandFiles.setAccessibleText(expanded ? "折叠文件列表" : "展开文件列表");
             expandFiles.getStyleClass().add("home-section");
@@ -3636,7 +3659,7 @@ public final class FileManagerApp extends Application {
             subtitle.getStyleClass().add("muted-label");
             HBox detail = new HBox(4, subtitle);
             detail.setAlignment(Pos.CENTER_LEFT);
-            if (pinned) { detail.getChildren().addFirst(UiGlyph.PIN.graphic(10, "command-symbol")); }
+            if (pinned) { detail.getChildren().addFirst(UiGlyph.PIN.graphic(10)); }
             VBox text = new VBox(1, title, detail);
             text.setMinWidth(0);
             HBox graphic = new HBox(10, icons.graphic(item, 36), text);
@@ -3651,7 +3674,7 @@ public final class FileManagerApp extends Application {
         }
 
         private Button homeTab(String label, HomeTab tab, UiGlyph glyph) {
-            Button button = new Button(label, glyph.graphic(13, "home-tab-icon"));
+            Button button = new Button(label, glyph.graphic(13));
             button.setId("home-" + tab.name().toLowerCase(Locale.ROOT));
             button.getStyleClass().add(tab == context.homeTab ? "active-tab" : "home-tab");
             button.setOnAction(event -> {

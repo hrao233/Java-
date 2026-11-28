@@ -1,0 +1,26 @@
+.root, .context-menu, .tooltip, .combo-box-popup, .popup-surface {
+    -fm-window: #222A36;
+    -fm-sidebar: #202733;
+    -fm-surface: #181E28;
+    -fm-secondary: #202733;
+    -fm-text: #E6EBF4;
+    -fm-muted: #B0BED0;
+    -fm-subtle: #91A0B6;
+    -fm-border: #364252;
+    -fm-control-border: #697B94;
+    -fm-accent: #91B5FF;
+    -fm-accent-text: #91B5FF;
+    -fm-on-accent: #172337;
+    -fm-accent-hover: #A8C5FF;
+    -fm-accent-pressed: #759BEA;
+    -fm-selection: #293F67;
+    -fm-hover: #2C3748;
+    -fm-pressed: #35445D;
+    -fm-shadow: #00000055;
+    -fm-error: #FFACB0;
+    -fm-warning: #FFCF8B;
+    -fm-copy: #23493F;
+    -fm-copy-stroke: #85CEB7;
+    -fm-move: #304975;
+    -fm-move-stroke: #A2BFFF;
+}

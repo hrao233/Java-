@@ -1,0 +1,374 @@
+/* Shared controls. The active Scene stylesheet supplies the -fm-* palette. */
+.root, .context-menu, .tooltip, .combo-box-popup, .popup-surface {
+    -fx-font-family: "Microsoft YaHei UI";
+    -fx-font-size: 13px;
+    -fx-background-color: -fm-window;
+    -fx-base: -fm-secondary;
+    -fx-background: -fm-surface;
+    -fx-control-inner-background: -fm-surface;
+    -fx-control-inner-background-alt: -fm-secondary;
+    -fx-text-base-color: -fm-text;
+    -fx-text-background-color: -fm-text;
+    -fx-text-inner-color: -fm-text;
+    -fx-accent: -fm-accent;
+    -fx-focus-color: -fm-accent;
+    -fx-faint-focus-color: transparent;
+    -fx-default-button: -fm-accent;
+    -fx-hover-base: -fm-hover;
+    -fx-pressed-base: -fm-pressed;
+    -fx-selection-bar: -fm-selection;
+    -fx-selection-bar-non-focused: -fm-selection;
+    -fx-selection-bar-text: -fm-text;
+    -fx-mark-color: -fm-muted;
+    -fx-mark-highlight-color: transparent;
+}
+
+.label, .check-box, .radio-button {
+    -fx-text-fill: -fm-text;
+}
+
+.button, .menu-button, .toggle-button, .combo-box-base {
+    -fx-background-color: -fm-surface;
+    -fx-background-insets: 0;
+    -fx-background-radius: 5;
+    -fx-border-color: -fm-control-border;
+    -fx-border-radius: 5;
+    -fx-text-fill: -fm-text;
+    -fx-padding: 5 10;
+    -fx-cursor: hand;
+}
+
+.menu-button > .label, .combo-box > .list-cell {
+    -fx-text-fill: -fm-text;
+    -fx-padding: 0;
+}
+
+.menu-button > .arrow-button, .combo-box-base > .arrow-button {
+    -fx-padding: 0 0 0 7;
+}
+
+.button:hover, .menu-button:hover, .menu-button:showing,
+.toggle-button:hover, .combo-box-base:hover, .combo-box-base:showing {
+    -fx-background-color: -fm-hover;
+}
+
+.button:armed, .menu-button:pressed, .toggle-button:armed, .combo-box-base:pressed {
+    -fx-background-color: -fm-pressed;
+}
+
+.toggle-button:selected {
+    -fx-background-color: -fm-selection;
+    -fx-text-fill: -fm-accent-text;
+}
+
+.toggle-button:selected:hover {
+    -fx-background-color: -fm-pressed;
+}
+
+.toggle-button:selected:armed {
+    -fx-background-color: -fm-hover;
+}
+
+.button:focused, .menu-button:focused, .toggle-button:focused, .combo-box-base:focused {
+    -fx-border-color: -fm-accent;
+}
+
+.button:default, .primary-button {
+    -fx-background-color: -fm-accent;
+    -fx-border-color: transparent;
+    -fx-text-fill: -fm-on-accent;
+}
+
+.button:default:hover, .primary-button:hover, .primary-button:showing {
+    -fx-background-color: -fm-accent-hover;
+}
+
+.button:default:armed, .primary-button:armed {
+    -fx-background-color: -fm-accent-pressed;
+}
+
+.button:default:focused, .primary-button:focused {
+    -fx-background-insets: 2;
+    -fx-border-color: -fm-accent;
+}
+
+.primary-button > .label {
+    -fx-text-fill: -fm-on-accent;
+}
+
+.button:disabled, .menu-button:disabled, .toggle-button:disabled,
+.combo-box-base:disabled, .text-input:disabled, .check-box:disabled, .radio-button:disabled {
+    -fx-opacity: 0.48;
+    -fx-cursor: default;
+}
+
+.icon-button {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+    -fx-padding: 0;
+    -fx-pref-width: 32;
+    -fx-pref-height: 32;
+}
+
+.glyph-stroke {
+    -fx-fill: transparent;
+    -fx-stroke: -fm-muted;
+    -fx-stroke-width: 1.8;
+    -fx-stroke-line-cap: round;
+    -fx-stroke-line-join: round;
+}
+
+.primary-button .glyph-stroke, .button:default .glyph-stroke {
+    -fx-stroke: -fm-on-accent;
+}
+
+.text-input {
+    -fx-background-color: -fm-secondary;
+    -fx-background-insets: 0;
+    -fx-background-radius: 6;
+    -fx-border-color: -fm-control-border;
+    -fx-border-radius: 6;
+    -fx-padding: 6 9;
+    -fx-text-fill: -fm-text;
+    -fx-prompt-text-fill: -fm-subtle;
+    -fx-highlight-fill: -fm-selection;
+    -fx-highlight-text-fill: -fm-text;
+}
+
+.text-input:hover {
+    -fx-background-color: -fm-hover;
+}
+
+.text-input:focused {
+    -fx-background-color: -fm-surface;
+    -fx-border-color: -fm-accent;
+}
+
+.text-area {
+    -fx-padding: 1;
+    -fx-background-color: -fm-surface;
+}
+
+.text-area .content, .text-area:focused .content {
+    -fx-background-color: -fm-surface;
+    -fx-background-insets: 0;
+    -fx-background-radius: 5;
+    -fx-padding: 7 9;
+}
+
+.check-box > .box, .radio-button > .radio {
+    -fx-background-color: -fm-surface;
+    -fx-background-insets: 0;
+    -fx-border-color: -fm-control-border;
+}
+
+.check-box > .box {
+    -fx-background-radius: 4;
+    -fx-border-radius: 4;
+}
+
+.radio-button > .radio {
+    -fx-background-radius: 12;
+    -fx-border-radius: 12;
+}
+
+.check-box:hover > .box, .radio-button:hover > .radio {
+    -fx-background-color: -fm-hover;
+}
+
+.check-box:armed > .box, .radio-button:armed > .radio {
+    -fx-background-color: -fm-pressed;
+}
+
+.check-box:focused > .box, .radio-button:focused > .radio {
+    -fx-border-color: -fm-accent;
+}
+
+.check-box:selected > .box, .check-box:indeterminate > .box {
+    -fx-background-color: -fm-accent;
+    -fx-border-color: -fm-accent;
+}
+
+.check-box:selected:hover > .box, .check-box:indeterminate:hover > .box {
+    -fx-background-color: -fm-accent-hover;
+}
+
+.check-box:selected:armed > .box, .check-box:indeterminate:armed > .box {
+    -fx-background-color: -fm-accent-pressed;
+}
+
+.check-box:selected:focused > .box, .check-box:indeterminate:focused > .box {
+    -fx-background-insets: 2;
+}
+
+.check-box:selected > .box > .mark, .check-box:indeterminate > .box > .mark {
+    -fx-background-color: -fm-on-accent;
+}
+
+.radio-button:selected > .radio > .dot {
+    -fx-background-color: -fm-accent;
+}
+
+.context-menu, .combo-box-popup > .list-view, .popup-surface {
+    -fx-background-color: -fm-surface;
+    -fx-background-insets: 0;
+    -fx-background-radius: 7;
+    -fx-border-color: -fm-border;
+    -fx-border-radius: 7;
+    -fx-padding: 5;
+    -fx-effect: dropshadow(gaussian, -fm-shadow, 12, 0, 0, 3);
+}
+
+.menu-item {
+    -fx-padding: 5 9;
+    -fx-background-radius: 4;
+}
+
+.menu-item > .label {
+    -fx-text-fill: -fm-text;
+}
+
+.menu-item:focused, .context-menu > .scroll-arrow:hover {
+    -fx-background-color: -fm-hover;
+}
+
+.menu-item:focused > .label {
+    -fx-text-fill: -fm-text;
+}
+
+.menu-item:pressed {
+    -fx-background-color: -fm-pressed;
+}
+
+.check-menu-item:checked > .left-container > .check,
+.radio-menu-item:checked > .left-container > .radio {
+    -fx-background-color: -fm-accent-text;
+}
+
+.menu:focused > .right-container > .arrow {
+    -fx-background-color: -fm-muted;
+}
+
+.context-menu .menu-up-arrow, .context-menu .menu-down-arrow {
+    -fx-background-color: -fm-muted;
+}
+
+.combo-box-popup .list-cell {
+    -fx-background-color: -fm-surface;
+    -fx-text-fill: -fm-text;
+    -fx-padding: 4 7;
+}
+
+.combo-box-popup .list-cell:filled:hover {
+    -fx-background-color: -fm-hover;
+}
+
+.combo-box-popup .list-cell:filled:selected {
+    -fx-background-color: -fm-selection;
+    -fx-text-fill: -fm-text;
+}
+
+.separator:horizontal > .line {
+    -fx-border-color: -fm-border transparent transparent transparent;
+    -fx-border-insets: 0;
+}
+
+.separator:vertical > .line {
+    -fx-border-color: transparent transparent transparent -fm-border;
+    -fx-border-insets: 0;
+}
+
+.scroll-pane, .scroll-pane > .viewport, .scroll-pane > .corner,
+.table-view > .virtual-flow > .corner, .list-view > .virtual-flow > .corner {
+    -fx-background-color: -fm-surface;
+    -fx-background-insets: 0;
+}
+
+.scroll-bar, .scroll-bar:focused, .scroll-bar > .track, .scroll-bar > .track-background {
+    -fx-background-color: transparent;
+    -fx-background-insets: 0;
+}
+
+.scroll-bar > .thumb {
+    -fx-background-color: -fm-control-border;
+    -fx-background-radius: 7;
+    -fx-background-insets: 2;
+}
+
+.scroll-bar > .thumb:hover {
+    -fx-background-color: -fm-muted;
+}
+
+.scroll-bar > .thumb:pressed {
+    -fx-background-color: -fm-accent;
+}
+
+.scroll-bar > .increment-button:hover, .scroll-bar > .decrement-button:hover {
+    -fx-background-color: -fm-hover;
+}
+
+.split-pane {
+    -fx-padding: 0;
+    -fx-background-insets: 0;
+    -fx-background-color: -fm-surface;
+}
+
+.split-pane > .split-pane-divider {
+    -fx-padding: 0 3;
+    -fx-background-color: -fm-border;
+    -fx-background-insets: 0 1;
+}
+
+.split-pane > .split-pane-divider:hover {
+    -fx-background-color: -fm-control-border;
+}
+
+.tooltip {
+    -fx-background-color: -fm-surface;
+    -fx-background-insets: 0;
+    -fx-background-radius: 5;
+    -fx-border-color: -fm-border;
+    -fx-border-radius: 5;
+    -fx-text-fill: -fm-text;
+    -fx-font-size: 12px;
+    -fx-padding: 4 8;
+    -fx-effect: dropshadow(gaussian, -fm-shadow, 9, 0, 0, 2);
+}
+
+.dialog-pane {
+    -fx-background-color: -fm-surface;
+}
+
+.dialog-pane:header .header-panel {
+    -fx-background-color: -fm-secondary;
+}
+
+.dialog-pane:header .header-panel .label {
+    -fx-text-fill: -fm-text;
+}
+
+.dialog-pane > .button-bar .button {
+    -fx-min-width: 78;
+}
+
+.progress-bar {
+    -fx-pref-height: 11;
+}
+
+.progress-bar > .track, .progress-bar > .bar {
+    -fx-background-insets: 0;
+    -fx-background-radius: 5;
+}
+
+.progress-bar > .track {
+    -fx-background-color: -fm-border;
+}
+
+.progress-bar > .bar {
+    -fx-background-color: -fm-accent;
+    -fx-padding: 0.38em;
+}
+
+.progress-indicator {
+    -fx-progress-color: -fm-accent;
+}

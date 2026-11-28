@@ -80,8 +80,7 @@ final class AddressBar extends StackPane {
         getChildren().addAll(trail, editRow);
 
         choices.setId("address-choices");
-        choices.getStyleClass().add("address-popup");
-        choices.getStylesheets().add(getClass().getResource("file-manager.css").toExternalForm());
+        choices.getStyleClass().addAll("popup-surface", "address-popup");
         choices.setFixedCellSize(ROW_HEIGHT);
         choices.setCellFactory(ignored -> new ListCell<>() {
             {
@@ -309,7 +308,7 @@ final class AddressBar extends StackPane {
 
     private static Button iconButton(String label, UiGlyph glyph, double size, Runnable handler) {
         Button button = new Button();
-        button.setGraphic(glyph.graphic(size, "crumb-icon"));
+        button.setGraphic(glyph.graphic(size));
         button.setAccessibleText(label);
         button.setTooltip(new Tooltip(label));
         button.getStyleClass().add("address-icon-button");

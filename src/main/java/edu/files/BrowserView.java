@@ -224,6 +224,7 @@ final class BrowserView extends StackPane {
         this.homeHeader = homeHeader;
         this.onEditFinished = onEditFinished;
         setId("browser-view");
+        getStyleClass().add("browser-view");
         buildTable();
         buildTiles();
         empty.getStyleClass().add("empty-state");
@@ -587,6 +588,7 @@ final class BrowserView extends StackPane {
                 filterButtons.put(field, filter);
                 column.setGraphic(filter);
             }
+            if (field == Field.NAME) { column.getStyleClass().add("name-cell"); }
             column.setCellValueFactory(cell -> new ReadOnlyObjectWrapper<>(cell.getValue()));
             column.setCellFactory(ignored -> new TableCell<>() {
                 @Override
@@ -662,7 +664,7 @@ final class BrowserView extends StackPane {
     private Button columnFilterButton(Field field) {
         Button button = new Button();
         button.setId("filter-" + field.name().toLowerCase(Locale.ROOT));
-        button.setGraphic(UiGlyph.DOWN.graphic(9, "filter-symbol"));
+        button.setGraphic(UiGlyph.DOWN.graphic(9));
         button.setTooltip(new Tooltip("筛选" + field.label));
         button.getStyleClass().add("column-filter");
         button.setOnAction(event -> openFilter(field, button));
@@ -719,8 +721,7 @@ final class BrowserView extends StackPane {
         }
         VBox panel = new VBox(8, body, clear);
         panel.setId("column-filter-options");
-        panel.getStyleClass().add("filter-panel");
-        panel.getStylesheets().add(getClass().getResource("file-manager.css").toExternalForm());
+        panel.getStyleClass().addAll("popup-surface", "filter-panel");
         var bounds = anchor.localToScreen(anchor.getBoundsInLocal());
         if (bounds == null) { return; }
         filterMenu = new Popup();
