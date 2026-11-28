@@ -14,12 +14,11 @@ $root = [IO.Path]::GetFullPath($FixtureDirectory)
 if (Test-Path -LiteralPath $root) { throw 'Choose a fresh fixture directory in a test Windows account' }
 New-Item -ItemType Directory -Path $root | Out-Null
 $msiexec = "$env:SystemRoot\System32\msiexec.exe"
-if ($UseMsiPayload) {
-    # Read the exact MSI embedded by jpackage without executing its GUI bootstrap.
-    Add-Type -TypeDefinition @'
+Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
 
 public static class JPackageMsiResource {
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -34,6 +33,20 @@ public static class JPackageMsiResource {
     static extern IntPtr LockResource(IntPtr resource);
     [DllImport("kernel32.dll")]
     static extern bool FreeLibrary(IntPtr image);
+    [DllImport("msi.dll", CharSet = CharSet.Unicode)]
+    static extern uint MsiEnumProductsEx(string productCode, string userSid, uint context,
+        uint index, StringBuilder installedCode, out uint installedContext, StringBuilder installedSid,
+        ref uint sidLength);
+
+    public static bool IsInstalledForUser(string productCode, string userSid) {
+        var sid = new StringBuilder(256);
+        uint sidLength = (uint)sid.Capacity;
+        uint result = MsiEnumProductsEx(productCode, userSid, 3, 0, new StringBuilder(39),
+            out uint context, sid, ref sidLength);
+        if (result == 259) return false;
+        if (result != 0) throw new Win32Exception((int)result);
+        return (context == 1 || context == 2) && sid.ToString() == userSid;
+    }
 
     public static byte[] Read(string path) {
         IntPtr image = LoadLibraryExW(path, IntPtr.Zero, 2);
@@ -51,6 +64,8 @@ public static class JPackageMsiResource {
     }
 }
 '@
+if ($UseMsiPayload) {
+    # Read the exact MSI embedded by jpackage without executing its GUI bootstrap.
     $setupPayload = Join-Path $root 'setup.msi'
     $upgradePayload = Join-Path $root 'upgrade.msi'
     [IO.File]::WriteAllBytes($setupPayload, [JPackageMsiResource]::Read($Setup))
@@ -65,7 +80,9 @@ $fixture = Join-Path $root '用户 文件.txt'
 Set-Content -LiteralPath $fixture -Value 'installer lifecycle fixture'
 $hash = (Get-FileHash -LiteralPath $fixture).Hash
 
-$uninstallPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall'
+$uninstallPaths = @('HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall')
+$userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $profile = 'explorer-install-test-' + ([guid]::NewGuid().ToString('N'))
 $preferences = "HKCU:\Software\JavaSoft\Prefs\edu\files\$profile"
 $startMenu = [Environment]::GetFolderPath('Programs')
@@ -73,8 +90,10 @@ $desktop = [Environment]::GetFolderPath('DesktopDirectory')
 $shell = New-Object -ComObject WScript.Shell
 
 function InstalledProducts {
-    @(Get-ItemProperty -Path "$uninstallPath\*" -ErrorAction SilentlyContinue |
-        Where-Object DisplayName -eq 'JavaFXFileManager')
+    foreach ($path in $uninstallPaths) {
+        Get-ItemProperty -Path "$path\*" -ErrorAction SilentlyContinue |
+            Where-Object DisplayName -eq 'JavaFXFileManager'
+    }
 }
 
 function Invoke-Installer {
@@ -113,6 +132,9 @@ function Assert-Install {
     if ($records.Count -ne 1 -or $records[0].DisplayVersion -ne $Version -or
         $records[0].InstallLocation.TrimEnd('\') -ne $install -or -not (Test-Path -LiteralPath $exe)) {
         throw "Expected one per-user installation of $Version in $install"
+    }
+    if (-not [JPackageMsiResource]::IsInstalledForUser($records[0].PSChildName, $userSid)) {
+        throw 'Windows Installer did not register this product for the test account'
     }
     $records[0]
 }
@@ -210,7 +232,7 @@ try {
     'The external fixture hash and Java Preferences marker survived the lifecycle'
 } catch {
     "Installer path exists: $(Test-Path -LiteralPath $exe)" | Write-Host
-    foreach ($uninstall in @($uninstallPath, 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall')) {
+    foreach ($uninstall in $uninstallPaths) {
         $records = Get-ItemProperty -Path "$uninstall\*" -ErrorAction SilentlyContinue |
             Where-Object DisplayName -like '*JavaFXFileManager*'
         $records | Select-Object DisplayName, DisplayVersion, InstallLocation, PSPath | Format-List | Out-String | Write-Host
