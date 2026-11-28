@@ -1,0 +1,43 @@
+name: Windows x64 build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: microsoft
+          java-version: '21'
+          architecture: x64
+          cache: maven
+      - name: Build and run default tests
+        shell: pwsh
+        run: |
+          java -version
+          mvn --version
+          mvn -B -ntp package
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $reports = @(Get-ChildItem -LiteralPath target/surefire-reports -Filter 'TEST-*.xml')
+          if ($reports.Count -eq 0) { throw 'Surefire did not produce any test reports' }
+          $tests = $failures = $errors = $skipped = 0
+          foreach ($report in $reports) {
+              $suite = ([xml](Get-Content -LiteralPath $report.FullName -Raw)).testsuite
+              $tests += [int]$suite.tests
+              $failures += [int]$suite.failures
+              $errors += [int]$suite.errors
+              $skipped += [int]$suite.skipped
+          }
+          $passed = $tests - $failures - $errors - $skipped
+          if ($passed -le 0) { throw 'No default tests ran' }
+          "Passed: $passed, failed: $failures, errors: $errors, skipped: $skipped" |
+              Tee-Object -FilePath $env:GITHUB_STEP_SUMMARY -Append
