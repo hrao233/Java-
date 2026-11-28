@@ -2,9 +2,7 @@ name: Windows x64 build
 
 on:
   push:
-    paths: ['src/**', 'pom.xml', '.github/workflows/windows-build.yml']
   pull_request:
-    paths: ['src/**', 'pom.xml', '.github/workflows/windows-build.yml']
   workflow_dispatch:
 
 permissions:
