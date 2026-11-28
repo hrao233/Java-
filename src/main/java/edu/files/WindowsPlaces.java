@@ -9,6 +9,7 @@ import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
 import java.nio.file.attribute.FileTime;
+import java.time.DateTimeException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
@@ -34,6 +35,10 @@ final class WindowsPlaces {
     private WindowsPlaces() { }
 
     static Places load() {
+        return catalog(readScriptOutput("windows-places.ps1"));
+    }
+
+    static Places catalog(List<String> records) {
         Map<String, Path> folders = new LinkedHashMap<>();
         FOLDERS.forEach(name -> folders.put(name, USER_HOME.resolve(name)));
         List<BrowserItem> oneDrive = new ArrayList<>();
@@ -45,35 +50,40 @@ final class WindowsPlaces {
         LocalFiles.Visibility visibility = new LocalFiles.Visibility(false, false);
         boolean extensions = true;
 
-        for (String line : readScriptOutput("windows-places.ps1")) {
+        for (String line : records) {
             String[] fields = line.split("\t", -1);
-            if (fields.length < 2) {
-                continue;
-            }
-            switch (fields[0]) {
-                case "view" -> {
-                    visibility = new LocalFiles.Visibility(fields[1].equals("1"), fields[2].equals("1"));
-                    extensions = !fields[3].equals("1");
-                }
-                case "folder" -> {
-                    if (!fields[2].isBlank()) {
-                        folders.put(fields[1], Path.of(fields[2]));
+            int requiredFields = switch (fields[0]) {
+                case "view", "shell" -> 4;
+                case "folder", "recent" -> 3;
+                case "disk" -> 9;
+                default -> 2;
+            };
+            if (fields.length < requiredFields) { continue; }
+            try {
+                switch (fields[0]) {
+                    case "view" -> {
+                        visibility = new LocalFiles.Visibility(fields[1].equals("1"), fields[2].equals("1"));
+                        extensions = !fields[3].equals("1");
                     }
-                }
-                case "onedrive" -> oneDrive.add(BrowserItem.folder(Path.of(fields[1]), "OneDrive"));
-                case "linux" -> linux.add(BrowserItem.folder(Path.of("\\\\wsl.localhost\\" + fields[1] + "\\"), fields[1]));
-                case "recent" -> recent.add(new Recent(Path.of(fields[1]), FileTime.from(Instant.parse(fields[2]))));
-                case "shell" -> {
-                    if (fields[2].matches("(?i)[a-z]:\\\\")) {
-                        driveNames.put(Path.of(fields[2]), fields[1]);
-                    } else if (fields[3].equals("1")) {
-                        shortcuts.add(BrowserItem.folder(Path.of(fields[2]), fields[1]));
-                    } else if (!fields[2].isBlank()) {
-                        shortcuts.add(BrowserItem.shell(fields[1], fields[2]));
+                    case "folder" -> {
+                        if (!fields[2].isBlank()) { folders.put(fields[1], Path.of(fields[2])); }
                     }
+                    case "onedrive" -> oneDrive.add(BrowserItem.folder(Path.of(fields[1]), "OneDrive"));
+                    case "linux" -> linux.add(BrowserItem.folder(Path.of("\\\\wsl.localhost\\" + fields[1] + "\\"), fields[1]));
+                    case "recent" -> recent.add(new Recent(Path.of(fields[1]), FileTime.from(Instant.parse(fields[2]))));
+                    case "shell" -> {
+                        if (fields[2].matches("(?i)[a-z]:\\\\")) {
+                            driveNames.put(Path.of(fields[2]), fields[1]);
+                        } else if (!fields[2].isBlank()) {
+                            shortcuts.add(fields[3].equals("1") ? BrowserItem.folder(Path.of(fields[2]), fields[1])
+                                    : BrowserItem.shell(fields[1], fields[2]));
+                        }
+                    }
+                    case "disk" -> disks.put(Path.of(fields[1] + "\\"), disk(fields));
+                    default -> { }
                 }
-                case "disk" -> disks.put(Path.of(fields[1] + "\\"), disk(fields));
-                default -> { }
+            } catch (IllegalArgumentException | DateTimeException malformed) {
+                // Retain the defaults and the other valid records from this script output.
             }
         }
         List<BrowserItem> computer = new ArrayList<>();

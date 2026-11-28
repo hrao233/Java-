@@ -148,9 +148,13 @@ class JavaFxFileOperationsTest {
     }
 
     private void openWindow(boolean automaticRefresh, FileClipboard clipboard) throws Exception {
+        var preferences = new MemoryPreferences(null, "");
+        if (!automaticRefresh) { preferences.putBoolean("automaticRefresh", false); }
+        openWindow(preferences, clipboard);
+    }
+
+    private void openWindow(MemoryPreferences preferences, FileClipboard clipboard) throws Exception {
         fx(() -> {
-            var preferences = new MemoryPreferences(null, "");
-            if (!automaticRefresh) { preferences.putBoolean("automaticRefresh", false); }
             if (Boolean.getBoolean("javafx.captureTabs") || Boolean.getBoolean("javafx.capturePanes")
                     || Boolean.getBoolean("javafx.captureDrag")) {
                 preferences.putBoolean("navigation", false);
@@ -178,6 +182,152 @@ class JavaFxFileOperationsTest {
             return null;
         });
         await(() -> idle() && field(app, "places") != null, "home page", 35);
+    }
+
+    @Test
+    void newFolderRefusesAReplacedDestinationWhileWaitingForTheWriter() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path directory = Files.createDirectory(root.resolve("chosen"));
+        Path former = root.resolve("former-directory");
+        Path sample = Files.writeString(directory.resolve("sample.txt"), "keep");
+        openWindow(false);
+        go(directory);
+        var gate = new Gate();
+        try {
+            ((ExecutorService) fx(() -> field(app, "writes"))).execute(gate::hold);
+            assertTrue(gate.entered.await(8, TimeUnit.SECONDS));
+            menu("newItems", "new-folder");
+            assertNotNull(fx(() -> field(app, "fileTask")));
+            Files.move(directory, former);
+            Files.createDirectory(directory);
+        } finally {
+            gate.release.countDown();
+        }
+        await(this::idle, "created or rejected the queued request", 10);
+        try (var entries = Files.list(directory)) { assertEquals(0, entries.count(), "replacement must stay empty"); }
+        try (var entries = Files.list(former)) { assertEquals(List.of(former.resolve(sample.getFileName())), entries.toList()); }
+        assertEquals("keep", Files.readString(former.resolve(sample.getFileName())));
+        assertTrue(fx(() -> errorDialog() != null && errorDialog().getContentText().contains("已变化")));
+        assertTrue(fx(() -> ((List<?>) field(app, "undo")).isEmpty()));
+        acknowledgeFileError();
+
+        go(former);
+        menu("newItems", "new-folder");
+        await(() -> idle() && browser.items().stream().anyMatch(item -> item.directory()),
+                "creating in a newly selected directory succeeds", 10);
+        assertEquals("keep", Files.readString(former.resolve(sample.getFileName())));
+        try (var entries = Files.list(former)) {
+            assertEquals(1, entries.filter(Files::isDirectory).count());
+        }
+    }
+
+    @Test
+    void malformedPreferencesDoNotBlockStartupOrDiscardValidHistory() throws Exception {
+        Path folder = Files.createDirectory(root.resolve("资料"));
+        Path sample = Files.writeString(folder.resolve("打开记录.txt"), "persisted");
+        var preferences = new MemoryPreferences(null, "");
+        preferences.put("pins", root + java.io.File.separator + "<invalid>\n" + folder);
+        preferences.put("recentFiles", "bad-timestamp\t" + sample + "\n1234\t" + sample);
+        openWindow(preferences, new TestClipboard());
+        await(() -> listed(sample) && !currentBrowse().needsReload, "valid home entries still load", 7);
+        assertTrue(fx(() -> ((Set<?>) field(app, "extraPins")).contains(folder)));
+        assertTrue(fx(() -> ((Map<?, ?>) field(app, "recentFiles")).containsKey(sample)));
+        assertNull(fx(this::errorDialog));
+        go(folder);
+        assertTrue(fx(() -> listed(sample)));
+    }
+
+    @Test
+    void reopeningRestoresLayoutAndPreferencesWithAFreshFileSession() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("left"));
+        Path right = Files.createDirectory(root.resolve("right"));
+        Path sample = Files.writeString(left.resolve("session.txt"), "keep on disk");
+        var preferences = new MemoryPreferences(null, "");
+        var clipboard = new TestClipboard();
+        openWindow(preferences, clipboard);
+        goWatched(left);
+        addWorkspaceLayout(right);
+        toggleAutoRefresh(false);
+        select(sample);
+        click("cut");
+        await(() -> cutSources().equals(List.of(sample)) && idle(), "session contains an unpublished cut", 8);
+        var layout = fx(() -> {
+            var display = javafx.stage.Screen.getPrimary().getVisualBounds();
+            stage.setX(display.getMinX() + 32);
+            stage.setY(display.getMinY() + 26);
+            stage.setWidth(1080);
+            stage.setHeight(645);
+            scene.getRoot().applyCss();
+            scene.getRoot().layout();
+            browserSplit().setDividerPositions(0.57);
+            scene.getRoot().layout();
+            return new double[]{stage.getX(), stage.getY(), stage.getWidth(), stage.getHeight(),
+                    browserSplit().getDividerPositions()[0]};
+        });
+        closeWindow();
+        openWindow(preferences, clipboard);
+        fx(() -> {
+            scene.getRoot().applyCss();
+            scene.getRoot().layout();
+            assertEquals(2, browserSplit().getItems().size());
+            assertEquals(layout[0], stage.getX(), 2);
+            assertEquals(layout[1], stage.getY(), 2);
+            assertEquals(layout[2], stage.getWidth(), 2);
+            assertEquals(layout[3], stage.getHeight(), 2);
+            assertEquals(layout[4], browserSplit().getDividerPositions()[0], 0.025);
+            assertEquals(1, tabs().getTabs().size());
+            assertEquals(BrowseContext.Page.HOME, paneContext(false).location.page());
+            assertEquals(BrowseContext.Page.HOME, paneContext(true).location.page());
+            assertFalse((boolean) field(app, "automaticRefresh"));
+            assertTrue(cutSources().isEmpty());
+            assertTrue(((List<?>) field(app, "undo")).isEmpty());
+            return null;
+        });
+        assertEquals("keep on disk", Files.readString(sample));
+    }
+
+    private void addWorkspaceLayout(Path right) throws Exception {
+        click("dual-pane");
+        goPane(true, right);
+        focusPane(false);
+    }
+
+    @Test
+    void copiesASearchResultIntoAnotherTabWithoutChangingTheSearch() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path source = Files.createDirectory(root.resolve("来源"));
+        Path child = Files.createDirectory(source.resolve("项目资料"));
+        Path target = Files.createDirectory(root.resolve("归档"));
+        Path match = Files.writeString(child.resolve("阶段报告.txt"), "reviewed");
+        Files.writeString(child.resolve("draft.txt"), "unselected");
+        openWindow(false, new TestClipboard());
+        Tab destination = openAt(target);
+        Tab searchTab = openAt(source);
+        fx(() -> {
+            var search = (TextField) scene.lookup("#search-field");
+            search.setText("阶段报告");
+            search.fireEvent(new ActionEvent());
+            return null;
+        });
+        await(() -> idle() && listed(match) && browser.items().size() == 1, "directory search results", 10);
+        select(match);
+        click("copy");
+        await(() -> idle() && cutSources().equals(List.of(match)), "search result copied", 8);
+        activate(destination);
+        await(() -> browseAt(target), "destination tab", 10);
+        click("paste");
+        Path published = target.resolve(match.getFileName());
+        await(() -> idle() && listed(published), "paste into the destination tab", 12);
+        assertEquals(-1, Files.mismatch(match, published));
+        assertFalse(Files.exists(target.resolve("draft.txt")));
+        activate(searchTab);
+        await(() -> idle() && "阶段报告".equals(currentBrowse().activeQuery) && listed(match),
+                "original search and file remain available", 10);
+    }
+
+    private javafx.scene.control.SplitPane browserSplit() {
+        return (javafx.scene.control.SplitPane) scene.lookup("#browser-split");
     }
 
     @Test
@@ -492,8 +642,14 @@ class JavaFxFileOperationsTest {
         Path targetB = Files.writeString(right.resolve("b.txt"), "original b");
         Path targetC = Files.writeString(right.resolve("c.txt"), "original c");
         Path file = left.resolve("large.bin");
-        openWindow(false);
+        var clipboard = new TestClipboard();
+        openWindow(false, clipboard);
         go(left);
+        select(copied);
+        click("cut");
+        await(() -> idle() && cutSources().equals(List.of(copied)), "source cut staged", 8);
+        var externalText = clipboard.text("from a different clipboard owner");
+        await(() -> cutSources().isEmpty() && button("paste").isDisabled(), "clipboard takeover clears the cut", 8);
         click("dual-pane");
         goPane(true, right);
         var rightList = fx(() -> paneBrowser(true));
@@ -516,6 +672,8 @@ class JavaFxFileOperationsTest {
         assertEquals(-1, Files.mismatch(copied, right.resolve(copied.getFileName())));
         assertEquals(-1, Files.mismatch(kept, published));
         assertEquals("source b", Files.readString(skipped));
+        assertEquals(externalText, clipboard.probe());
+        assertEquals("from a different clipboard owner", clipboard.textValue());
         assertTrue(fx(() -> progressLabel("operation-details").contains("已跳过 1 项")));
 
         click("dual-pane");

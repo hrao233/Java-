@@ -48,6 +48,7 @@ import javafx.scene.input.MouseEvent;
 import javafx.scene.input.TransferMode;
 import javafx.scene.layout.*;
 import javafx.stage.DirectoryChooser;
+import javafx.stage.Screen;
 import javafx.stage.Stage;
 import javafx.util.Duration;
 
@@ -262,7 +263,7 @@ public final class FileManagerApp extends Application {
         inspectorHost.visibleProperty().bind(inspectorHost.managedProperty());
         inspectorHost.setManaged(false);
         configureTree();
-        navigationWidth = Math.clamp(preferences.getDouble("navigationWidth", 222), MIN_NAV_WIDTH, MAX_NAV_WIDTH);
+        navigationWidth = Math.clamp(layoutValue("navigationWidth", 222), MIN_NAV_WIDTH, MAX_NAV_WIDTH);
         navigationPane = preferences.getBoolean("navigation", true);
         workspace.setId("workspace-split");
         workspace.getStyleClass().add("workspace-split");
@@ -302,6 +303,7 @@ public final class FileManagerApp extends Application {
         stage.setMinWidth(960);
         stage.setMinHeight(550);
         stage.setScene(scene);
+        restoreWindowLayout();
         stage.focusedProperty().addListener((observable, previous, focused) -> {
             if (focused) {
                 refreshModifiedFolders();
@@ -321,6 +323,7 @@ public final class FileManagerApp extends Application {
             }
         });
         stage.show();
+        stage.setMaximized(preferences.getBoolean("windowMaximized", false));
         clipboardTimer.setCycleCount(Animation.INDEFINITE);
         clipboardTimer.play();
         pollClipboard();
@@ -350,8 +353,7 @@ public final class FileManagerApp extends Application {
             rightPane.watcher.close();
         }
         thumbnails.clear();
-        rememberNavigationWidth();
-        preferences.putDouble("navigationWidth", navigationWidth);
+        saveWindowLayout();
         if (fileTask != null && !writing) { fileTask.cancel(); }
         if (modifiedFoldersTask != null) { reads.cancel(modifiedFoldersTask); }
         reads.close();
@@ -365,6 +367,46 @@ public final class FileManagerApp extends Application {
         }
         if (operationProgress != null) { operationProgress.close(); }
         if (icons != null) { icons.close(); }
+    }
+
+    private double layoutValue(String key, double fallback) {
+        double value = preferences.getDouble(key, fallback);
+        return Double.isFinite(value) ? value : fallback;
+    }
+
+    private void restoreWindowLayout() {
+        browserDivider = Math.clamp(layoutValue("browserDivider", 0.5), 0, 1);
+        setDualPane(preferences.getBoolean("dualPane", false));
+        double x = layoutValue("windowX", Double.NaN);
+        double y = layoutValue("windowY", Double.NaN);
+        if (!Double.isFinite(x) || !Double.isFinite(y)) { return; }
+
+        var screens = Screen.getScreensForRectangle(x, y, 1, 1);
+        var bounds = (screens.isEmpty() ? Screen.getPrimary() : screens.getFirst()).getVisualBounds();
+        double width = Math.clamp(layoutValue("windowWidth", 1200), stage.getMinWidth(),
+                Math.max(stage.getMinWidth(), bounds.getWidth()));
+        double height = Math.clamp(layoutValue("windowHeight", 760), stage.getMinHeight(),
+                Math.max(stage.getMinHeight(), bounds.getHeight()));
+        stage.setWidth(width);
+        stage.setHeight(height);
+        stage.setX(Math.clamp(x, bounds.getMinX(), Math.max(bounds.getMinX(), bounds.getMaxX() - width)));
+        stage.setY(Math.clamp(y, bounds.getMinY(), Math.max(bounds.getMinY(), bounds.getMaxY() - height)));
+    }
+
+    private void saveWindowLayout() {
+        if (stage == null) { return; }
+        rememberNavigationWidth();
+        preferences.putDouble("navigationWidth", navigationWidth);
+        preferences.putBoolean("dualPane", dualPaneOpen);
+        double[] positions = browsers.getDividerPositions();
+        preferences.putDouble("browserDivider", positions.length == 0 ? browserDivider : positions[0]);
+        preferences.putBoolean("windowMaximized", stage.isMaximized());
+        if (!stage.isMaximized() && !stage.isFullScreen() && !stage.isIconified()) {
+            preferences.putDouble("windowX", stage.getX());
+            preferences.putDouble("windowY", stage.getY());
+            preferences.putDouble("windowWidth", stage.getWidth());
+            preferences.putDouble("windowHeight", stage.getHeight());
+        }
     }
 
     private HBox tabBar() {
@@ -1481,35 +1523,59 @@ public final class FileManagerApp extends Application {
 
     private void create(NewItems.Type type) {
         if (!canCreate() || places == null) { return; }
-        Path directory = activePane.context.location.path();
-        var report = activePane.listingReporter();
+        BrowserPane pane = activePane;
+        BrowseContext owner = pane.context;
+        Path directory = owner.location.path();
+        var target = transferTarget(pane, directory, null);
+        var report = pane.listingReporter();
         switch (type.kind()) {
-            case COMMAND -> runFileTask(task(ignored -> {
-                WindowsPlaces.launchNewCommand(directory, type.value());
-                return null;
+            case COMMAND -> runFileTask(task(cancelled -> {
+                try (var directories = new NtfsFileOperations.PinnedDirectories()) {
+                    verifyCreationDirectory(target, directories);
+                    WindowsPlaces.launchNewCommand(directory, type.value());
+                    return null;
+                }
             }), "正在打开「" + type.label() + "」的创建向导…", false,
                     ignored -> report.accept("已打开「" + type.label() + "」的创建向导"));
             case SHORTCUT -> chooseText("创建快捷方式", "目标路径或网址", "", input -> {
+                if (!visible(pane) || pane.context != owner || !directory.equals(owner.location.path())) {
+                    showError(new IOException("新建目标已变化，请重新选择"));
+                    return;
+                }
                 NewItems.Shortcut shortcut = NewItems.Shortcut.parse(directory, input);
-                createItem(type.label(), ignored -> NewItems.createShortcut(directory, type, shortcut));
+                createItem(pane, target, type.label(), ignored -> NewItems.createShortcut(directory, type, shortcut));
             });
-            default -> createItem(type.label(), ignored -> NewItems.create(directory, type));
+            default -> createItem(pane, target, type.label(), ignored -> NewItems.create(directory, type));
         }
     }
 
-    private void createItem(String label, Work<NewItems.Created> work) {
-        if (fileCommandsUnavailable()) { return; }
-        BrowserPane pane = activePane;
+    private void verifyCreationDirectory(PasteTarget target, NtfsFileOperations.PinnedDirectories directories)
+            throws IOException {
+        var identity = target.knownDirectory();
+        if (identity == null || !identity.known()) { throw new IOException("无法确认新建目标文件夹的身份，请重新选择"); }
+        if (identity.ntfs() == null) {
+            verifyDestination(target);
+        } else {
+            requireVisible(target.path());
+            directories.verify(identity.ntfs());
+        }
+    }
+
+    private void createItem(BrowserPane pane, PasteTarget target, String label, Work<NewItems.Created> work) {
+        if (fileCommandsUnavailable(pane)) { return; }
         pane.deferWatchRead();
         BrowseContext owner = pane.context;
         Location origin = owner.location;
         long view = owner.listingVersion;
         runFileTask(task(cancelled -> {
-            var created = work.read(cancelled);
-            try {
-                return new CreatedItem(created, FileChanges.capture(created.entry()));
-            } catch (IOException | SecurityException unavailable) {
-                return new CreatedItem(created, null);
+            try (var directories = new NtfsFileOperations.PinnedDirectories()) {
+                verifyCreationDirectory(target, directories);
+                var created = work.read(cancelled);
+                try {
+                    return new CreatedItem(created, FileChanges.capture(created.entry()));
+                } catch (IOException | SecurityException unavailable) {
+                    return new CreatedItem(created, null);
+                }
             }
         }), "正在新建" + label + "…", true, result -> {
             var created = result.created();
@@ -2623,7 +2689,16 @@ public final class FileManagerApp extends Application {
     }
 
     private List<Path> loadPaths(String key) {
-        return preferences.get(key, "").lines().filter(value -> !value.isBlank()).map(Path::of).toList();
+        return preferences.get(key, "").lines().map(FileManagerApp::savedPath).filter(Objects::nonNull).toList();
+    }
+
+    private static Path savedPath(String value) {
+        try {
+            Path path = Path.of(value);
+            return path.isAbsolute() ? path : null;
+        } catch (InvalidPathException malformed) {
+            return null;
+        }
     }
 
     private void savePaths(String key, Collection<Path> paths) {
@@ -2633,9 +2708,13 @@ public final class FileManagerApp extends Application {
     private void loadVisits(String key, Map<Path, FileTime> destination) {
         preferences.get(key, "").lines().forEach(line -> {
             int separator = line.indexOf('\t');
-            if (separator > 0) {
-                destination.put(Path.of(line.substring(separator + 1)),
-                        FileTime.fromMillis(Long.parseLong(line.substring(0, separator))));
+            if (separator <= 0) { return; }
+            Path path = savedPath(line.substring(separator + 1));
+            if (path == null) { return; }
+            try {
+                destination.put(path, FileTime.fromMillis(Long.parseLong(line.substring(0, separator))));
+            } catch (NumberFormatException malformed) {
+                // Keep the other valid history entries.
             }
         });
     }
