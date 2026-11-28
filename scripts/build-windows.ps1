@@ -74,7 +74,7 @@ $originalPath = $env:Path
 Push-Location $project
 try {
     $env:Path = (Join-Path $javaHome 'bin') + ';' + $env:Path
-    $maven = (Get-Command mvn.cmd -CommandType Application).Source
+    $maven = Get-Command mvn.cmd -CommandType Application | Select-Object -First 1 -ExpandProperty Source
     $mavenVersion = & $maven -v | Select-Object -First 1
     if ($mavenVersion -notmatch ('Apache Maven ' + [regex]::Escape($lock.maven) + '\b')) {
         throw "Use Apache Maven $($lock.maven) for this release. Found $mavenVersion"
