@@ -759,3 +759,35 @@
 .selectable-entry:cut-file {
     -fx-opacity: 0.52;
 }
+
+.table-view .table-row-cell:filled:drop-copy .table-cell,
+.selectable-entry:drop-copy,
+.browse-tabs .tab:drop-copy {
+    -fx-background-color: #bde4da;
+}
+
+.table-view .table-row-cell:filled:drop-move .table-cell,
+.selectable-entry:drop-move,
+.browse-tabs .tab:drop-move {
+    -fx-background-color: #cbdcf5;
+}
+
+#browser-view:drop-copy, #browser-view:drop-move {
+    -fx-border-width: 2;
+    -fx-border-insets: 0;
+}
+
+#browser-view:drop-copy {
+    -fx-border-color: #31897b;
+}
+
+#browser-view:drop-move {
+    -fx-border-color: #5b79b0;
+}
+
+.drag-status {
+    -fx-text-fill: #174e48;
+    -fx-background-color: #e0efec;
+    -fx-background-radius: 5;
+    -fx-padding: 2 7;
+}

@@ -1,9 +1,12 @@
 package edu.files;
 
+import com.sun.javafx.scene.input.DragboardHelper;
+import com.sun.javafx.tk.TKClipboard;
 import javafx.application.Platform;
 import javafx.event.ActionEvent;
 import javafx.event.Event;
 import javafx.geometry.Rectangle2D;
+import javafx.scene.Node;
 import javafx.scene.Scene;
 import javafx.scene.SnapshotParameters;
 import javafx.scene.control.Button;
@@ -17,16 +20,26 @@ import javafx.scene.control.Label;
 import javafx.scene.control.MenuItem;
 import javafx.scene.control.Tab;
 import javafx.scene.control.TabPane;
+import javafx.scene.control.TableRow;
 import javafx.scene.control.TextArea;
 import javafx.scene.control.TextField;
 import javafx.scene.control.skin.VirtualFlow;
+import javafx.scene.image.Image;
 import javafx.scene.image.PixelFormat;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyCodeCombination;
 import javafx.scene.input.KeyEvent;
+import javafx.scene.input.DataFormat;
+import javafx.scene.input.DragEvent;
+import javafx.scene.input.Dragboard;
+import javafx.scene.input.MouseButton;
+import javafx.scene.input.MouseEvent;
+import javafx.scene.input.PickResult;
+import javafx.scene.input.TransferMode;
 import javafx.stage.Stage;
 import javafx.stage.Window;
 import javafx.stage.WindowEvent;
+import javafx.util.Pair;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
@@ -44,6 +57,7 @@ import java.lang.reflect.Method;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.BasicFileAttributeView;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -83,6 +97,8 @@ class JavaFxFileOperationsTest {
     private final AtomicReference<Gate> heldMove = new AtomicReference<>();
     private final AtomicInteger browseCommits = new AtomicInteger();
     private final AtomicReference<CompletableFuture<Long>> timedCommit = new AtomicReference<>();
+    private final AtomicReference<CompletableFuture<Long>> timedDragTask = new AtomicReference<>();
+    private final AtomicReference<FileDrag.Intent> dragIntent = new AtomicReference<>(FileDrag.Intent.COPY);
     private Map<Path, CompletableFuture<Long>> timedPanes = Map.of();
     private Path captures;
 
@@ -134,7 +150,8 @@ class JavaFxFileOperationsTest {
         fx(() -> {
             var preferences = new MemoryPreferences(null, "");
             if (!automaticRefresh) { preferences.putBoolean("automaticRefresh", false); }
-            if (Boolean.getBoolean("javafx.captureTabs") || Boolean.getBoolean("javafx.capturePanes")) {
+            if (Boolean.getBoolean("javafx.captureTabs") || Boolean.getBoolean("javafx.capturePanes")
+                    || Boolean.getBoolean("javafx.captureDrag")) {
                 preferences.putBoolean("navigation", false);
             }
             app = new FileManagerApp(preferences, this::operation, new FileManagerApp.ReadObserver() {
@@ -151,7 +168,7 @@ class JavaFxFileOperationsTest {
                         if (paneSample != null) { paneSample.complete(System.nanoTime()); }
                     }
                 }
-            }, clipboard);
+            }, clipboard, proposed -> dragIntent.get());
             stage = new Stage();
             stage.setOpacity(0);
             app.start(stage);
@@ -160,6 +177,502 @@ class JavaFxFileOperationsTest {
             return null;
         });
         await(() -> idle() && field(app, "places") != null, "home page", 35);
+    }
+
+    @Test
+    void dragUsesFrozenMultiSelectionCopiesBothWaysAndMovesWithShift() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("资料"));
+        Path right = Files.createDirectory(root.resolve("收件"));
+        Path file = Files.writeString(left.resolve("中文 文件.txt"), "source file");
+        Path folder = Files.createDirectory(left.resolve("目录"));
+        Files.writeString(folder.resolve("nested.txt"), "inside directory");
+        var clipboard = new TestClipboard();
+        var clipboardState = clipboard.text("keep my clipboard");
+        openWindow(false, clipboard);
+        go(left);
+        click("dual-pane");
+        goPane(true, right);
+        fx(() -> { browser.selectAll(); return null; });
+        await(() -> paneContext(false).selectionProof.size() == 2, "mixed selection verified", 8);
+        var multi = beginFileDrag(false, file);
+        assertEquals(2, fx(() -> multi.board().getFiles().size()));
+        fx(() -> { browser.clearSelection(); return null; });
+        Node rightList = fx(() -> paneBrowser(true));
+        assertTrue(dragOver(multi, rightList));
+        assertEquals("复制 2 项 到「收件」", fx(this::dragStatusText));
+        captureDrag("copy-across.png");
+        assertTrue(dropFiles(multi, rightList));
+        dragDone(multi, TransferMode.MOVE);
+        Path copied = right.resolve(file.getFileName());
+        await(() -> idle() && paneListed(true, copied), "frozen multi copy", 12);
+        assertEquals("source file", Files.readString(file));
+        assertEquals(-1, Files.mismatch(file, copied));
+        assertEquals("inside directory", Files.readString(right.resolve("目录/nested.txt")));
+        assertEquals(clipboardState, clipboard.probe());
+
+        Path rightCopy = Files.writeString(right.resolve("回传.txt"), "copy back");
+        goPane(true, right);
+        var copiedBack = selectForDrag(true, rightCopy);
+        assertTrue(dragOver(copiedBack, browser));
+        assertTrue(dropFiles(copiedBack, browser));
+        dragDone(copiedBack, TransferMode.COPY);
+        await(() -> idle() && paneListed(false, left.resolve(rightCopy.getFileName())), "right-to-left copy", 12);
+        assertEquals(-1, Files.mismatch(rightCopy, left.resolve(rightCopy.getFileName())));
+
+        Path move = Files.writeString(right.resolve("同卷移动.txt"), "move me");
+        goPane(true, right);
+        var shifted = selectForDrag(true, move);
+        dragIntent.set(FileDrag.Intent.MOVE);
+        assertTrue(dragOver(shifted, browser));
+        assertTrue(fx(this::dragStatusText).startsWith("移动 1 项"));
+        captureDrag("move-across.png");
+        assertTrue(dropFiles(shifted, browser));
+        dragDone(shifted, TransferMode.COPY);
+        Path moved = left.resolve(move.getFileName());
+        await(() -> idle() && paneListed(false, moved) && !paneListed(true, move), "same-volume move", 12);
+        assertFalse(Files.exists(move));
+        Files.writeString(moved, "edited after move");
+        focusPane(false);
+        menu("moreItems", "undo");
+        await(() -> idle() && paneListed(true, move) && !paneListed(false, moved), "drag move undo", 12);
+        assertEquals("edited after move", Files.readString(move));
+        assertEquals(clipboardState, clipboard.probe());
+        assertEquals("", fx(this::dragStatusText));
+    }
+
+    @Test
+    void dragFindsFolderIconsAndInactiveTabsAndRejectsOrdinaryFileTargets() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("source"));
+        Path right = Files.createDirectory(root.resolve("target"));
+        Path dormant = Files.createDirectory(root.resolve("tab-target"));
+        Path file = Files.writeString(left.resolve("payload.txt"), "payload");
+        Path folder = Files.createDirectory(right.resolve("接收目录"));
+        Path ordinary = Files.writeString(right.resolve("file.txt"), "unchanged");
+        openWindow(false);
+        go(left);
+        Tab initial = fx(() -> tabs().getSelectionModel().getSelectedItem());
+        Tab target = openAt(dormant);
+        activate(initial);
+        await(() -> browseAt(left), "source tab restored", 10);
+        click("dual-pane");
+        goPane(true, right);
+        focusPane(true);
+        menu("viewItems", "mode-large");
+        var drag = selectForDrag(false, file);
+        Node wrong = fx(() -> dragEntry(true, ordinary));
+        assertFalse(dragOver(drag, wrong));
+        assertFalse(dropFiles(drag, wrong));
+        assertEquals("unchanged", Files.readString(ordinary));
+        assertFalse(Files.exists(right.resolve(file.getFileName())));
+        var folderTarget = fx(() -> dragEntry(true, folder));
+        await(() -> fireDrag(drag, folderTarget, DragEvent.DRAG_OVER).isAccepted(), "folder drag identity", 8);
+        captureDrag("folder-target.png");
+        assertTrue(dropFiles(drag, folderTarget));
+        dragDone(drag, TransferMode.COPY);
+        await(() -> idle() && Files.exists(folder.resolve(file.getFileName())), "drop directly into folder", 12);
+        assertEquals(-1, Files.mismatch(file, folder.resolve(file.getFileName())));
+
+        var toTab = selectForDrag(false, file);
+        Node header = fx(() -> {
+            scene.getRoot().applyCss();
+            scene.getRoot().layout();
+            return scene.lookup("#" + target.getId());
+        });
+        assertNotNull(header);
+        dragIntent.set(FileDrag.Intent.MOVE);
+        assertTrue(dragOver(toTab, header));
+        assertTrue(dropFiles(toTab, header));
+        dragDone(toTab, TransferMode.COPY);
+        await(() -> idle() && Files.exists(dormant.resolve(file.getFileName())), "drop into inactive tab", 12);
+        assertSame(initial, fx(() -> tabs().getSelectionModel().getSelectedItem()));
+        assertEquals("payload", Files.readString(dormant.resolve(file.getFileName())));
+        assertFalse(Files.exists(file));
+        assertFalse(Files.exists(right.resolve(file.getFileName())));
+    }
+
+    @Test
+    void dragRefusesReplacedObjectsAndTargetsAndDoesNotRetargetAfterNavigation() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("source"));
+        Path right = Files.createDirectory(root.resolve("target"));
+        Path other = Files.createDirectory(root.resolve("elsewhere"));
+        Path file = Files.writeString(left.resolve("replace.txt"), "same payload");
+        Path contained = Files.createDirectory(right.resolve("subfolder"));
+        openWindow(false);
+        go(left);
+        click("dual-pane");
+        goPane(true, right);
+        var moving = selectForDrag(false, file);
+        var attributes = LocalFiles.describe(file);
+        Path saved = Files.move(file, root.resolve("saved.txt"));
+        Files.writeString(file, "same payload");
+        Files.getFileAttributeView(file, BasicFileAttributeView.class)
+                .setTimes(attributes.modified(), null, attributes.created());
+        var rightList = fx(() -> paneBrowser(true));
+        dragIntent.set(FileDrag.Intent.MOVE);
+        assertTrue(dragOver(moving, rightList));
+        assertTrue(dropFiles(moving, rightList));
+        dragDone(moving, TransferMode.COPY);
+        acknowledgeFileError();
+        assertEquals(-1, Files.mismatch(file, saved));
+        assertFalse(Files.exists(right.resolve(file.getFileName())));
+
+        dragIntent.set(FileDrag.Intent.COPY);
+        goPane(false, left);
+        var folderRequest = selectForDrag(false, file);
+        Node row = fx(() -> dragEntry(true, contained));
+        await(() -> fireDrag(folderRequest, row, DragEvent.DRAG_OVER).isAccepted(), "verified folder before replacement", 8);
+        Path oldFolder = Files.move(contained, root.resolve("old-subfolder"));
+        Files.createDirectory(contained);
+        assertTrue(dropFiles(folderRequest, row));
+        dragDone(folderRequest, TransferMode.COPY);
+        acknowledgeFileError();
+        assertFalse(Files.exists(contained.resolve(file.getFileName())));
+        assertFalse(Files.exists(oldFolder.resolve(file.getFileName())));
+
+        var navigation = selectForDrag(false, file);
+        assertTrue(dragOver(navigation, rightList));
+        goPane(true, other);
+        assertFalse(dropFiles(navigation, rightList));
+        dragDone(navigation, null);
+        assertFalse(Files.exists(right.resolve(file.getFileName())));
+        assertFalse(Files.exists(other.resolve(file.getFileName())));
+        assertEquals("same payload", Files.readString(file));
+    }
+
+    @Test
+    void externalDragAllowsCopyOnlyAndIgnoresStaleSessionsAndText() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path source = Files.createDirectory(root.resolve("foreign"));
+        Path destination = Files.createDirectory(root.resolve("target"));
+        Path file = Files.writeString(source.resolve("外部 文件.txt"), "copied from foreign");
+        Path sub = Files.createDirectory(source.resolve("外部子目录"));
+        Files.writeString(sub.resolve("inside.txt"), "foreign directory");
+        openWindow(false);
+        go(destination);
+        Map<DataFormat, Object> files = Map.of(DataFormat.FILES, List.of(file.toFile(), sub.toFile()));
+        var external = fx(() -> dragboard(null, files, Set.of(TransferMode.COPY, TransferMode.MOVE)));
+        dragIntent.set(FileDrag.Intent.MOVE);
+        assertFalse(dragOver(external, browser));
+        assertTrue(fx(this::dragStatusText).contains("仅支持复制"));
+        assertFalse(dropFiles(external, browser));
+        dragIntent.set(FileDrag.Intent.COPY);
+        var moveOnly = fx(() -> dragboard(null, files, Set.of(TransferMode.MOVE)));
+        assertFalse(dragOver(moveOnly, browser));
+        assertFalse(dropFiles(moveOnly, browser));
+        var forged = fx(() -> dragboard(null, Map.of(FileDrag.SESSION, "invalid token", DataFormat.FILES, List.of(file.toFile())),
+                Set.of(TransferMode.COPY)));
+        assertFalse(dragOver(forged, browser));
+        assertFalse(dropFiles(forged, browser));
+        var text = fx(() -> dragboard(null, Map.of(DataFormat.PLAIN_TEXT, file.toString()), Set.of(TransferMode.COPY)));
+        assertFalse(dragOver(text, browser));
+        assertFalse(dropFiles(text, browser));
+        assertFalse(Files.exists(destination.resolve(file.getFileName())));
+        assertTrue(dragOver(external, browser));
+        assertTrue(dropFiles(external, browser));
+        assertFalse(dropFiles(external, browser), "the same delivery has no second hover acceptance");
+        await(() -> idle() && listed(destination.resolve(file.getFileName())), "external file copy", 12);
+        assertEquals(-1, Files.mismatch(file, destination.resolve(file.getFileName())));
+        assertEquals("foreign directory", Files.readString(destination.resolve("外部子目录/inside.txt")));
+        assertTrue(Files.isDirectory(sub));
+        assertTrue(fx(() -> field(app, "dragSource") == null && field(app, "dropBoard") == null));
+    }
+
+    @Test
+    void acceptedDragKeepsTheClosedDestinationAndSupportsConflictsAndCancellation() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("source"));
+        Path right = Files.createDirectory(root.resolve("destination"));
+        Path copied = Files.writeString(left.resolve("a.txt"), "already applied");
+        Path skipped = Files.writeString(left.resolve("b.txt"), "source b");
+        Path kept = Files.writeString(left.resolve("c.txt"), "source c");
+        Path targetB = Files.writeString(right.resolve("b.txt"), "original b");
+        Path targetC = Files.writeString(right.resolve("c.txt"), "original c");
+        Path file = left.resolve("large.bin");
+        openWindow(false);
+        go(left);
+        click("dual-pane");
+        goPane(true, right);
+        var rightList = fx(() -> paneBrowser(true));
+        fx(() -> { browser.selectAll(); return null; });
+        await(() -> paneContext(false).selectionProof.size() == 3, "batch sources verified", 8);
+        var batch = beginFileDrag(false, copied);
+        assertTrue(dragOver(batch, rightList));
+        assertTrue(dropFiles(batch, rightList));
+        dragDone(batch, TransferMode.COPY);
+        await(() -> conflictScene() != null && Files.exists(right.resolve(copied.getFileName())), "drag copy conflict", 12);
+        click("dual-pane");
+        chooseConflict("conflict-skip");
+        await(() -> conflictScene() != null && progressLabel("operation-file").equals("c.txt"),
+                "continue to next conflict", 10);
+        chooseConflict("conflict-keep");
+        Path published = right.resolve("c - 副本.txt");
+        await(() -> idle() && Files.exists(published), "copy continues after destination closes", 12);
+        assertEquals("original b", Files.readString(targetB));
+        assertEquals("original c", Files.readString(targetC));
+        assertEquals(-1, Files.mismatch(copied, right.resolve(copied.getFileName())));
+        assertEquals(-1, Files.mismatch(kept, published));
+        assertEquals("source b", Files.readString(skipped));
+        assertTrue(fx(() -> progressLabel("operation-details").contains("已跳过 1 项")));
+
+        click("dual-pane");
+        await(() -> paneAt(true, right), "reopen copy destination", 10);
+        Files.write(file, new byte[12 * 1024 * 1024]);
+        goPane(false, left);
+        var request = selectForDrag(false, file);
+        pauseNativeCopy.set(true);
+        try {
+            assertTrue(dragOver(request, rightList));
+            assertTrue(dropFiles(request, rightList));
+            dragDone(request, TransferMode.COPY);
+            assertTrue(copyHasBytes.await(10, TimeUnit.SECONDS));
+            await(() -> progressScene() != null, "cancellable drag copy progress", 10);
+            fx(() -> { ((Button) progressScene().lookup("#operation-action")).fire(); return null; });
+        } finally {
+            releaseCopy.countDown();
+        }
+        await(() -> idle() && "已取消".equals(progressLabel("operation-stage")), "cancelled drag copy", 12);
+        assertFalse(Files.exists(right.resolve(file.getFileName())));
+        assertTrue(Files.exists(file));
+        try (var entries = Files.list(right)) {
+            assertFalse(entries.anyMatch(path -> path.getFileName().toString().startsWith(".file-manager-")));
+        }
+    }
+
+    @Test
+    void sourceRefreshKeepsTheDragAndLostMoveReceiptIsOnlyAvailableForInspection() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("left"));
+        Path right = Files.createDirectory(root.resolve("right"));
+        Path file = Files.writeString(right.resolve("move.txt"), "move sample");
+        openWindow(true);
+        goWatched(left);
+        click("dual-pane");
+        goPane(true, right);
+        await(() -> paneWatching(true), "right directory watched", 10);
+        var source = selectForDrag(true, file);
+        var readVersion = fx(() -> paneContext(true).listingVersion);
+        Path external = Files.writeString(right.resolve("refresh.txt"), "visible from a new listing");
+        await(() -> paneListed(true, external) && paneContext(true).listingVersion > readVersion,
+                "automatic refresh during drag", 10);
+        dragIntent.set(FileDrag.Intent.MOVE);
+        loseMoveReceipt.set(true);
+        assertTrue(dragOver(source, browser));
+        assertTrue(dropFiles(source, browser));
+        dragDone(source, TransferMode.MOVE);
+        acknowledgeFileError();
+        Path moved = left.resolve(file.getFileName());
+        await(() -> idle() && paneListed(false, moved) && !paneListed(true, file), "uncertain drag moves still refresh both", 12);
+        assertEquals("move sample", Files.readString(moved));
+        assertFalse(Files.exists(file));
+        assertEquals(1, injectedWrites.get());
+        assertTrue(fx(() -> ((List<?>) field(app, "unknownOperations")).size() == 1
+                && ((List<?>) field(app, "undo")).isEmpty()));
+        assertFalse(dragOver(source, browser), "consumed session cannot be replayed");
+    }
+
+    @Test
+    void unverifiedDragCanGatherCopyProofButCannotAdvertiseFilesOrMove() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path left = Files.createDirectory(root.resolve("left"));
+        Path right = Files.createDirectory(root.resolve("right"));
+        Path sample = Files.writeString(left.resolve("unselected.txt"), "sample");
+        openWindow(false);
+        go(left);
+        click("dual-pane");
+        goPane(true, right);
+        assertTrue(fx(() -> paneContext(false).selectionProof.isEmpty()));
+        var quick = beginFileDrag(false, sample);
+        assertFalse(fx(() -> quick.board().hasFiles()));
+        Node to = fx(() -> paneBrowser(true));
+        dragIntent.set(FileDrag.Intent.MOVE);
+        assertFalse(dragOver(quick, to));
+        assertTrue(fx(this::dragStatusText).contains("核验来源"));
+        dragIntent.set(FileDrag.Intent.COPY);
+        await(() -> fireDrag(quick, to, DragEvent.DRAG_OVER).isAccepted(), "source verified during drag", 10);
+        assertTrue(dropFiles(quick, to));
+        dragDone(quick, TransferMode.COPY);
+        await(() -> idle() && Files.exists(right.resolve(sample.getFileName())), "quick drag copy", 10);
+        assertEquals(-1, Files.mismatch(sample, right.resolve(sample.getFileName())));
+    }
+
+    @Test
+    @EnabledIfSystemProperty(named = "javafx.dragBenchmark", matches = "true")
+    void measureDragSessionAndHoverCosts() throws Exception {
+        assumeTrue(NtfsFileOperations.captureDirectory(root) != null);
+        Path source = Files.createDirectory(root.resolve("source"));
+        Path destination = Files.createDirectory(root.resolve("target"));
+        var paths = new ArrayList<Path>();
+        for (int index = 0; index < 1_200; index++) {
+            paths.add(Files.createFile(source.resolve("sample-%04d.txt".formatted(index))));
+        }
+        openWindow(false);
+        go(source);
+        click("dual-pane");
+        goPane(true, destination);
+        fx(() -> { browser.selectAll(); return null; });
+        var createSamples = fx(() -> {
+            Node item = dragEntry(false, paths.getFirst());
+            var measured = new ArrayList<Long>();
+            for (int index = 0; index < 13; index++) {
+                long start = System.nanoTime();
+                SimulatedDrag drag = startSimulatedDrag(item);
+                long elapsed = System.nanoTime() - start;
+                assertEquals(1_200, ((FileDrag.Source) field(app, "dragSource")).items().size());
+                finishSimulatedDrag(drag, null);
+                if (index >= 3) { measured.add(elapsed); }
+            }
+            assertNull(field(app, "dragSourceRead"));
+            return measured;
+        });
+        Node view = fx(() -> paneBrowser(true));
+        var hover = selectForDrag(false, paths.getFirst());
+        int workersBefore = workerThreads();
+        var hoverSamples = fx(() -> {
+            var measured = new ArrayList<Long>();
+            for (int index = 0; index < 550; index++) {
+                long start = System.nanoTime();
+                var event = fireDrag(hover, view, DragEvent.DRAG_OVER);
+                long elapsed = System.nanoTime() - start;
+                assertTrue(event.isAccepted());
+                if (index >= 50) { measured.add(elapsed); }
+            }
+            finishSimulatedDrag(hover, null);
+            return measured;
+        });
+        var dropSamples = new ArrayList<Long>();
+        for (Path path : paths.subList(0, 5)) {
+            var offered = selectForDrag(false, path);
+            assertTrue(dragOver(offered, view));
+            var created = new CompletableFuture<Long>();
+            long start = fx(() -> {
+                timedDragTask.set(created);
+                long now = System.nanoTime();
+                assertTrue(fireDrag(offered, view, DragEvent.DRAG_DROPPED).isDropCompleted());
+                return now;
+            });
+            dropSamples.add(created.get(10, TimeUnit.SECONDS) - start);
+            dragDone(offered, TransferMode.COPY);
+            await(() -> idle() && Files.exists(destination.resolve(path.getFileName())), "measured drag copy", 12);
+        }
+        await(() -> field(app, "dragSource") == null && field(app, "dropSite") == null
+                && field(app, "dragSourceRead") == null && field(app, "dropFolderRead") == null, "no retained drag session", 8);
+        var sortedHover = hoverSamples.stream().sorted().toList();
+        System.out.printf(java.util.Locale.ROOT, "PHASE32_BENCH request=%s hoverMedianMs=%.4f hoverP95Ms=%.4f drop=%s workers=%d,%d%n",
+                milliseconds(createSamples), sortedHover.get(249) / 1e6, sortedHover.get(474) / 1e6,
+                milliseconds(dropSamples), workersBefore, workerThreads());
+    }
+
+    private SimulatedDrag selectForDrag(boolean right, Path file) throws Exception {
+        focusPane(right);
+        fx(() -> { assertTrue(paneBrowser(right).reveal(file)); return null; });
+        await(() -> paneContext(right).selectionProof.keySet().stream().anyMatch(item -> item.path().equals(file)),
+                "file selected and verified for drag", 8);
+        return beginFileDrag(right, file);
+    }
+
+    private SimulatedDrag beginFileDrag(boolean right, Path path) throws Exception {
+        return fx(() -> startSimulatedDrag(dragEntry(right, path)));
+    }
+
+    private SimulatedDrag startSimulatedDrag(Node item) throws Exception {
+        Event.fireEvent(item, new MouseEvent(MouseEvent.MOUSE_PRESSED, 2, 2, 0, 0, MouseButton.PRIMARY,
+                1, false, false, false, false, true, false, false, false, false, true,
+                new PickResult(item, 2, 2)));
+        var press = field(app, "dragPress");
+        assertNotNull(press, "pressed a rendered file");
+        var create = FileManagerApp.class.getDeclaredMethod("createFileDrag", press.getClass());
+        create.setAccessible(true);
+        var source = (FileDrag.Source) create.invoke(app, press);
+        assertNotNull(source);
+        return dragboard((Node) source.gesture(), FileManagerApp.dragContent(source), Set.of(TransferMode.COPY));
+    }
+
+    private Node dragEntry(boolean right, Path path) throws Exception {
+        scene.getRoot().applyCss();
+        scene.getRoot().layout();
+        var view = paneBrowser(right);
+        for (Node entry : view.lookupAll(".selectable-entry")) {
+            if (entry.getUserData() instanceof BrowserItem item && path.equals(item.path())) { return entry; }
+        }
+        for (Node entry : view.lookupAll(".table-row-cell")) {
+            if (entry instanceof TableRow<?> row && row.getItem() != null) {
+                var item = (BrowserItem) call(row.getItem(), "item");
+                if (item != null && path.equals(item.path())) {
+                    var cell = row.lookup(".table-cell");
+                    return cell == null ? row : cell;
+                }
+            }
+        }
+        return fail("No rendered item at " + path);
+    }
+
+    private boolean dragOver(SimulatedDrag drag, Node target) throws Exception {
+        return fx(() -> fireDrag(drag, target, DragEvent.DRAG_OVER).isAccepted());
+    }
+
+    private boolean dropFiles(SimulatedDrag drag, Node target) throws Exception {
+        return fx(() -> fireDrag(drag, target, DragEvent.DRAG_DROPPED).isDropCompleted());
+    }
+
+    private void dragDone(SimulatedDrag drag, TransferMode result) throws Exception {
+        fx(() -> {
+            finishSimulatedDrag(drag, result);
+            return null;
+        });
+    }
+
+    private static void finishSimulatedDrag(SimulatedDrag drag, TransferMode result) {
+        Event.fireEvent(drag.source(), new DragEvent(DragEvent.DRAG_DONE, drag.board(), 0, 0,
+                0, 0, result, drag.source(), null, new PickResult(drag.source(), 0, 0)));
+    }
+
+    private static DragEvent fireDrag(SimulatedDrag drag, Node target, javafx.event.EventType<DragEvent> type) {
+        var event = new DragEvent(type, drag.board(), 2, 2, 0, 0, TransferMode.MOVE,
+                drag.source(), null, new PickResult(target, 2, 2));
+        Event.fireEvent(target, event);
+        return event;
+    }
+
+    private String dragStatusText() { return ((Label) scene.lookup("#drag-status")).getText(); }
+
+    private void captureDrag(String name) throws Exception {
+        if (!Boolean.getBoolean("javafx.captureDrag")) { return; }
+        if (captures == null) { captures = Files.createTempDirectory("phase32-fx-"); }
+        var snapshot = fx(() -> scene.snapshot(null));
+        var png = new BufferedImage((int) snapshot.getWidth(), (int) snapshot.getHeight(), BufferedImage.TYPE_INT_ARGB);
+        copyPixels(snapshot, png, 0);
+        Path file = captures.resolve(name);
+        assertTrue(ImageIO.write(png, "png", file.toFile()));
+        System.out.println("PHASE32_SCREENSHOT " + file);
+    }
+
+    private record SimulatedDrag(Dragboard board, Node source) { }
+
+    private static SimulatedDrag dragboard(Node source, Map<DataFormat, Object> content, Set<TransferMode> modes) {
+        return new SimulatedDrag(DragboardHelper.createDragboard(new TestDragboard(content, modes, source != null)), source);
+    }
+
+    @SuppressWarnings({"removal", "unchecked"})
+    private record TestDragboard(Map<DataFormat, Object> content, Set<TransferMode> modes,
+                                 boolean local) implements TKClipboard {
+        @Override public void setSecurityContext(java.security.AccessControlContext context) { }
+        @Override public Set<DataFormat> getContentTypes() { return content.keySet(); }
+        @Override public boolean putContent(Pair<DataFormat, Object>... pairs) { throw new UnsupportedOperationException(); }
+        @Override public Object getContent(DataFormat type) {
+            assertTrue(local || type != FileDrag.SESSION, "foreign custom payload must not be read");
+            return content.get(type);
+        }
+        @Override public boolean hasContent(DataFormat type) { return content.containsKey(type); }
+        @Override public Set<TransferMode> getTransferModes() { return modes; }
+        @Override public void setDragView(Image image) { throw new UnsupportedOperationException(); }
+        @Override public void setDragViewOffsetX(double x) { throw new UnsupportedOperationException(); }
+        @Override public void setDragViewOffsetY(double y) { throw new UnsupportedOperationException(); }
+        @Override public Image getDragView() { return null; }
+        @Override public double getDragViewOffsetX() { return 0; }
+        @Override public double getDragViewOffsetY() { return 0; }
     }
 
     @Test
@@ -624,6 +1137,15 @@ class JavaFxFileOperationsTest {
             assertEquals("kept on the source volume", Files.readString(source));
             assertFalse(Files.exists(unexpected));
             assertNull(fx(() -> field(app, "activeFileOperation")));
+            var drag = selectForDrag(false, source);
+            dragIntent.set(FileDrag.Intent.MOVE);
+            Node otherVolume = fx(() -> paneBrowser(true));
+            assertFalse(dragOver(drag, otherVolume));
+            assertTrue(fx(this::dragStatusText).contains("同卷 NTFS"));
+            assertFalse(dropFiles(drag, otherVolume));
+            dragDone(drag, null);
+            assertEquals("kept on the source volume", Files.readString(source));
+            assertFalse(Files.exists(unexpected));
         } finally {
             Files.deleteIfExists(unexpected);
             Files.delete(target);
@@ -1986,6 +2508,8 @@ class JavaFxFileOperationsTest {
     }
 
     private FileOperationTask operation(FileOperationTask.Kind kind, List<FileChanges.Change> changes) {
+        var dragSample = timedDragTask.getAndSet(null);
+        if (dragSample != null) { dragSample.complete(System.nanoTime()); }
         Gate move = kind == FileOperationTask.Kind.MOVE ? heldMove.getAndSet(null) : null;
         if (move != null) {
             var original = changes.getFirst();

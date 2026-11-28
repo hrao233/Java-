@@ -36,18 +36,23 @@ import javafx.scene.Scene;
 import javafx.scene.control.*;
 import javafx.scene.image.Image;
 import javafx.scene.image.ImageView;
+import javafx.scene.input.ClipboardContent;
+import javafx.scene.input.DragEvent;
+import javafx.scene.input.Dragboard;
 import javafx.scene.input.KeyCode;
 import javafx.scene.input.KeyCodeCombination;
 import javafx.scene.input.KeyCombination;
 import javafx.scene.input.KeyEvent;
 import javafx.scene.input.MouseButton;
 import javafx.scene.input.MouseEvent;
+import javafx.scene.input.TransferMode;
 import javafx.scene.layout.*;
 import javafx.stage.DirectoryChooser;
 import javafx.stage.Stage;
 import javafx.util.Duration;
 
 import java.awt.Desktop;
+import java.io.File;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -68,6 +73,7 @@ import java.util.concurrent.Executors;
 import java.util.function.BiFunction;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.function.Predicate;
 import java.util.prefs.Preferences;
 import java.util.stream.Stream;
@@ -75,6 +81,8 @@ import java.util.stream.Stream;
 public final class FileManagerApp extends Application {
     private static final PseudoClass NAV_DIVIDER = PseudoClass.getPseudoClass("nav-divider");
     private static final PseudoClass ACTIVE_BROWSER = PseudoClass.getPseudoClass("active-browser");
+    private static final PseudoClass DROP_COPY = PseudoClass.getPseudoClass("drop-copy");
+    private static final PseudoClass DROP_MOVE = PseudoClass.getPseudoClass("drop-move");
     private static final double MIN_NAV_WIDTH = 146;
     private static final double MAX_NAV_WIDTH = 480;
     private static final int MAX_RETAINED_SELECTION = 64;
@@ -89,6 +97,9 @@ public final class FileManagerApp extends Application {
     private record PasteTarget(Path path, DirectoryIdentity knownDirectory, BrowserItem folder,
                                Selection knownFolder) { }
     private record PreparedPaste(FileChanges.Destination destination, List<Selection> sources) { }
+    private record DragPress(BrowserPane pane, BrowseContext owner, long version, List<BrowserItem> items,
+                             Map<BrowserItem, Selection> proofs) { }
+    private record DropSite(Node mark, BrowseContext owner, long version, PasteTarget target) { }
     private record ExternalExclusion(FileClipboard.State state, Set<Path> paths) { }
     private record CreatedItem(NewItems.Created created, Selection proof) { }
     private record PreviewData(Image image, String text) { }
@@ -120,6 +131,21 @@ public final class FileManagerApp extends Application {
     private final Preferences preferences;
     private final BiFunction<Kind, List<Change>, FileOperationTask> operationFactory;
     private final ReadObserver readObserver;
+    private final Function<TransferMode, FileDrag.Intent> dragIntent;
+    private DragPress dragPress;
+    private FileDrag.Source dragSource;
+    private Task<List<Selection>> dragSourceRead;
+    private List<Selection> dragProofs = List.of();
+    private String dragSourceError;
+    private Dragboard dropBoard;
+    private Node dropSurface;
+    private FileDrag.Payload dropPayload;
+    private DropSite dropSite;
+    private Task<Selection> dropFolderRead;
+    private Selection dropFolderProof;
+    private String dropFolderError;
+    private FileDrag.Intent highlightedDrop;
+    private long lastDragScroll;
     private long nextTabId;
     private BrowserPane leftPane;
     private BrowserPane rightPane;
@@ -140,6 +166,7 @@ public final class FileManagerApp extends Application {
     private final Label status = new Label();
     private final Label clipboardStatus = new Label();
     private final Label watchStatus = new Label();
+    private final Label dragStatus = new Label();
     private final Label writeNotice = new Label();
     private final Button unknownResults = new Button("核查结果");
     private final List<FileChanges.UnknownOperation> unknownOperations = new ArrayList<>();
@@ -207,10 +234,16 @@ public final class FileManagerApp extends Application {
 
     FileManagerApp(Preferences preferences, BiFunction<Kind, List<Change>, FileOperationTask> operationFactory,
                    ReadObserver readObserver, FileClipboard clipboard) {
+        this(preferences, operationFactory, readObserver, clipboard, FileDrag::keyIntent);
+    }
+
+    FileManagerApp(Preferences preferences, BiFunction<Kind, List<Change>, FileOperationTask> operationFactory,
+                   ReadObserver readObserver, FileClipboard clipboard, Function<TransferMode, FileDrag.Intent> dragIntent) {
         this.preferences = preferences;
         this.operationFactory = operationFactory;
         this.readObserver = readObserver;
         this.clipboard = clipboard;
+        this.dragIntent = dragIntent;
     }
 
     @Override
@@ -297,6 +330,7 @@ public final class FileManagerApp extends Application {
     @Override
     public void stop() {
         closing = true;
+        finishFileDrag();
         clipboardTimer.stop();
         clipboardDeadline.stop();
         if (clipboardCommand != null) { clipboardCommand.cancel(true); }
@@ -339,6 +373,7 @@ public final class FileManagerApp extends Application {
         tabs.setMinWidth(0);
         tabs.setTabClosingPolicy(TabPane.TabClosingPolicy.ALL_TABS);
         tabs.setTabDragPolicy(TabPane.TabDragPolicy.FIXED);
+        installFileDrop(tabs, this::tabDropSite);
         HBox.setHgrow(tabs, Priority.ALWAYS);
         addTabHeader(leftPane.context);
         tabs.getSelectionModel().selectedItemProperty().addListener((observable, previous, selected) -> {
@@ -422,6 +457,7 @@ public final class FileManagerApp extends Application {
     private void closeTab(BrowseContext owner) {
         Tab tab = tabHeaders.get(owner);
         if (closing || tab == null) { return; }
+        if (dropSite != null && dropSite.owner() == owner) { endDropHover(); }
         var headers = tabs.getTabs();
         if (headers.size() == 1) {
             openTab(Location.page(Page.HOME));
@@ -612,7 +648,12 @@ public final class FileManagerApp extends Application {
         writeNotice.setId("write-notice");
         writeNotice.managedProperty().bind(writeNotice.visibleProperty());
         writeNotice.setVisible(false);
-        HBox bar = new HBox(8, progress, status, watchStatus, clipboardStatus, operationProgress.launcher(), writeNotice, unknownResults);
+        dragStatus.setId("drag-status");
+        dragStatus.getStyleClass().add("drag-status");
+        dragStatus.setMaxWidth(450);
+        dragStatus.managedProperty().bind(dragStatus.visibleProperty());
+        dragStatus.setVisible(false);
+        HBox bar = new HBox(8, progress, status, dragStatus, watchStatus, clipboardStatus, operationProgress.launcher(), writeNotice, unknownResults);
         bar.setAlignment(Pos.CENTER_LEFT);
         bar.getStyleClass().add("status-bar");
         return bar;
@@ -1737,6 +1778,316 @@ public final class FileManagerApp extends Application {
                 folder, folder == null ? null : owner.selectionProof.get(folder));
     }
 
+    private void pressFileDrag(BrowserPane pane, MouseEvent event) {
+        dragPress = null;
+        if (event.getButton() != MouseButton.PRIMARY || pane.browser.editingName() || fileCommandsUnavailable(pane)) { return; }
+        var hit = pane.browser.dragHit(event.getPickResult().getIntersectedNode());
+        if (hit == null || hit.item() == null || !FileDrag.ordinary(hit.item())) { return; }
+        var selection = pane.browser.selection();
+        var owner = pane.context;
+        dragPress = new DragPress(pane, owner, owner.listingVersion,
+                selection.contains(hit.item()) ? selection : List.of(hit.item()), owner.selectionProof);
+    }
+
+    private FileDrag.Source createFileDrag(DragPress press) throws IOException {
+        var pane = press.pane();
+        if (!pane.shows(press.owner(), press.version()) || fileCommandsUnavailable(pane)) { return null; }
+        Map<BrowserItem, Selection> proofs = new HashMap<>();
+        for (BrowserItem item : press.items()) {
+            var proof = press.proofs().get(item);
+            if (proof != null) { proofs.put(item, proof); }
+        }
+        clearDragSource();
+        dragSource = FileDrag.Source.create(pane.browser, press.items(), proofs);
+        if (dragSource.verified()) { dragProofs = press.items().stream().map(proofs::get).toList(); }
+        else { readDragSources(dragSource); }
+        return dragSource;
+    }
+
+    private void readDragSources(FileDrag.Source source) {
+        var read = task(cancelled -> {
+            var entries = new ArrayList<Selection>(source.items().size());
+            for (BrowserItem item : source.items()) {
+                if (cancelled.getAsBoolean()) { throw new IOException("已取消拖放核验"); }
+                var entry = captureSelected(item, source.proofs().get(item));
+                if (entry.nativeItem() == null) { throw new IOException("拖放需要可验证的本地 NTFS 来源"); }
+                entries.add(entry);
+            }
+            return List.copyOf(entries);
+        });
+        dragSourceRead = read;
+        readDetail(read, entries -> {
+            if (dragSourceRead == read) {
+                dragSourceRead = null;
+                dragProofs = entries;
+            }
+        }, failure -> {
+            if (dragSourceRead == read) {
+                dragSourceRead = null;
+                dragSourceError = "来源已变化或无法核验，请刷新后重新选择";
+            }
+        });
+    }
+
+    private void startFileDrag(BrowserPane pane, MouseEvent event) {
+        var press = dragPress;
+        dragPress = null;
+        if (press == null || press.pane() != pane || !event.isPrimaryButtonDown()) { return; }
+        try {
+            var source = createFileDrag(press);
+            if (source == null) { return; }
+            var board = pane.browser.startDragAndDrop(TransferMode.COPY);
+            if (board.setContent(dragContent(source))) {
+                showDragStatus(dragHint());
+                event.consume();
+            } else {
+                finishFileDrag();
+            }
+        } catch (IOException invalid) {
+            pane.showStatus(invalid.getMessage());
+        }
+    }
+
+    static ClipboardContent dragContent(FileDrag.Source source) {
+        var content = new ClipboardContent();
+        content.put(FileDrag.SESSION, source.token());
+        if (source.verified()) { content.putFiles(source.paths().stream().map(Path::toFile).toList()); }
+        return content;
+    }
+
+    private void finishFileDrag() {
+        dragPress = null;
+        clearDragSource();
+        endDropHover();
+    }
+
+    private void clearDragSource() {
+        if (dragSourceRead != null) { reads.cancel(dragSourceRead); }
+        dragSourceRead = null;
+        dragSource = null;
+        dragProofs = List.of();
+        dragSourceError = null;
+    }
+
+    private String dragHint() {
+        if (dragSource == null) { return ""; }
+        String count = "拖放 " + dragSource.items().size() + " 项";
+        return count + (dragSource.verified() ? " · Shift 同卷移动，跨应用用 Ctrl 复制"
+                : " · 窗口内可复制，移动或拖出前请先选中并核验");
+    }
+
+    private void showDragStatus(String text) {
+        if (!dragStatus.getText().equals(text)) { dragStatus.setText(text); }
+        dragStatus.setVisible(!text.isEmpty());
+    }
+
+    private void installFileDrop(Node surface, Function<Node, DropSite> locate) {
+        surface.setOnDragOver(event -> fileDragOver(surface, locate, event));
+        surface.setOnDragDropped(event -> fileDropped(locate, event));
+        surface.setOnDragExited(event -> {
+            if (event.getTarget() == surface && dropSurface == surface) { endDropHover(); }
+        });
+    }
+
+    private DropSite tabDropSite(Node picked) {
+        for (Node node = picked; node != null && node != tabs; node = node.getParent()) {
+            if (node.getStyleClass().contains("tab-close-button")) { return null; }
+            if (node.getStyleClass().contains("tab")) {
+                String id = node.getId();
+                for (var entry : tabHeaders.entrySet()) {
+                    if (entry.getValue().getId().equals(id)) { return directoryDropSite(node, entry.getKey()); }
+                }
+                break;
+            }
+        }
+        return null;
+    }
+
+    private DropSite directoryDropSite(Node mark, BrowseContext owner) {
+        if (closing || fileTask != null || owner.closed || owner.directoryUnavailable || owner.location.page() != Page.DIRECTORY
+                || !owner.activeQuery.isEmpty() || owner.directoryIdentity == null || owner.directoryIdentity.ntfs() == null
+                || owner.browseRequest != null && !owner.browseRequest.intent().automatic()) { return null; }
+        return new DropSite(mark, owner, 0, new PasteTarget(owner.location.path(), owner.directoryIdentity, null, null));
+    }
+
+    private DropSite browserDropSite(BrowserPane pane, Node picked) {
+        if (fileCommandsUnavailable(pane) || pane.browser.editingName()) { return null; }
+        var hit = pane.browser.dragHit(picked);
+        if (hit == null) { return null; }
+        var owner = pane.context;
+        if (hit.item() == null) { return directoryDropSite(hit.mark(), owner); }
+        var folder = hit.item();
+        if (owner.location.page() != Page.DIRECTORY || owner.directoryIdentity == null
+                || owner.directoryIdentity.ntfs() == null || !folder.directory() || !FileDrag.ordinary(folder)) { return null; }
+        return new DropSite(hit.mark(), owner, owner.listingVersion, new PasteTarget(folder.path(), null, folder, null));
+    }
+
+    private FileDrag.Payload payload(DragEvent event) {
+        var board = event.getDragboard();
+        boolean marked = board.hasContent(FileDrag.SESSION);
+        Object gesture = event.getGestureSource();
+        boolean fromThisWindow = dragSource != null && dragSource.gesture() == gesture;
+        return FileDrag.classify(dragSource, gesture, marked,
+                marked && fromThisWindow ? board.getContent(FileDrag.SESSION) : null, !marked && board.hasFiles());
+    }
+
+    private void fileDragOver(Node surface, Function<Node, DropSite> locate, DragEvent event) {
+        if (closing) { return; }
+        if (dropBoard != event.getDragboard() || dropSurface != surface) {
+            clearDropSite();
+            dropBoard = event.getDragboard();
+            dropSurface = surface;
+            dropPayload = payload(event);
+        }
+        if (dropPayload == FileDrag.Payload.OTHER) { showDragStatus(dragHint()); return; }
+        var site = locate.apply(event.getPickResult().getIntersectedNode());
+        if (!Objects.equals(dropSite, site)) {
+            clearDropSite();
+            dropSite = site;
+        }
+        var intent = dragIntent.apply(event.getTransferMode());
+        String restriction = dropRestriction(dropPayload, site, intent, event);
+        if (restriction == null && site.target().folder() != null && dropFolderProof == null) {
+            if (dropFolderError == null && dropFolderRead == null) { readDropFolder(site); }
+            restriction = dropFolderError == null ? "正在核验目标文件夹…" : dropFolderError;
+        }
+        if (restriction == null) {
+            event.acceptTransferModes(TransferMode.COPY);
+            highlightDrop(event.isAccepted() ? intent : null);
+            String count = dropPayload == FileDrag.Payload.INTERNAL ? " " + dragSource.items().size() + " 项" : "";
+            String action = intent == FileDrag.Intent.MOVE ? "移动" : "复制";
+            showDragStatus(event.isAccepted() ? action + count + " 到「" + Location.folder(site.target().path()).label() + "」"
+                    : "来源不接受复制");
+        } else {
+            highlightDrop(null);
+            showDragStatus(restriction);
+        }
+        if (surface instanceof BrowserView browser && dropPayload != FileDrag.Payload.INVALID
+                && System.nanoTime() - lastDragScroll >= 90_000_000L) {
+            browser.scrollDuringDrag(event.getScreenX(), event.getScreenY());
+            lastDragScroll = System.nanoTime();
+        }
+        event.consume();
+    }
+
+    private String dropRestriction(FileDrag.Payload payload, DropSite site, FileDrag.Intent intent, DragEvent event) {
+        if (payload == FileDrag.Payload.INVALID || payload == FileDrag.Payload.INTERNAL && dragSource == null) {
+            return "拖放会话已失效，请重新拖动";
+        }
+        if (intent == FileDrag.Intent.LINK) { return "请选择复制或同卷移动"; }
+        if (!event.getDragboard().getTransferModes().contains(TransferMode.COPY)
+                || payload == FileDrag.Payload.EXTERNAL && intent == FileDrag.Intent.MOVE) {
+            return "跨应用拖放仅支持复制，请按 Ctrl";
+        }
+        if (site == null) { return "请拖到普通目录、文件夹或有效目录标签"; }
+        if (payload == FileDrag.Payload.INTERNAL) {
+            var expected = site.target().knownDirectory();
+            Long volume = expected != null ? Long.valueOf(expected.ntfs().id().volume()) : (
+                    dropFolderProof == null ? null : Long.valueOf(dropFolderProof.nativeItem().id().volume()));
+            String restriction = dragSource.restriction(site.target().path(), volume, intent);
+            if (restriction != null) { return restriction; }
+            if (dragProofs.isEmpty()) { return dragSourceError == null ? "正在核验拖放来源…" : dragSourceError; }
+        }
+        return null;
+    }
+
+    private void readDropFolder(DropSite site) {
+        var folder = site.target().folder();
+        var known = site.owner().selectionProof.get(folder);
+        var listedIn = site.owner().directoryIdentity.ntfs();
+        var read = task(cancelled -> {
+            var proof = captureSelected(folder, known);
+            if (proof.nativeItem() != null) {
+                var parent = proof.nativeItem().parent();
+                if (parent.path().equals(listedIn.path())) {
+                    if (!parent.equals(listedIn)) { throw new IOException("目标文件夹的上级目录已变化"); }
+                } else {
+                    NtfsFileOperations.verify(listedIn);
+                }
+            }
+            return proof;
+        });
+        dropFolderRead = read;
+        readDetail(read, proof -> {
+            if (dropFolderRead != read) { return; }
+            dropFolderRead = null;
+            if (proof.nativeItem() != null) { dropFolderProof = proof; }
+            else { dropFolderError = "目标文件夹需要可验证的本地 NTFS 身份"; }
+        }, failure -> {
+            if (dropFolderRead == read) {
+                dropFolderRead = null;
+                dropFolderError = "目标文件夹已变化或无法核验";
+            }
+        });
+    }
+
+    private void fileDropped(Function<Node, DropSite> locate, DragEvent event) {
+        var actual = payload(event);
+        if (actual == FileDrag.Payload.OTHER) { return; }
+        boolean accepted = false;
+        try {
+            var site = locate.apply(event.getPickResult().getIntersectedNode());
+            var intent = dragIntent.apply(event.getTransferMode());
+            if (closing || fileTask != null || actual != dropPayload || dropBoard != event.getDragboard()
+                    || !Objects.equals(site, dropSite) || highlightedDrop != intent || site == null
+                    || dropRestriction(actual, site, intent, event) != null) { return; }
+            var target = site.target();
+            if (target.folder() != null) {
+                if (dropFolderProof == null) { return; }
+                target = new PasteTarget(target.path(), null, target.folder(), dropFolderProof);
+            }
+            event.acceptTransferModes(TransferMode.COPY);
+            if (!event.isAccepted()) { return; }
+            var report = activePane.listingReporter();
+            if (actual == FileDrag.Payload.INTERNAL) {
+                var sources = dragProofs;
+                clearDragSource();
+                prepareDirectTransfer(target, intent == FileDrag.Intent.MOVE,
+                        cancelled -> sources, report);
+            } else {
+                var files = event.getDragboard().getFiles();
+                if (files == null || files.isEmpty() || files.size() > ClipboardFiles.MAX_ITEMS) {
+                    throw new IOException("拖放的文件列表为空或超出数量限制");
+                }
+                var paths = ClipboardFiles.dragPaths(files.stream().map(File::getPath).toList());
+                prepareDirectTransfer(target, false, cancelled -> captureExternalFiles(paths, cancelled), report);
+            }
+            accepted = true;
+        } catch (IOException invalid) {
+            activePane.showStatus(invalid.getMessage());
+        } finally {
+            endDropHover();
+            event.setDropCompleted(accepted);
+            event.consume();
+        }
+    }
+
+    private void endDropHover() {
+        clearDropSite();
+        dropBoard = null;
+        dropSurface = null;
+        dropPayload = null;
+        lastDragScroll = 0;
+        showDragStatus(dragHint());
+    }
+
+    private void clearDropSite() {
+        highlightDrop(null);
+        dropSite = null;
+        if (dropFolderRead != null) { reads.cancel(dropFolderRead); }
+        dropFolderRead = null;
+        dropFolderProof = null;
+        dropFolderError = null;
+    }
+
+    private void highlightDrop(FileDrag.Intent intent) {
+        if (dropSite != null && highlightedDrop != intent) {
+            dropSite.mark().pseudoClassStateChanged(DROP_COPY, intent == FileDrag.Intent.COPY);
+            dropSite.mark().pseudoClassStateChanged(DROP_MOVE, intent == FileDrag.Intent.MOVE);
+        }
+        highlightedDrop = intent;
+    }
+
     private BrowserPane opposite(BrowserPane pane) {
         return pane == leftPane ? rightPane : leftPane;
     }
@@ -1771,27 +2122,32 @@ public final class FileManagerApp extends Application {
         PasteTarget target = transferTarget(opposite, opposite.context.location.path(), null);
         var selected = source.browser.selection();
         var known = source.context.selectionProof;
-        var report = source.listingReporter();
+        prepareDirectTransfer(target, move, cancelled -> captureSelected(selected, known), source.listingReporter());
+    }
+
+    private void prepareDirectTransfer(PasteTarget target, boolean move, Work<List<Selection>> capture, Consumer<String> report) {
         runFileTask(task(cancelled -> {
             var destination = verifyDestination(target);
-            var entries = captureSelected(selected, known);
+            var entries = capture.read(cancelled);
             validateDirectTransfer(entries, destination, move);
             return new PreparedPaste(destination, entries);
-        }), "正在核对跨栏传输…", false, prepared -> submitTransfer(prepared, move, report, ignored -> {}));
+        }), "正在核对来源和目标…", false, prepared -> submitTransfer(prepared, move, report, ignored -> {}));
     }
 
     private static void validateDirectTransfer(List<Selection> sources, FileChanges.Destination destination,
                                                boolean move) throws IOException {
+        if (destination.directory() == null) { throw new IOException("目标需要可验证的本地 NTFS 目录"); }
         Path target = destination.path().toRealPath();
         for (Selection source : sources) {
+            if (source.nativeItem() == null) {
+                throw new IOException("直接传输需要可验证的本地 NTFS 来源：" + source.path());
+            }
+            NtfsFileOperations.verify(source.nativeItem());
             if (Files.isSameFile(source.path().getParent(), target)) {
                 throw new IOException("来源与目标目录相同：" + target);
             }
             if (source.entry().directory() && target.startsWith(source.path().toRealPath())) {
                 throw new IOException("目标文件夹位于源文件夹内：" + target);
-            }
-            if (source.nativeItem() == null) {
-                throw new IOException("直接传输需要可验证的本地 NTFS 来源：" + source.path());
             }
             if (move && !NtfsFileOperations.sameVolume(source.nativeItem(), destination.directory())) {
                 throw new IOException("直接移动需要同一 NTFS 卷上的可验证对象：" + source.path());
@@ -1836,19 +2192,23 @@ public final class FileManagerApp extends Application {
         runFileTask(task(cancelled -> {
             var destination = verifyDestination(target);
             if (pending.local() != null) { return new PreparedPaste(destination, pending.local().sources()); }
-            var sources = new ArrayList<Selection>();
-            for (Path path : pending.external()) {
-                if (cancelled.getAsBoolean()) { throw new IOException("已取消粘贴准备"); }
-                var entry = LocalFiles.describe(path);
-                if (entry.link() || entry.other()) { throw new IOException("此剪贴板含链接或特殊项目，请重新选择：" + path); }
-                sources.add(FileChanges.capture(entry));
-            }
-            return new PreparedPaste(destination, List.copyOf(sources));
+            return new PreparedPaste(destination, captureExternalFiles(pending.external(), cancelled));
         }), "正在核对粘贴来源和目标…", false, prepared -> {
             if (pasteCanContinue(report)) {
                 submitTransfer(prepared, pending.move(), report, outcome -> clipboardAfterPaste(pending, prepared.sources(), outcome));
             }
         });
+    }
+
+    private static List<Selection> captureExternalFiles(List<Path> paths, BooleanSupplier cancelled) throws IOException {
+        var sources = new ArrayList<Selection>();
+        for (Path path : paths) {
+            if (cancelled.getAsBoolean()) { throw new IOException("已取消传输准备"); }
+            var entry = LocalFiles.describe(path);
+            if (entry.link() || entry.other()) { throw new IOException("来源含链接或特殊项目，请重新选择：" + path); }
+            sources.add(FileChanges.capture(entry));
+        }
+        return List.copyOf(sources);
     }
 
     private FileChanges.Destination verifyDestination(PasteTarget target) throws IOException {
@@ -2395,6 +2755,13 @@ public final class FileManagerApp extends Application {
                     item -> contextMenu(this, item), () -> updateListingStatus(""),
                     this::homeHeader, this::flushWatchRefresh);
             browser.setMinWidth(0);
+            browser.addEventFilter(MouseEvent.MOUSE_PRESSED, event -> pressFileDrag(this, event));
+            browser.addEventFilter(MouseEvent.MOUSE_RELEASED, event -> dragPress = null);
+            browser.setOnDragDetected(event -> startFileDrag(this, event));
+            browser.setOnDragDone(event -> {
+                if (event.getGestureSource() == browser) { finishFileDrag(); }
+            });
+            installFileDrop(browser, picked -> browserDropSite(this, picked));
             configureNavigation();
             useSingleNavigation();
             overview.getStyleClass().add("overview");
@@ -2435,6 +2802,8 @@ public final class FileManagerApp extends Application {
         }
 
         private void suspend() {
+            if (dragSource != null && dragSource.gesture() == browser) { finishFileDrag(); }
+            else if (dropSite != null && dropSite.owner() == context) { endDropHover(); }
             browser.dismissTransientControls();
             savePresentation();
             releaseBrowse(context);
@@ -2954,6 +3323,9 @@ public final class FileManagerApp extends Application {
         }
 
         private void render(boolean preserveSelection, List<BrowserItem> verifiedSelection) {
+            if (dropSite != null && dropSite.owner() == context && dropSite.target().folder() != null) {
+                clearDropSite();
+            }
             View config = currentView();
             boolean computer = context.location.page() == Page.COMPUTER;
             boolean gallery = context.location.page() == Page.GALLERY;

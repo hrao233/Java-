@@ -92,6 +92,27 @@ final class ClipboardFiles {
         return List.copyOf(paths);
     }
 
+    static List<Path> dragPaths(List<String> names) throws IOException {
+        if (names.isEmpty() || names.size() > MAX_ITEMS) { throw invalidDrag(); }
+        int units = 1;
+        for (String name : names) {
+            try {
+                checkName(name);
+            } catch (IOException malformed) {
+                throw invalidDrag();
+            }
+            units += name.length() + 1;
+            if (HEADER + units * Character.BYTES > MAX_BYTES) { throw invalidDrag(); }
+        }
+        try {
+            return paths(names);
+        } catch (IOException malformed) {
+            throw invalidDrag();
+        }
+    }
+
+    private static IOException invalidDrag() { return new IOException("拖放的文件列表格式或数量不受支持"); }
+
     static String quotedPaths(List<Path> paths) {
         return String.join(System.lineSeparator(), paths.stream().map(path -> "\"" + path + "\"").toList());
     }

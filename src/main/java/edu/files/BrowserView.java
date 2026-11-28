@@ -25,6 +25,7 @@ import javafx.scene.control.TableColumn;
 import javafx.scene.control.TableRow;
 import javafx.scene.control.TableView;
 import javafx.scene.control.TextField;
+import javafx.scene.control.TextInputControl;
 import javafx.scene.control.Tooltip;
 import javafx.scene.control.skin.ListViewSkin;
 import javafx.scene.control.skin.VirtualFlow;
@@ -157,6 +158,7 @@ final class BrowserView extends StackPane {
 
     private record NameEdit(Path path, String text, int selectionEnd, String suffix, Consumer<String> commit) { }
     record ScrollPosition(Path firstPath, double position) { }
+    record DragHit(Node mark, BrowserItem item) { }
     record Presentation(Map<Field, Set<ColumnFilters.Bucket>> filters, ScrollPosition scroll, boolean homeFilesExpanded) {
         static final Presentation DEFAULT = new Presentation(Map.of(), null, true);
     }
@@ -237,6 +239,32 @@ final class BrowserView extends StackPane {
     List<BrowserItem> items() { return ordered; }
     boolean filtersActive() { return filters.active(); }
     boolean editingName() { return nameEdit != null; }
+
+    DragHit dragHit(Node picked) {
+        for (Node node = picked; node != null && node != this; node = node.getParent()) {
+            if (node instanceof TextInputControl || node instanceof javafx.scene.control.ButtonBase
+                    || node instanceof ScrollBar || node.getStyleClass().contains("column-header-background")) {
+                return null;
+            }
+            if (node.getStyleClass().contains("selectable-entry") && node.getUserData() instanceof BrowserItem item) {
+                return new DragHit(node, item);
+            }
+            if (node instanceof TableRow<?> row && row.getItem() instanceof Line line) {
+                return line.item() == null ? null : new DragHit(row, line.item());
+            }
+        }
+        return new DragHit(this, null);
+    }
+
+    void scrollDuringDrag(double screenX, double screenY) {
+        var listing = table.isVisible() ? table : tiles;
+        if (!(listing.lookup(".virtual-flow") instanceof VirtualFlow<?> flow)) { return; }
+        Bounds area = flow.localToScreen(flow.getLayoutBounds());
+        if (area == null || !area.contains(screenX, screenY)) { return; }
+        double edge = Math.min(26, area.getHeight() / 5);
+        if (screenY - area.getMinY() < edge) { flow.scrollPixels(-28); }
+        else if (area.getMaxY() - screenY < edge) { flow.scrollPixels(28); }
+    }
 
     void cutItems(Set<BrowserItem> items) {
         if (cutItems.equals(items)) { return; }
