@@ -160,6 +160,46 @@ public final class VisualAudit extends Application {
         if (category("D")) { commands(); }
         if (category("E")) { tasks(); }
         if (category("F")) { windows(); }
+        if (category("P") && !wanted.isEmpty()) { professionalLayouts(); }
+    }
+
+    private void professionalLayouts() throws Exception {
+        Path data = project.resolve("02_原始数据");
+        Path experiment = Files.createDirectory(data.resolve("实验一"));
+        Files.createDirectory(data.resolve("实验二"));
+        Files.createDirectory(experiment.resolve("参考资料"));
+        Path samples = Files.createDirectory(experiment.resolve("路线测量"));
+        Files.createDirectory(samples.resolve("图像样本"));
+        Files.createDirectory(samples.resolve("历史记录"));
+        Files.copy(project.resolve("Field Notes.txt"), samples.resolve("现场笔记.txt"));
+        Files.copy(project.resolve("Field Report.pdf"), samples.resolve("路线调研报告.pdf"));
+        Files.copy(project.resolve("Budget Q4.xlsx"), samples.resolve("测量记录.xlsx"));
+        go(false, samples);
+        menu("browse-layout", "layout-columns");
+        waitForBranches(experiment);
+        select(false, "路线调研报告.pdf");
+        waitForIcons();
+        shot("P01", "列式浏览");
+        menu("browse-layout", "layout-hybrid");
+        waitForBranches(samples);
+        waitForIcons();
+        shot("P02", "混合浏览");
+        if (selected("P03")) {
+            Path deep;
+            try (var paths = Files.walk(workspace.resolve("编辑与评审工作目录"))) {
+                deep = paths.filter(Files::isDirectory).max(Comparator.comparingInt(Path::getNameCount)).orElseThrow();
+            }
+            go(false, deep);
+            menu("browse-layout", "layout-columns");
+            waitForBranches(deep.getParent());
+            shot("P03", "深层目录横向滚动");
+        }
+    }
+
+    private void waitForBranches(Path folder) throws Exception {
+        waitFor("专业布局目录分支", () -> scene.getRoot().lookupAll(".miller-column").stream()
+                .anyMatch(node -> folder.equals(node.getUserData())
+                        && node.lookup(".miller-branches") instanceof ListView<?> list && !list.getItems().isEmpty()));
     }
 
     private void navigation() throws Exception {
