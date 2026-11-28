@@ -126,7 +126,7 @@ def create_fixture(root):
             data.write(block)
 
 
-def capture(pid, destination, include_owned):
+def capture(pid, destination, include_owned, title):
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     user32.SetThreadDpiAwarenessContext.argtypes = [wintypes.HANDLE]
     user32.SetThreadDpiAwarenessContext.restype = wintypes.HANDLE
@@ -152,22 +152,27 @@ def capture(pid, destination, include_owned):
 
     handles = []
     visible = []
+    process_windows = []
     callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
     @callback_type
     def find_main(hwnd, _):
-        title = ctypes.create_unicode_buffer(120)
-        if user32.IsWindowVisible(hwnd) and owner(hwnd) == pid:
-            visible.append(hwnd)
-            user32.GetWindowTextW(hwnd, title, len(title))
-            if title.value == "本地文件管理器":
-                handles.append(hwnd)
+        title_text = ctypes.create_unicode_buffer(120)
+        if owner(hwnd) == pid:
+            user32.GetWindowTextW(hwnd, title_text, len(title_text))
+            shown = bool(user32.IsWindowVisible(hwnd))
+            process_windows.append((title_text.value, shown))
+            if shown:
+                visible.append(hwnd)
+                if title_text.value == title:
+                    handles.append(hwnd)
         return True
 
     user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
     user32.EnumWindows(find_main, 0)
     if len(handles) != 1:
-        raise RuntimeError("Expected one visible audit application window.")
+        raise RuntimeError(f"Expected one visible window for {ascii(title)}. "
+                           f"Windows of capture process: {ascii(process_windows)}.")
 
     window = handles[0]
     def native_frame(hwnd):
@@ -230,8 +235,9 @@ if __name__ == "__main__":
     parser.add_argument("path", type=Path)
     parser.add_argument("--pid", type=int)
     parser.add_argument("--include-owned", action="store_true")
+    parser.add_argument("--title", default="本地文件管理器")
     args = parser.parse_args()
     if args.action == "fixture":
         create_fixture(args.path)
     else:
-        capture(args.pid, args.path, args.include_owned)
+        capture(args.pid, args.path, args.include_owned, args.title)

@@ -153,6 +153,7 @@ public final class VisualAudit extends Application {
 
     private void captureAll() throws Exception {
         waitFor("homepage", () -> settled(false));
+        if ("dark".equals(System.getProperty("edu.files.audit.theme"))) { menu("view", "theme-dark"); }
         if (category("A")) { navigation(); }
         if (category("B")) { views(); }
         if (category("C")) { tabsAndPanes(); }
@@ -431,7 +432,7 @@ public final class VisualAudit extends Application {
         String second = "02_路线观察.txt";
         String large = "03_路线原始样本.dat";
 
-        attempt("E01-E04", () -> {
+        taskShots("E01,E04", () -> {
             holdNextCopy();
             copyTo(from, transfer.resolve("Single"), large);
             waitFor("copy bytes", () -> heldCopy.get() != null);
@@ -443,7 +444,7 @@ public final class VisualAudit extends Application {
             shot("E04", "文件任务完成");
             closeProgress();
         });
-        attempt("E02", () -> {
+        taskShots("E02", () -> {
             holdNextCopy();
             copyTo(from, transfer.resolve("Batch"), first, second, large);
             waitFor("batch bytes", () -> heldCopy.get() != null && Files.exists(transfer.resolve("Batch").resolve(second)));
@@ -453,7 +454,7 @@ public final class VisualAudit extends Application {
             waitResult(FileOperationTask.Result.COMPLETED);
             closeProgress();
         });
-        attempt("E03", () -> {
+        taskShots("E03,E03b", () -> {
             copyTo(from, transfer.resolve("Conflict"), first, second);
             awaitShot("E03", "同名冲突对话框", () -> shown("#file-conflict") != null);
             waitFor("conflict decision", () -> shown("#conflict-skip") != null);
@@ -465,7 +466,7 @@ public final class VisualAudit extends Application {
             shot("E03b", "同名跳过后的报告");
             closeProgress();
         });
-        attempt("E05", () -> {
+        taskShots("E05", () -> {
             nextFault.set("partial");
             copyTo(from, transfer.resolve("Partial"), first, second);
             waitFor("partial failure alert", () -> shown(".dialog-pane") != null);
@@ -478,7 +479,7 @@ public final class VisualAudit extends Application {
             shot("E05", "文件任务部分完成");
             closeProgress();
         });
-        attempt("E06", () -> {
+        taskShots("E06", () -> {
             holdNextCopy();
             copyTo(from, transfer.resolve("Cancel"), large);
             waitFor("copy can be cancelled", () -> heldCopy.get() != null);
@@ -490,21 +491,21 @@ public final class VisualAudit extends Application {
             shot("E06", "文件任务取消");
             closeProgress();
         });
-        attempt("E07", () -> {
+        taskShots("E07", () -> {
             go(false, from);
             select(false, first);
             button("trash");
             awaitShot("E07", "回收确认", () -> shown(".dialog-pane") != null);
             dismissDialog(ButtonType.CANCEL);
         });
-        attempt("E08", () -> {
+        taskShots("E08", () -> {
             nextFault.set("denied");
             copyTo(from, transfer.resolve("Failed"), first);
             awaitShot("E08", "文件操作失败提示", () -> shown(".dialog-pane") != null);
             dismissDialog(ButtonType.OK);
             closeProgress();
         });
-        attempt("E09", () -> {
+        taskShots("E09", () -> {
             nextFault.set("receipt");
             copyTo(from, transfer.resolve("Unknown"), first);
             waitFor("unknown result alert", () -> shown(".dialog-pane") != null);
@@ -518,7 +519,7 @@ public final class VisualAudit extends Application {
                 ((Button) scene.lookup("#unknown-results")).setVisible(false);
             });
         });
-        attempt("E10", () -> {
+        taskShots("E10", () -> {
             enter(false, workspace.resolve("Missing folder").toString());
             awaitShot("E10", "目录不存在提示", () -> shown(".dialog-pane") != null);
             dismissDialog(ButtonType.OK);
@@ -892,6 +893,10 @@ public final class VisualAudit extends Application {
             System.err.println("MISSED " + ids + ": " + exception);
             exception.printStackTrace();
         }
+    }
+
+    private void taskShots(String ids, Step action) {
+        if (Arrays.stream(ids.split(",")).anyMatch(this::selected)) { attempt(ids, action); }
     }
 
     private Object pane(boolean right) throws Exception { return get(app, right ? "rightPane" : "leftPane"); }
