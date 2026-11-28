@@ -161,6 +161,38 @@ public final class VisualAudit extends Application {
         if (category("E")) { tasks(); }
         if (category("F")) { windows(); }
         if (category("P") && !wanted.isEmpty()) { professionalLayouts(); }
+        if (category("Q") && !wanted.isEmpty()) { professionalPanes(); }
+    }
+
+    private void professionalPanes() throws Exception {
+        Files.createDirectory(delivery.resolve("发布材料"));
+        Files.createDirectory(delivery.resolve("归档"));
+        Files.copy(project.resolve("Field Report.pdf"), delivery.resolve("调研报告.pdf"));
+        go(false, project);
+        button("dual-pane");
+        waitFor("right panel", () -> settled(true));
+        go(true, delivery);
+        focus(true);
+        menu("browse-layout", "layout-columns");
+        waitForBranches(delivery.getParent());
+        waitForIcons();
+        shot("Q01", "传统与米勒列");
+
+        focus(false);
+        menu("browse-layout", "layout-columns");
+        waitForBranches(project.getParent());
+        focus(true);
+        menu("browse-layout", "layout-hybrid");
+        waitForBranches(delivery);
+        waitForIcons();
+        shot("Q02", "米勒列与混合");
+        shot("Q03", "深色专业双栏");
+
+        if (selected("Q04")) {
+            focus(false);
+            stageAction(() -> size(stage.getMinWidth(), stage.getMinHeight()));
+            shot("Q04", "窄窗口专业双栏");
+        }
     }
 
     private void professionalLayouts() throws Exception {
